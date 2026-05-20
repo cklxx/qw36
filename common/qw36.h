@@ -75,6 +75,13 @@ typedef struct {
     uint32_t moe_decoder_sparse_step; /* every Nth layer is MoE; 1 = all */
     uint8_t  moe_norm_topk_prob;
 
+    /* Gated DeltaNet — zero if model has no DeltaNet layers. */
+    uint32_t dn_num_key_heads;
+    uint32_t dn_num_value_heads;
+    uint32_t dn_key_head_dim;
+    uint32_t dn_value_head_dim;
+    uint32_t dn_conv_kernel_size;
+
     /* Head */
     uint8_t  tie_word_embeddings;
 
@@ -88,7 +95,7 @@ typedef struct {
 /* --------------------------------------------------------------------- */
 
 typedef struct {
-    /* Attention */
+    /* Vanilla full attention (NULL on Gated DeltaNet layers) */
     void *q_proj;       /* [hidden, n_heads * head_dim] */
     void *k_proj;       /* [hidden, n_kv * head_dim]    */
     void *v_proj;       /* [hidden, n_kv * head_dim]    */
@@ -97,6 +104,27 @@ typedef struct {
     void *k_norm;       /* [head_dim]                    */
     void *input_layernorm;       /* [hidden] */
     void *post_attn_layernorm;   /* [hidden] */
+
+    /* Gated DeltaNet (NULL on vanilla layers). Tensor names in GGUF:
+     *   attn_qkv.weight    — fused QKV  [hidden, q_dim + k_dim + v_dim]
+     *   attn_gate.weight   — z gating   [hidden, v_dim]
+     *   ssm_alpha.weight   — a-proj     [hidden, n_v_heads]
+     *   ssm_beta.weight    — b-proj     [hidden, n_v_heads]
+     *   ssm_conv1d.weight  — depthwise short conv  [k, q_dim+k_dim+v_dim]
+     *   ssm_dt.bias        — dt bias    [n_v_heads]
+     *   ssm_a              — log A      [n_v_heads]
+     *   ssm_norm.weight    — per-val-head RMSNorm gain [val_dim]
+     *   ssm_out.weight     — out proj   [v_dim, hidden]
+     */
+    void *dn_qkv;
+    void *dn_gate;
+    void *dn_alpha;
+    void *dn_beta;
+    void *dn_conv1d;     /* short, materialized fp32 (kernel*channels small) */
+    void *dn_dt_bias;
+    void *dn_a_log;
+    void *dn_norm;
+    void *dn_out;
 
     /* MLP — dense path */
     void *gate_proj;    /* [hidden, intermediate] */
@@ -135,6 +163,13 @@ typedef struct {
     uint32_t seq_capacity;
     uint32_t seq_pos;       /* how many tokens have been written */
     qw36_dtype kv_dtype;
+
+    /* Gated DeltaNet per-layer state (NULL on vanilla layers):
+     *   conv_state[L]:  short-window history for ssm_conv1d (depthwise).
+     *                   Size = (kernel_size - 1) * (q_dim + k_dim + v_dim) floats.
+     *   delta_state[L]: rank-1 state S of shape [n_v_heads, key_dim, val_dim]. */
+    float **conv_state;
+    float **delta_state;
 
     /* Scratch (host or device). Engine reuses across steps. */
     float *x;               /* [hidden] residual */

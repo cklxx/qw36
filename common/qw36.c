@@ -358,6 +358,148 @@ static void softmax_k(float *vals, int k) {
     for (int i = 0; i < k; i++) vals[i] *= inv;
 }
 
+/* --------------------------------------------------------------------- */
+/* Gated DeltaNet (Qwen3.5 / 3.6 linear attention) decode.                */
+/*                                                                        */
+/* Mirrors agent-infer/crates/cuda-kernels/.../gated_delta_rule.cu        */
+/* (gated_delta_rule_decode_kernel) — see comments there. Algorithm per   */
+/* token, per value head v:                                               */
+/*                                                                        */
+/*   k_head = v * num_key_heads / num_value_heads                         */
+/*   q = qkv[k_head*key_dim ..]            (already conv+SiLU'd by caller)*/
+/*   k = qkv[q_dim + k_head*key_dim ..]                                   */
+/*   v_in = qkv[q_dim + k_dim + v*val_dim ..]                             */
+/*   q ← L2-normalize(q) / sqrt(key_dim)                                  */
+/*   k ← L2-normalize(k)                                                  */
+/*   x = α[v] + dt_bias[v];     softplus = log(1 + e^x) (or x if x>20)    */
+/*   g  = -e^{A_log[v]} * softplus;   exp_g = e^g                         */
+/*   β  = σ(b[v])                                                         */
+/*   kv_mem[d] = Σ_j (S[v,j,d] * exp_g) * k[j]    (pass 1, also decays S) */
+/*   δ[d]      = (v_in[d] - kv_mem[d]) * β                                */
+/*   S[v,j,d] += δ[d] * k[j]                                              */
+/*   y[v,d]    = Σ_j S[v,j,d] * q[j]                                      */
+/* --------------------------------------------------------------------- */
+static void gated_delta_decode(const float *qkv,
+                               const float *b_proj_raw,
+                               const float *a_proj_raw,
+                               const float *dt_bias,
+                               const float *a_log,
+                               float       *state,    /* [n_v, key, val] */
+                               float       *out,      /* [n_v * val] */
+                               uint32_t n_key, uint32_t n_value,
+                               uint32_t key_dim, uint32_t val_dim,
+                               float *qbuf, float *kbuf)
+{
+    const uint32_t q_dim_total = n_key * key_dim;
+    const uint32_t k_dim_total = q_dim_total;
+    const float    inv_sqrt_d  = 1.0f / sqrtf((float)key_dim);
+
+    for (uint32_t v = 0; v < n_value; v++) {
+        const uint32_t kh = v * n_key / n_value;
+
+        /* Copy and L2-normalize q, k for this head. */
+        double qss = 0.0, kss = 0.0;
+        for (uint32_t d = 0; d < key_dim; d++) {
+            qbuf[d] = qkv[kh * key_dim + d];
+            kbuf[d] = qkv[q_dim_total + kh * key_dim + d];
+            qss += (double)qbuf[d] * qbuf[d];
+            kss += (double)kbuf[d] * kbuf[d];
+        }
+        float q_scale = 1.0f / sqrtf((float)qss + 1e-12f);
+        float k_scale = 1.0f / sqrtf((float)kss + 1e-12f);
+        for (uint32_t d = 0; d < key_dim; d++) {
+            qbuf[d] *= q_scale * inv_sqrt_d;
+            kbuf[d] *= k_scale;
+        }
+
+        const float *vin = qkv + q_dim_total + k_dim_total + v * val_dim;
+
+        /* Gating scalars. */
+        float a_v = a_proj_raw[v] + dt_bias[v];
+        float softplus = (a_v > 20.0f) ? a_v : logf(1.0f + expf(a_v));
+        float g  = -expf(a_log[v]) * softplus;
+        float exp_g = expf(g);
+        float beta  = 1.0f / (1.0f + expf(-b_proj_raw[v]));
+
+        float *S = state + (size_t)v * key_dim * val_dim;
+
+        /* Pass 1: decay state in place + accumulate kv_mem = (decayed_S^T) @ k */
+        float *out_v = out + (size_t)v * val_dim;
+        for (uint32_t d = 0; d < val_dim; d++) out_v[d] = 0.0f;
+        /* Use out_v as kv_mem accumulator first; we'll overwrite it later. */
+        for (uint32_t j = 0; j < key_dim; j++) {
+            float *row = S + (size_t)j * val_dim;
+            const float kj = kbuf[j];
+            for (uint32_t d = 0; d < val_dim; d++) {
+                float s = row[d] * exp_g;
+                row[d] = s;
+                out_v[d] += s * kj;
+            }
+        }
+
+        /* Pass 2: rank-1 update + output. */
+        /* delta = (v_in - kv_mem) * beta. We need kv_mem from pass 1 (in
+         * out_v), so copy it aside then zero out_v for the output sum. */
+        float kv_mem_local[8192];
+        for (uint32_t d = 0; d < val_dim; d++) {
+            kv_mem_local[d] = out_v[d];
+            out_v[d] = 0.0f;
+        }
+        for (uint32_t j = 0; j < key_dim; j++) {
+            float *row = S + (size_t)j * val_dim;
+            const float kj = kbuf[j];
+            const float qj = qbuf[j];
+            for (uint32_t d = 0; d < val_dim; d++) {
+                float delta = (vin[d] - kv_mem_local[d]) * beta;
+                row[d] += delta * kj;
+                out_v[d] += row[d] * qj;
+            }
+        }
+    }
+}
+
+/* Depthwise causal 1D conv (decode step). conv_w is [k, channels] (or its
+ * transpose; we read element wt(t, c) accordingly). conv_state holds the
+ * last (k-1) inputs per channel, shape [k-1, channels]. On exit:
+ *   y[c] = silu( Σ_{t=0..k-1} wt(t, c) * input_at_t[c] )
+ * where input at the latest position is x[c]; older positions live in
+ * conv_state. State is shifted left by one and the new x appended.
+ *
+ * conv_w layout in GGUF is [k, channels] with k = dim[1] (i.e. innermost
+ * axis is k). We read wt(t, c) as conv_w[c * k + t]. */
+static void conv1d_silu_decode(const float *x, const float *conv_w,
+                               float *conv_state, float *y,
+                               uint32_t channels, uint32_t k)
+{
+    /* y[c] = silu(sum_{t=0..k-1} conv_w[c*k + t] * window[t, c])
+     * where window[0..k-2] is conv_state, window[k-1] is x. */
+    if (k == 0) {
+        for (uint32_t c = 0; c < channels; c++) y[c] = silu(x[c]);
+        return;
+    }
+    for (uint32_t c = 0; c < channels; c++) {
+        const float *wt = conv_w + c * k;
+        double acc = 0.0;
+        if (k > 1) {
+            const float *win = conv_state + c;        /* stride = channels */
+            for (uint32_t t = 0; t < k - 1; t++)
+                acc += (double)wt[t] * win[t * channels];
+        }
+        acc += (double)wt[k - 1] * x[c];
+        y[c] = silu((float)acc);
+    }
+    /* Shift state: drop oldest, append new x. */
+    if (k > 1) {
+        for (uint32_t t = 0; t + 1 < k - 1; t++) {
+            float *dst = conv_state + (size_t)t * channels;
+            const float *src = conv_state + (size_t)(t + 1) * channels;
+            memcpy(dst, src, channels * sizeof(float));
+        }
+        memcpy(conv_state + (size_t)(k - 2) * channels, x,
+               channels * sizeof(float));
+    }
+}
+
 /* MoE forward (per token):
  *
  *   r = router @ x                       [n_experts]
@@ -723,13 +865,41 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     eng_get_u32(eng, "expert_feed_forward_length",&c->moe_intermediate_size);
     if (!c->moe_decoder_sparse_step) c->moe_decoder_sparse_step = 1;
 
+    /* Gated DeltaNet config. Infer from tensor shapes since the GGUF
+     * metadata for "linear attention" head config varies between
+     * variants. We pick the first SSM layer we see. */
+    {
+        qw36_gguf_tensor t;
+        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
+            /* GGUF stores dims innermost-first. ssm_conv1d shape is
+             * [k, channels] in numpy → dims[0]=k, dims[1]=channels. */
+            c->dn_conv_kernel_size = (uint32_t)t.dims[0];
+        }
+        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_a", &t) == 0)
+            c->dn_num_value_heads = (uint32_t)t.dims[0];
+        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_norm.weight", &t) == 0)
+            c->dn_value_head_dim = (uint32_t)t.dims[0];
+        /* Number of key heads = (q_dim + k_dim) / key_head_dim / 2.
+         * In Qwen3.5 the Q/K dim equals the V dim — i.e. q_dim = k_dim =
+         * n_v_heads * val_head_dim — so set num_key_heads = num_value_heads
+         * and key_head_dim = value_head_dim. */
+        c->dn_num_key_heads = c->dn_num_value_heads;
+        c->dn_key_head_dim  = c->dn_value_head_dim;
+    }
+
     /* Bind global tensors. Small (norm) → fp32; big (embed/lm_head) → lazy. */
     qw36_weights *w = &eng->weights;
     w->dtype = QW36_DTYPE_F32;
     w->embed_tokens = bind_tensor_lazy(eng, "token_embd.weight");
     w->final_norm   = bind_tensor_f32(eng, "output_norm.weight");
     w->lm_head      = bind_tensor_lazy(eng, "output.weight");
-    if (!w->lm_head && c->tie_word_embeddings) w->lm_head = w->embed_tokens;
+    /* Many Qwen3 / Qwen3.5 / Qwen3.6 checkpoints omit output.weight and
+     * tie it to the input embedding without setting tie_word_embeddings
+     * explicitly. Fall back unconditionally — never leave lm_head NULL. */
+    if (!w->lm_head) {
+        w->lm_head = w->embed_tokens;
+        c->tie_word_embeddings = 1;
+    }
     if (!w->embed_tokens || !w->final_norm) {
         if (err && err_cap) snprintf(err, err_cap, "missing embedding or output norm");
         qw36_engine_close(eng); return NULL;
@@ -759,13 +929,31 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         BIND_NORM(input_layernorm,     "blk.%u.attn_norm.weight");
         BIND_NORM(q_norm,              "blk.%u.attn_q_norm.weight");
         BIND_NORM(k_norm,              "blk.%u.attn_k_norm.weight");
+        /* Some Qwen3.5/3.6 checkpoints name the post-attention norm
+         * "post_attention_norm" (with the underscore expanded) instead of
+         * "ffn_norm". Try both. */
         BIND_NORM(post_attn_layernorm, "blk.%u.ffn_norm.weight");
+        if (!L->post_attn_layernorm)
+            BIND_NORM(post_attn_layernorm, "blk.%u.post_attention_norm.weight");
 
         /* Vanilla attention projections — lazy (big). */
         BIND_W(q_proj,    "blk.%u.attn_q.weight");
         BIND_W(k_proj,    "blk.%u.attn_k.weight");
         BIND_W(v_proj,    "blk.%u.attn_v.weight");
         BIND_W(o_proj,    "blk.%u.attn_output.weight");
+
+        /* Gated DeltaNet projections. attn_qkv / attn_gate are big (lazy);
+         * the rest are small enough to materialize. conv1d is depthwise
+         * (kernel × channels = a few thousand floats), keep as fp32. */
+        BIND_W(dn_qkv,           "blk.%u.attn_qkv.weight");
+        BIND_W(dn_gate,          "blk.%u.attn_gate.weight");
+        BIND_W(dn_alpha,         "blk.%u.ssm_alpha.weight");
+        BIND_W(dn_beta,          "blk.%u.ssm_beta.weight");
+        BIND_NORM(dn_conv1d,     "blk.%u.ssm_conv1d.weight");
+        BIND_NORM(dn_dt_bias,    "blk.%u.ssm_dt.bias");
+        BIND_NORM(dn_a_log,      "blk.%u.ssm_a");
+        BIND_NORM(dn_norm,       "blk.%u.ssm_norm.weight");
+        BIND_W(dn_out,           "blk.%u.ssm_out.weight");
 
         /* Dense MLP — lazy. */
         BIND_W(gate_proj, "blk.%u.ffn_gate.weight");
@@ -840,6 +1028,28 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         if (!st->k_cache[l] || !st->v_cache[l]) goto fail;
     }
 
+    /* DeltaNet per-layer state. Sized to the conv kernel size and the
+     * key/val dims read from config. Zero for layers without DeltaNet —
+     * we allocate symmetrically across L for simplicity. */
+    if (c->dn_num_value_heads) {
+        const size_t qkv_dim = (size_t)c->dn_num_key_heads   * c->dn_key_head_dim
+                             + (size_t)c->dn_num_key_heads   * c->dn_key_head_dim
+                             + (size_t)c->dn_num_value_heads * c->dn_value_head_dim;
+        const size_t conv_window = c->dn_conv_kernel_size
+                                 ? (size_t)c->dn_conv_kernel_size - 1 : 0;
+        const size_t s_elems = (size_t)c->dn_num_value_heads
+                             * c->dn_key_head_dim * c->dn_value_head_dim;
+        st->conv_state  = (float **)calloc(L, sizeof(float *));
+        st->delta_state = (float **)calloc(L, sizeof(float *));
+        if (!st->conv_state || !st->delta_state) goto fail;
+        for (size_t l = 0; l < L; l++) {
+            st->conv_state[l]  = (float *)calloc(conv_window * qkv_dim, sizeof(float));
+            st->delta_state[l] = (float *)calloc(s_elems, sizeof(float));
+            if ((conv_window && !st->conv_state[l]) || !st->delta_state[l])
+                goto fail;
+        }
+    }
+
     /* Scratch — big enough for attention staging (n_heads*(cap+1) +
      * n_heads*head_dim) and for MLP gate/up. */
     const size_t attn_scratch_n =
@@ -886,6 +1096,14 @@ void qw36_state_free(qw36_state *st)
         for (uint32_t l = 0; l < st->num_layers; l++) free(st->v_cache[l]);
         free(st->v_cache);
     }
+    if (st->conv_state) {
+        for (uint32_t l = 0; l < st->num_layers; l++) free(st->conv_state[l]);
+        free(st->conv_state);
+    }
+    if (st->delta_state) {
+        for (uint32_t l = 0; l < st->num_layers; l++) free(st->delta_state[l]);
+        free(st->delta_state);
+    }
     free(st->x); free(st->x_rms); free(st->q); free(st->k); free(st->v);
     free(st->attn_scores); free(st->gate); free(st->up); free(st->logits);
     free(st);
@@ -919,12 +1137,89 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
+        fprintf(stderr, "[fwd] L%u q=%p dn=%p moe=%p\n",
+                l, L->q_proj, L->dn_qkv, L->moe_router);
+
+        if (!L->q_proj && L->dn_qkv) {
+            /* === Gated DeltaNet branch === */
+            const uint32_t n_v   = c->dn_num_value_heads;
+            const uint32_t n_k   = c->dn_num_key_heads;
+            const uint32_t kd    = c->dn_key_head_dim;
+            const uint32_t vd    = c->dn_value_head_dim;
+            const uint32_t q_dim = n_k * kd, k_dim_t = n_k * kd, v_dim = n_v * vd;
+            const uint32_t qkv_dim = q_dim + k_dim_t + v_dim;
+            const qw36_lazy_w *qkv_w = (const qw36_lazy_w *)L->dn_qkv;
+            fprintf(stderr, "[dn] L%u n_v=%u n_k=%u kd=%u vd=%u qkv_dim=%u, "
+                            "dn_qkv rows=%llu cols=%llu k=%u\n",
+                    l, n_v, n_k, kd, vd, qkv_dim,
+                    (unsigned long long)qkv_w->rows,
+                    (unsigned long long)qkv_w->cols,
+                    c->dn_conv_kernel_size);
+
+            rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
+                        hidden, c->rms_norm_eps);
+
+            /* Projections.  Heap-allocate to keep the stack frame small. */
+            const size_t need = (size_t)2 * qkv_dim   /* qkv + qkv_act */
+                              + (size_t)v_dim          /* z_proj */
+                              + (size_t)n_v * 2        /* alpha + beta */
+                              + (size_t)v_dim          /* gout */
+                              + (size_t)kd * 2;        /* qb + kb */
+            float *blk = (float *)calloc(need, sizeof(float));
+            if (!blk) return -3;
+            float *qkv     = blk;
+            float *qkv_act = qkv + qkv_dim;
+            float *z_proj  = qkv_act + qkv_dim;
+            float *alpha   = z_proj + v_dim;
+            float *beta    = alpha + n_v;
+            float *gout    = beta + n_v;
+            float *qb      = gout + v_dim;
+            float *kb      = qb + kd;
+
+            matmul_lazy(qkv,    st->x_rms, (const qw36_lazy_w *)L->dn_qkv,   row_scratch);
+            matmul_lazy(z_proj, st->x_rms, (const qw36_lazy_w *)L->dn_gate,  row_scratch);
+            matmul_lazy(alpha,  st->x_rms, (const qw36_lazy_w *)L->dn_alpha, row_scratch);
+            matmul_lazy(beta,   st->x_rms, (const qw36_lazy_w *)L->dn_beta,  row_scratch);
+
+            /* Conv1d + SiLU on the QKV channels (depthwise causal). */
+            conv1d_silu_decode(qkv, (const float *)L->dn_conv1d,
+                               st->conv_state[l], qkv_act,
+                               qkv_dim, c->dn_conv_kernel_size);
+
+            /* Gated delta rule step. */
+            gated_delta_decode(qkv_act, beta, alpha,
+                               (const float *)L->dn_dt_bias,
+                               (const float *)L->dn_a_log,
+                               st->delta_state[l], gout,
+                               n_k, n_v, kd, vd, qb, kb);
+
+            /* Per-value-head gated RMSNorm + silu(z) gating:
+             *   gout[v,d] = silu(z_proj[v,d]) * (gout[v,d] *
+             *               rsqrt(mean(gout[v]²)+eps) * dn_norm.weight[d]) */
+            const float *dn_norm_w = (const float *)L->dn_norm;
+            for (uint32_t v = 0; v < n_v; v++) {
+                float *go = gout   + (size_t)v * vd;
+                float *zp = z_proj + (size_t)v * vd;
+                rmsnorm_f32(go, go, dn_norm_w, vd, c->rms_norm_eps);
+                for (uint32_t d = 0; d < vd; d++) go[d] = silu(zp[d]) * go[d];
+            }
+
+            /* Out projection: hidden = ssm_out @ gout. */
+            matmul_lazy(st->x_rms, gout,
+                        (const qw36_lazy_w *)L->dn_out, row_scratch);
+            for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+            free(blk);
+
+            /* MLP block (shared with full-attention path below). */
+            goto mlp_block;
+        }
+
         if (!L->q_proj) {
-            /* Gated DeltaNet (Qwen3.5/3.6 linear attention) — TODO. */
+            /* Layer is neither vanilla nor DeltaNet — unknown variant. */
             return -2;
         }
 
-        /* --- attention block --- */
+        /* --- vanilla full-attention block --- */
         rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
                     hidden, c->rms_norm_eps);
 
@@ -995,7 +1290,8 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                     (const qw36_lazy_w *)L->o_proj, row_scratch);
         for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
 
-        /* --- mlp block --- */
+mlp_block:
+        /* --- mlp block (shared by vanilla and DeltaNet branches) --- */
         rmsnorm_f32(st->x_rms, x, (const float *)L->post_attn_layernorm,
                     hidden, c->rms_norm_eps);
 
@@ -1043,12 +1339,19 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     }
 
     /* Final norm + lm_head (lazy). */
+    fprintf(stderr, "[fwd] post-loop, final_norm=%p lm_head=%p\n",
+            w->final_norm, w->lm_head);
     rmsnorm_f32(st->x_rms, st->x, (const float *)w->final_norm,
                 hidden, c->rms_norm_eps);
+    fprintf(stderr, "[fwd] final rmsnorm done, calling lm_head matmul\n");
     matmul_lazy(st->logits, st->x_rms,
                 (const qw36_lazy_w *)w->lm_head, row_scratch);
+    fprintf(stderr, "[fwd] lm_head matmul done, logits[0]=%g\n", st->logits[0]);
+    fflush(stderr);
 
     st->seq_pos++;
+    fprintf(stderr, "[fwd] returning, seq_pos=%u\n", st->seq_pos);
+    fflush(stderr);
     return 0;
 }
 
