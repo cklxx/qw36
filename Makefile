@@ -26,8 +26,8 @@ metal:
 cuda:
 	$(MAKE) -C cuda
 
-test:
-	$(MAKE) -C tests
+test: cpu metal
+	tests/precision_cpu_vs_metal.sh
 
 clean:
 	$(MAKE) -C cpu   clean   2>/dev/null || true
