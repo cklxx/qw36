@@ -126,22 +126,40 @@ beta = sigmoid(b_raw)
 
 ## Path to 85 tok/s
 
-Current state on M-class GPU, Qwen3.5-0.8B-Q4_K_M:
-- CPU build:   ~1.7 tok/s
-- Metal build: ~12 tok/s (after #28 GPU-resident state)
-- Target:      85+ tok/s (agent-infer)
+Tracking on Qwen3.5-0.8B-Q4_K_M, M-class GPU:
 
-Remaining bottleneck: DN (18/24 layers) and MoE still bridge through host
-in qw36_forward, forcing many GPU→CPU→GPU sync points per token.
+| step | commit | decode tok/s | notes |
+|------|--------|--------------|-------|
+| CPU baseline                | —        | 1.7  | lazy quant matmul |
+| `backend->matmul` (MPS gemv)| 218fb50  | 11   | first Metal hook |
+| MPS gemv cache + batch infra| 51b2778  | 13   | per-shape pipeline cache |
+| persistent GPU state        | d24bbbd  | 55   | task #28 — KV cache + scratch on device |
+| fused GDR Metal kernel      | 1ecb8c4  | 55   | DN block stays on GPU |
+| bucketed MTLBuffer pool     | 2cd9da4  | 56   | recycle transient scratch |
+| fp16 weights (opt-in)       | e286627  | **81** | `QW36_METAL_FP16_WEIGHTS=1`, MPS half GEMV |
+| Metal MoE first pass        | efc7f6c  | 81   | task #23 — no MoE in 0.8B so no-op here |
 
-Open work:
-1. **task #22**: port gated_delta_step to Metal (kernel source available
-   above) so the DN block stays on GPU.
-2. **task #23**: same for MoE expert dispatch.
-3. Wire `backend->begin_batch` / `end_batch` around the whole forward
-   once no host bridges remain — single MTLCommandBuffer per token.
-4. **task #21**: rmsnorm / residual_add / swiglu / attention all via
-   `_dev` variants exclusively (some already done in d24bbbd).
+Sustained (longer ctx) at fp16:
+- n=16:  80.8 tok/s
+- n=64:  76.4 tok/s
+- n=128: 74.3 tok/s
+
+Decode rate degrades 81 → 74 as ctx grows — that's the per-position scan
+in `attn_scores` + `attn_softmax` + `attn_combine` dispatched as three
+separate kernels. Closing the remaining gap to ≥85 sustained likely
+needs:
+
+1. **Fused decode attention**: single MSL kernel that does score+softmax
+   +combine over the KV cache in one dispatch. Threadgroup per head;
+   simdgroup reduction for the running softmax. Eliminates 2 of the 3
+   dispatch syncs per layer and improves cache locality on the KV scan.
+2. **fp16 KV cache**: halves the bytes scanned in attention. The
+   conversion only happens once at kv_append; reads stay cheap.
+3. **lm_head over fp16 weights**: already covered by
+   `QW36_METAL_FP16_WEIGHTS=1` but `output_norm` weight upload is still
+   in scope to verify.
+
+`task #30` tracks 1–3.
 
 ## Known blocker for Qwen 3.6 end-to-end
 
