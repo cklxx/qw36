@@ -23,9 +23,25 @@ to 200 tok/s in progress (#30/#40).
 | 564eee4            | 50 (opt-in) | Q4_K sub-block scale cache         |
 | 9d06231            | 84     | xh f32→f16 dedup                  |
 | b63285b            | 84     | MPS weight matrix wrapper cache    |
-| 720ac5d            | **85** | **xh cache fp16-input invalidate** |
+| 720ac5d            | 85     | xh cache fp16-input invalidate    |
+| bdf42ad            | 90     | vanilla fused residual+rmsnorm   |
+| b489b09            | 100    | DN fused residual+rmsnorm        |
+| 5b59ef8            | 115    | post-MLP→next-input fused        |
+| 35df347            | 117    | vanilla QKV concat fusion        |
+| 21cedec            | 120    | DN 4-projection (qkv+z+a+b) concat |
+| 0ba7349            | 121    | DN gated rmsnorm tail fuse      |
+| aac7f50            | 121    | DN conv1d + gated_delta fuse     |
+| 112e85f            | **122** | **persistent compute encoder**  |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
-| (agent-infer ref)  | ~200   | MLX bf16 + custom Q4_K + compiled fused kernels |
+| (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
+
+Per-layer cost is ~245us (consistent across MAX_LAYERS=N benches), so 24
+layers cost ~5.88ms + 2.46ms (embed + lm_head + sample) ≈ 8.34ms / token
+= ~120 tok/s. lm_head + final-norm path is already at memory-bandwidth
+limit (~1.55ms for 300MB fp16 lm_head ÷ 200 GB/s bw). To reach 200 tok/s
+(5ms / token) the layer budget would need to drop to ~106us/layer — 2.3×
+faster — which requires writing a custom fp16/bf16 GEMV that *beats* MPS
+on these shapes. Codex's qmv_quad attempt was slower on this host.
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
