@@ -979,24 +979,31 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         return;
 
     const uint32_t q_rows = metal_matrix_rows_from_bytes(wq, hidden);
-    if (q_rows && q_rows % head_dim == 0) {
+    /* Qwen3.5/3.6 vanilla q_proj output is n_heads * head_dim * 2 when the
+     * attention has a Q-gate (per-head [Q(hd) | gate(hd)] concat). Detect
+     * by comparing wq rows against the caller-supplied n_heads. */
+    uint32_t q_has_gate = 0;
+    if (q_rows == 2u * n_heads * head_dim) {
+        q_has_gate = 1;
+    } else if (q_rows && q_rows % head_dim == 0) {
         const uint32_t inferred_heads = q_rows / head_dim;
         if (inferred_heads) n_heads = inferred_heads;
     }
 
     uint32_t q_len = n_heads * head_dim;
+    uint32_t q_proj_out_len = q_has_gate ? (2u * q_len) : q_len;
     uint32_t kv_len = n_kv * head_dim;
     uint32_t positions = seq_pos + 1;
     if (y->bytes < (size_t)q_len * sizeof(float)) return;
     qw36_gpu_buf *q = metal_scratch(ctx, &ctx->attn_q_scratch,
-        (size_t)q_len * sizeof(float), QW36_DTYPE_F32);
+        (size_t)q_proj_out_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *k = metal_scratch(ctx, &ctx->attn_k_scratch,
         (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *v = metal_scratch(ctx, &ctx->attn_v_scratch,
         (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
     if (!q || !k || !v) return;
 
-    metal_matmul(ctx, q, x, wq, 1, q_len, hidden);
+    metal_matmul(ctx, q, x, wq, 1, q_proj_out_len, hidden);
     metal_matmul(ctx, k, x, wk, 1, kv_len, hidden);
     metal_matmul(ctx, v, x, wv, 1, kv_len, hidden);
 
@@ -1045,6 +1052,9 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         if (!f16_kv) {
             [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:19];
             [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
+            [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:21];
+        } else {
+            [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:19];
         }
         [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
                                 atIndex:0];

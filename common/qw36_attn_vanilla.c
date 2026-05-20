@@ -121,7 +121,18 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     const size_t hidden = fc->hidden;
     float *x = st->x;
 
-    if (!c->has_q_gate &&
+    /* GPU fast-path. Allowed when there is no Q-gate, OR when there is a
+     * Q-gate but all of q/k/v are fp16 (the fused decode kernel handles
+     * the gate; the slower prep+score+combine fallback does not). */
+    const qw36_lazy_w *wq_lw = (const qw36_lazy_w *)L->q_proj;
+    const qw36_lazy_w *wk_lw = (const qw36_lazy_w *)L->k_proj;
+    const qw36_lazy_w *wv_lw = (const qw36_lazy_w *)L->v_proj;
+    const int qgate_gpu_ok = !c->has_q_gate ||
+        (wq_lw && wk_lw && wv_lw &&
+         wq_lw->dtype == QW36_DTYPE_F16 &&
+         wk_lw->dtype == QW36_DTYPE_F16 &&
+         wv_lw->dtype == QW36_DTYPE_F16);
+    if (qgate_gpu_ok &&
         fc->gpu_state && eng->backend && eng->backend->rmsnorm &&
         eng->backend->matmul && eng->backend->attention &&
         eng->backend->residual_add &&
@@ -188,8 +199,12 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     trace_tensor(trace, "input_layernorm_out", st->x_rms, hidden,
                  shape_hidden, 3);
 
+    /* The host attention_dispatch routes through metal_attention which
+     * handles Q-gate via its fused fp16 path; only enable when the same
+     * fp16 condition is met so the prep+score+combine fallback isn't
+     * taken (it cannot consume the gated q layout). */
     int used_backend_attention = 0;
-    if (!c->has_q_gate) {
+    if (qgate_gpu_ok) {
         used_backend_attention = qw36__attention_dispatch(staging, st->x_rms, L,
             (float *)st->k_cache[layer_idx], (float *)st->v_cache[layer_idx],
             c, st->seq_pos, st->seq_capacity);
