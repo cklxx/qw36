@@ -1159,7 +1159,9 @@ static void metal_attention(qw36_gpu_ctx *ctx,
                             uint32_t seq_capacity,
                             float rope_theta, float partial_rotary_factor)
 {
-    if (!ctx || !y || !x || !wq || !wk || !wv || !q_norm || !k_norm ||
+    const int fused_qkv = wq && !wk && !wv;
+    if (!ctx || !y || !x || !wq || (!fused_qkv && (!wk || !wv)) ||
+        !q_norm || !k_norm ||
         !k_cache || !v_cache || n_heads == 0 || n_kv == 0 || head_dim == 0)
         return;
 
@@ -1167,30 +1169,54 @@ static void metal_attention(qw36_gpu_ctx *ctx,
     /* Qwen3.5/3.6 vanilla q_proj output is n_heads * head_dim * 2 when the
      * attention has a Q-gate (per-head [Q(hd) | gate(hd)] concat). Detect
      * by comparing wq rows against the caller-supplied n_heads. */
+    uint32_t q_len = n_heads * head_dim;
+    uint32_t kv_len = n_kv * head_dim;
     uint32_t q_has_gate = 0;
-    if (q_rows == 2u * n_heads * head_dim) {
+    uint32_t fused_rows = 0;
+    if (fused_qkv && q_rows == 2u * q_len + 2u * kv_len) {
+        q_has_gate = 1;
+        fused_rows = q_rows;
+    } else if (fused_qkv && q_rows == q_len + 2u * kv_len) {
+        fused_rows = q_rows;
+    } else if (q_rows == 2u * n_heads * head_dim) {
         q_has_gate = 1;
     } else if (q_rows && q_rows % head_dim == 0) {
         const uint32_t inferred_heads = q_rows / head_dim;
         if (inferred_heads) n_heads = inferred_heads;
     }
 
-    uint32_t q_len = n_heads * head_dim;
+    q_len = n_heads * head_dim;
     uint32_t q_proj_out_len = q_has_gate ? (2u * q_len) : q_len;
-    uint32_t kv_len = n_kv * head_dim;
+    if (fused_rows && fused_rows != q_proj_out_len + 2u * kv_len) return;
     uint32_t positions = seq_pos + 1;
     if (y->bytes < (size_t)q_len * sizeof(float)) return;
+    const uint32_t q_scratch_len = fused_rows ? fused_rows : q_proj_out_len;
     qw36_gpu_buf *q = metal_scratch(ctx, &ctx->attn_q_scratch,
-        (size_t)q_proj_out_len * sizeof(float), QW36_DTYPE_F32);
-    qw36_gpu_buf *k = metal_scratch(ctx, &ctx->attn_k_scratch,
-        (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
-    qw36_gpu_buf *v = metal_scratch(ctx, &ctx->attn_v_scratch,
-        (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
+        (size_t)q_scratch_len * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *k = q;
+    qw36_gpu_buf *v = q;
+    NSUInteger k_byte_offset = (NSUInteger)q_proj_out_len * sizeof(float);
+    NSUInteger v_byte_offset = (NSUInteger)(q_proj_out_len + kv_len) * sizeof(float);
+    uint32_t q_elem_offset = 0;
+    uint32_t k_elem_offset = q_proj_out_len;
+    uint32_t v_elem_offset = q_proj_out_len + kv_len;
+    if (!fused_rows) {
+        k = metal_scratch(ctx, &ctx->attn_k_scratch,
+            (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
+        v = metal_scratch(ctx, &ctx->attn_v_scratch,
+            (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
+        k_byte_offset = 0;
+        v_byte_offset = 0;
+        k_elem_offset = 0;
+        v_elem_offset = 0;
+    }
     if (!q || !k || !v) return;
 
-    metal_matmul(ctx, q, x, wq, 1, q_proj_out_len, hidden);
-    metal_matmul(ctx, k, x, wk, 1, kv_len, hidden);
-    metal_matmul(ctx, v, x, wv, 1, kv_len, hidden);
+    metal_matmul(ctx, q, x, wq, 1, q_scratch_len, hidden);
+    if (!fused_rows) {
+        metal_matmul(ctx, k, x, wk, 1, kv_len, hidden);
+        metal_matmul(ctx, v, x, wv, 1, kv_len, hidden);
+    }
 
     float rms_eps = 1.0e-6f;
     uint32_t k_cache_dtype = (uint32_t)k_cache->dtype;
@@ -1204,12 +1230,14 @@ static void metal_attention(qw36_gpu_ctx *ctx,
     int wq_ok = wq->dtype == QW36_DTYPE_F16 ||
                 wq->dtype == QW36_DTYPE_Q4_K || wq->dtype == QW36_DTYPE_Q5_K ||
                 wq->dtype == QW36_DTYPE_Q6_K || wq->dtype == QW36_DTYPE_Q8_0;
-    int wk_ok = wk->dtype == QW36_DTYPE_F16 ||
-                wk->dtype == QW36_DTYPE_Q4_K || wk->dtype == QW36_DTYPE_Q5_K ||
-                wk->dtype == QW36_DTYPE_Q6_K || wk->dtype == QW36_DTYPE_Q8_0;
-    int wv_ok = wv->dtype == QW36_DTYPE_F16 ||
-                wv->dtype == QW36_DTYPE_Q4_K || wv->dtype == QW36_DTYPE_Q5_K ||
-                wv->dtype == QW36_DTYPE_Q6_K || wv->dtype == QW36_DTYPE_Q8_0;
+    int wk_ok = fused_rows ? wq_ok :
+                (wk->dtype == QW36_DTYPE_F16 ||
+                 wk->dtype == QW36_DTYPE_Q4_K || wk->dtype == QW36_DTYPE_Q5_K ||
+                 wk->dtype == QW36_DTYPE_Q6_K || wk->dtype == QW36_DTYPE_Q8_0);
+    int wv_ok = fused_rows ? wq_ok :
+                (wv->dtype == QW36_DTYPE_F16 ||
+                 wv->dtype == QW36_DTYPE_Q4_K || wv->dtype == QW36_DTYPE_Q5_K ||
+                 wv->dtype == QW36_DTYPE_Q6_K || wv->dtype == QW36_DTYPE_Q8_0);
     if (wq_ok && wk_ok && wv_ok &&
         tg_size <= 256 &&
         tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
@@ -1250,9 +1278,15 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:21];
             [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:22];
+            [enc setBytes:&q_elem_offset length:sizeof(q_elem_offset) atIndex:23];
+            [enc setBytes:&k_elem_offset length:sizeof(k_elem_offset) atIndex:24];
+            [enc setBytes:&v_elem_offset length:sizeof(v_elem_offset) atIndex:25];
         } else {
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:19];
             [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:20];
+            [enc setBytes:&q_elem_offset length:sizeof(q_elem_offset) atIndex:21];
+            [enc setBytes:&k_elem_offset length:sizeof(k_elem_offset) atIndex:22];
+            [enc setBytes:&v_elem_offset length:sizeof(v_elem_offset) atIndex:23];
         }
         [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
                                 atIndex:0];
@@ -1268,8 +1302,8 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
         uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
         [enc setBuffer:q->mtl       offset:0 atIndex:0];
-        [enc setBuffer:k->mtl       offset:0 atIndex:1];
-        [enc setBuffer:v->mtl       offset:0 atIndex:2];
+        [enc setBuffer:k->mtl       offset:k_byte_offset atIndex:1];
+        [enc setBuffer:v->mtl       offset:v_byte_offset atIndex:2];
         [enc setBuffer:k_cache->mtl offset:0 atIndex:3];
         [enc setBuffer:v_cache->mtl offset:0 atIndex:4];
         [enc setBuffer:q_norm->mtl  offset:0 atIndex:5];

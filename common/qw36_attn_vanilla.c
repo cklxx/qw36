@@ -127,6 +127,7 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     const qw36_lazy_w *wq_lw = (const qw36_lazy_w *)L->q_proj;
     const qw36_lazy_w *wk_lw = (const qw36_lazy_w *)L->k_proj;
     const qw36_lazy_w *wv_lw = (const qw36_lazy_w *)L->v_proj;
+    const int fused_qkv = wq_lw && !wk_lw && !wv_lw;
     /* The fused decode kernel reads q/k/v as fp32; the matmul writing them
      * may be either MPS (when weights are F16) or the native quantised
      * dequant+gemv kernel (when weights stay Q4_K/Q5_K/Q6_K/Q8_0 on GPU).
@@ -136,17 +137,19 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     #define QW36_FUSED_DTYPE_OK(d_) ((d_) == QW36_DTYPE_F16 || \
         (d_) == QW36_DTYPE_Q4_K || (d_) == QW36_DTYPE_Q5_K || \
         (d_) == QW36_DTYPE_Q6_K || (d_) == QW36_DTYPE_Q8_0)
-    const int dtype_ok = wq_lw && wk_lw && wv_lw &&
-        QW36_FUSED_DTYPE_OK(wq_lw->dtype) &&
-        QW36_FUSED_DTYPE_OK(wk_lw->dtype) &&
-        QW36_FUSED_DTYPE_OK(wv_lw->dtype);
+    const int dtype_ok = fused_qkv
+        ? (wq_lw && QW36_FUSED_DTYPE_OK(wq_lw->dtype))
+        : (wq_lw && wk_lw && wv_lw &&
+           QW36_FUSED_DTYPE_OK(wq_lw->dtype) &&
+           QW36_FUSED_DTYPE_OK(wk_lw->dtype) &&
+           QW36_FUSED_DTYPE_OK(wv_lw->dtype));
     #undef QW36_FUSED_DTYPE_OK
     const int qgate_gpu_ok = !c->has_q_gate || dtype_ok;
     if (qgate_gpu_ok &&
         fc->gpu_state && eng->backend && eng->backend->rmsnorm &&
         eng->backend->matmul && eng->backend->attention &&
         eng->backend->residual_add &&
-        L->q_proj && L->k_proj && L->v_proj && L->o_proj &&
+        L->q_proj && (fused_qkv || (L->k_proj && L->v_proj)) && L->o_proj &&
         L->q_norm && L->k_norm &&
         st->k_cache_dev && st->v_cache_dev &&
         st->k_cache_dev[layer_idx] && st->v_cache_dev[layer_idx])
@@ -245,12 +248,32 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
 
     if (!used_backend_attention) {
         int v_rc = 0;
-        if (c->has_q_gate) {
-            if (!st->q_full || !st->q_gate) return -3;
-            v_rc |= qw36__matmul_lazy(st->q_full, st->x_rms,
+        const size_t q_proj_out = c->has_q_gate ? (size_t)q_dim * 2 : q_dim;
+        const size_t fused_qkv_n = q_proj_out + (size_t)kv_dim * 2;
+        float *qkv_raw = NULL;
+        const float *q_raw = NULL;
+        const float *k_raw = NULL;
+        const float *v_raw = NULL;
+        if (fused_qkv) {
+            qkv_raw = (float *)malloc(fused_qkv_n * sizeof(float));
+            if (!qkv_raw) return -3;
+            v_rc |= qw36__matmul_lazy(qkv_raw, st->x_rms,
                                       (const qw36_lazy_w *)L->q_proj,
                                       fc->row_scratch);
-            trace_tensor(trace, "q_proj_raw", st->q_full, (size_t)q_dim * 2,
+            q_raw = qkv_raw;
+            k_raw = qkv_raw + q_proj_out;
+            v_raw = k_raw + kv_dim;
+        }
+        if (c->has_q_gate) {
+            if (!st->q_full || !st->q_gate) { free(qkv_raw); return -3; }
+            if (fused_qkv) {
+                memcpy(st->q_full, q_raw, q_proj_out * sizeof(float));
+            } else {
+                v_rc |= qw36__matmul_lazy(st->q_full, st->x_rms,
+                                          (const qw36_lazy_w *)L->q_proj,
+                                          fc->row_scratch);
+            }
+            trace_tensor(trace, "q_proj_raw", st->q_full, q_proj_out,
                          shape_q_raw, 3);
             for (uint32_t h = 0; h < c->num_attention_heads; h++) {
                 const float *src = st->q_full + (size_t)h * 2 * c->head_dim;
@@ -264,9 +287,13 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
             trace_tensor(trace, "gate_split", st->q_gate, q_dim,
                          shape_q_split, 4);
         } else {
-            v_rc |= qw36__matmul_lazy(st->q, st->x_rms,
-                                      (const qw36_lazy_w *)L->q_proj,
-                                      fc->row_scratch);
+            if (fused_qkv) {
+                memcpy(st->q, q_raw, q_dim * sizeof(float));
+            } else {
+                v_rc |= qw36__matmul_lazy(st->q, st->x_rms,
+                                          (const qw36_lazy_w *)L->q_proj,
+                                          fc->row_scratch);
+            }
             trace_tensor(trace, "q_proj_raw", st->q, q_dim, shape_q_raw, 3);
         }
 
@@ -274,22 +301,29 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                      + (size_t)st->seq_pos * kv_dim;
         float *v_row = (float *)st->v_cache[layer_idx]
                      + (size_t)st->seq_pos * kv_dim;
-        v_rc |= qw36__matmul_lazy(k_row, st->x_rms,
-                                  (const qw36_lazy_w *)L->k_proj,
-                                  fc->row_scratch);
-        v_rc |= qw36__matmul_lazy(v_row, st->x_rms,
-                                  (const qw36_lazy_w *)L->v_proj,
-                                  fc->row_scratch);
+        if (fused_qkv) {
+            memcpy(k_row, k_raw, kv_dim * sizeof(float));
+            memcpy(v_row, v_raw, kv_dim * sizeof(float));
+        } else {
+            v_rc |= qw36__matmul_lazy(k_row, st->x_rms,
+                                      (const qw36_lazy_w *)L->k_proj,
+                                      fc->row_scratch);
+            v_rc |= qw36__matmul_lazy(v_row, st->x_rms,
+                                      (const qw36_lazy_w *)L->v_proj,
+                                      fc->row_scratch);
+        }
         trace_tensor(trace, "k_proj_raw", k_row, kv_dim, shape_kv_raw, 3);
         trace_tensor(trace, "v_proj_raw", v_row, kv_dim, shape_kv_raw, 3);
         if (v_rc) {
             fprintf(stderr, "qw36: vanilla QKV failed at layer %u "
                     "(ggml types %d/%d/%d)\n", layer_idx,
                     ((const qw36_lazy_w *)L->q_proj)->ggml_type,
-                    ((const qw36_lazy_w *)L->k_proj)->ggml_type,
-                    ((const qw36_lazy_w *)L->v_proj)->ggml_type);
+                    L->k_proj ? ((const qw36_lazy_w *)L->k_proj)->ggml_type : -1,
+                    L->v_proj ? ((const qw36_lazy_w *)L->v_proj)->ggml_type : -1);
+            free(qkv_raw);
             return -6;
         }
+        free(qkv_raw);
 
         for (uint32_t h = 0; h < c->num_attention_heads; h++) {
             float *qh = st->q + (size_t)h * c->head_dim;

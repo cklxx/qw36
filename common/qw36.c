@@ -224,6 +224,67 @@ static int lazy_fuse_dense_gate_up(qw36_engine *eng, qw36_layer_weights *L) {
     return 0;
 }
 
+/* Metal vanilla-attention fast path: concatenate q_proj/k_proj/v_proj into one
+ * dense [q_rows + k_rows + v_rows, hidden] fp16 matrix after materialization and
+ * before upload. L->k_proj == NULL && L->v_proj == NULL is the internal signal
+ * that L->q_proj contains the fused QKV matrix. Q-gated layers keep the Q half
+ * layout intact: per-head [Q(head_dim) | gate(head_dim)] rows come first. */
+static int lazy_fuse_vanilla_qkv(qw36_engine *eng, qw36_layer_weights *L,
+                                 const qw36_config *c) {
+    if (!eng || !L || !c || !L->q_proj || !L->k_proj || !L->v_proj)
+        return 0;
+    qw36_lazy_w *q = (qw36_lazy_w *)L->q_proj;
+    qw36_lazy_w *k = (qw36_lazy_w *)L->k_proj;
+    qw36_lazy_w *v = (qw36_lazy_w *)L->v_proj;
+    if (q->dtype != QW36_DTYPE_F16 || k->dtype != QW36_DTYPE_F16 ||
+        v->dtype != QW36_DTYPE_F16 ||
+        q->cols != k->cols || q->cols != v->cols ||
+        q->n_extra || k->n_extra || v->n_extra)
+        return 0;
+
+    const uint64_t q_dim =
+        (uint64_t)c->num_attention_heads * c->head_dim;
+    const uint64_t kv_dim =
+        (uint64_t)c->num_key_value_heads * c->head_dim;
+    const uint64_t q_rows = c->has_q_gate ? q_dim * 2u : q_dim;
+    if (q->rows != q_rows || k->rows != kv_dim || v->rows != kv_dim)
+        return 0;
+    if (q_rows > UINT64_MAX - kv_dim ||
+        q_rows + kv_dim > UINT64_MAX - kv_dim)
+        return -1;
+
+    const uint64_t rows64 = q_rows + kv_dim + kv_dim;
+    const size_t cols = (size_t)q->cols;
+    if (rows64 > SIZE_MAX) return -1;
+    const size_t rows = (size_t)rows64;
+    if (cols && rows > SIZE_MAX / cols) return -1;
+    const size_t numel = rows * cols;
+    if (numel > SIZE_MAX / sizeof(uint16_t)) return -1;
+    const size_t q_bytes = (size_t)q_rows * cols * sizeof(uint16_t);
+    const size_t kv_bytes = (size_t)kv_dim * cols * sizeof(uint16_t);
+
+    uint8_t *buf = (uint8_t *)malloc(numel * sizeof(uint16_t));
+    qw36_lazy_w *fused = (qw36_lazy_w *)calloc(1, sizeof(*fused));
+    if (!buf || !fused) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    memcpy(buf, q->data, q_bytes);
+    memcpy(buf + q_bytes, k->data, kv_bytes);
+    memcpy(buf + q_bytes + kv_bytes, v->data, kv_bytes);
+    *fused = *q;
+    fused->data = buf;
+    fused->rows = rows64;
+    fused->gpu_buf = NULL;
+    qw36__eng_own(eng, buf);
+    qw36__eng_own(eng, fused);
+    L->q_proj = fused;
+    L->k_proj = NULL;
+    L->v_proj = NULL;
+    return 0;
+}
+
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
@@ -579,6 +640,11 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             qgpu_env && atoi(qgpu_env) != 0;
         const int fuse_dense_gate_up =
             backend->name && strcmp(backend->name, "metal") == 0;
+        const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
+        const int fuse_vanilla_qkv =
+            backend->name && strcmp(backend->name, "metal") == 0 &&
+            fp16_lazy_weights && !quant_gpu_weights &&
+            (!fuse_qkv_env || atoi(fuse_qkv_env) != 0);
 
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
@@ -651,6 +717,17 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 if (lazy_fuse_dense_gate_up(eng, L)) {
                     if (err && err_cap) snprintf(err, err_cap,
                         "%s: backend gate_up fuse failed at blk.%u",
+                        backend->name, l);
+                    qw36_engine_close(eng); return NULL;
+                }
+            }
+        }
+        if (fuse_vanilla_qkv) {
+            for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+                qw36_layer_weights *L = &eng->weights.layers[l];
+                if (lazy_fuse_vanilla_qkv(eng, L, c)) {
+                    if (err && err_cap) snprintf(err, err_cap,
+                        "%s: backend qkv fuse failed at blk.%u",
                         backend->name, l);
                     qw36_engine_close(eng); return NULL;
                 }

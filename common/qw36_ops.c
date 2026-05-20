@@ -581,9 +581,11 @@ int qw36__attention_dispatch(float *y, const float *x,
     const qw36_lazy_w *wq = (const qw36_lazy_w *)L->q_proj;
     const qw36_lazy_w *wk = (const qw36_lazy_w *)L->k_proj;
     const qw36_lazy_w *wv = (const qw36_lazy_w *)L->v_proj;
+    const int fused_qkv = wq && !wk && !wv;
     qw36_gpu_backend *be;
     qw36_gpu_ctx *ctx;
-    if (!wq || !wk || !wv || !wq->gpu_buf || !wk->gpu_buf || !wv->gpu_buf ||
+    if (!wq || !wq->gpu_buf ||
+        (!fused_qkv && (!wk || !wv || !wk->gpu_buf || !wv->gpu_buf)) ||
         !L->q_norm || !L->k_norm ||
         !qw36__active_backend(&be, &ctx) || !be->attention)
         return 0;
@@ -604,7 +606,9 @@ int qw36__attention_dispatch(float *y, const float *x,
     qw36_gpu_buf *kb = be->upload(ctx, k_cache, cache_bytes, QW36_DTYPE_F32);
     qw36_gpu_buf *vb = be->upload(ctx, v_cache, cache_bytes, QW36_DTYPE_F32);
     if (xb && yb && qnb && knb && kb && vb) {
-        be->attention(ctx, yb, xb, wq->gpu_buf, wk->gpu_buf, wv->gpu_buf,
+        be->attention(ctx, yb, xb, wq->gpu_buf,
+                      fused_qkv ? NULL : wk->gpu_buf,
+                      fused_qkv ? NULL : wv->gpu_buf,
                       qnb, knb, kb, vb,
                       c->hidden_size, c->num_attention_heads,
                       c->num_key_value_heads, c->head_dim,
@@ -641,11 +645,13 @@ int qw36__attention_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
     const qw36_lazy_w *wq = (const qw36_lazy_w *)L->q_proj;
     const qw36_lazy_w *wk = (const qw36_lazy_w *)L->k_proj;
     const qw36_lazy_w *wv = (const qw36_lazy_w *)L->v_proj;
+    const int fused_qkv = wq && !wk && !wv;
     qw36_engine *eng = qw36__active_engine;
     qw36_gpu_backend *be;
     qw36_gpu_ctx *ctx;
     if (!y || !x || !k_cache || !v_cache ||
-        !wq || !wk || !wv || !wq->gpu_buf || !wk->gpu_buf || !wv->gpu_buf ||
+        !wq || !wq->gpu_buf ||
+        (!fused_qkv && (!wk || !wv || !wk->gpu_buf || !wv->gpu_buf)) ||
         !L->q_norm || !L->k_norm ||
         !qw36__active_backend(&be, &ctx) || !be->attention)
         return -1;
@@ -656,7 +662,9 @@ int qw36__attention_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
         (size_t)c->head_dim * sizeof(float), QW36_DTYPE_F32);
     if (!qnb || !knb) return -1;
 
-    be->attention(ctx, y, x, wq->gpu_buf, wk->gpu_buf, wv->gpu_buf,
+    be->attention(ctx, y, x, wq->gpu_buf,
+                  fused_qkv ? NULL : wk->gpu_buf,
+                  fused_qkv ? NULL : wv->gpu_buf,
                   qnb, knb, k_cache, v_cache,
                   c->hidden_size, c->num_attention_heads,
                   c->num_key_value_heads, c->head_dim,

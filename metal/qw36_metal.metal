@@ -787,6 +787,9 @@ kernel void qw36_attn_decode_fused_f32(
     constant uint      &v_cache_dtype [[buffer(20)]],
     constant uint      &q_has_gate    [[buffer(21)]],
     constant uint      &y_dtype       [[buffer(22)]],
+    constant uint      &q_offset      [[buffer(23)]],
+    constant uint      &k_offset      [[buffer(24)]],
+    constant uint      &v_offset      [[buffer(25)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -808,10 +811,13 @@ kernel void qw36_attn_decode_fused_f32(
     uint simd_id = lane >> 5;
     uint simd_count = (tg_size + 31u) >> 5;
 
+    device const float *q_base = q_raw + q_offset;
+    device const float *k_base = k_raw + k_offset;
+    device const float *v_base = v_raw + v_offset;
     uint q_head_stride = q_has_gate ? (2u * head_dim) : head_dim;
-    device const float *qh_base = q_raw + h * q_head_stride;
-    device const float *gate_base = q_raw + h * 2u * head_dim + head_dim;
-    device const float *kh_base = k_raw + kvh * head_dim;
+    device const float *qh_base = q_base + h * q_head_stride;
+    device const float *gate_base = q_base + h * 2u * head_dim + head_dim;
+    device const float *kh_base = k_base + kvh * head_dim;
 
     float q_in = (lane < head_dim) ? qh_base[lane] : 0.0f;
     float k_in = (lane < head_dim) ? kh_base[lane] : 0.0f;
@@ -857,7 +863,7 @@ kernel void qw36_attn_decode_fused_f32(
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
         uint off = seq_pos * kv_len + kvh * head_dim + lane;
         qw36_store_scalar(k_cache, k_cache_dtype, off, kv);
-        qw36_store_scalar(v_cache, v_cache_dtype, off, v_raw[kvh * head_dim + lane]);
+        qw36_store_scalar(v_cache, v_cache_dtype, off, v_base[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -896,7 +902,7 @@ kernel void qw36_attn_decode_fused_f32(
         float acc = 0.0f;
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
-                ? v_raw[kvh * head_dim + lane]
+                ? v_base[kvh * head_dim + lane]
                 : qw36_load_scalar(v_cache, v_cache_dtype,
                                    t * kv_len + kvh * head_dim + lane);
             acc += scores[t] * vv;
@@ -931,6 +937,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     constant uint      &tg_size      [[buffer(18)]],
     constant uint      &q_has_gate   [[buffer(19)]],
     constant uint      &y_dtype      [[buffer(20)]],
+    constant uint      &q_offset     [[buffer(21)]],
+    constant uint      &k_offset     [[buffer(22)]],
+    constant uint      &v_offset     [[buffer(23)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -952,10 +961,13 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     uint simd_id = lane >> 5;
     uint simd_count = (tg_size + 31u) >> 5;
 
+    device const float *q_base = q_raw + q_offset;
+    device const float *k_base = k_raw + k_offset;
+    device const float *v_base = v_raw + v_offset;
     uint q_head_stride = q_has_gate ? (2u * head_dim) : head_dim;
-    device const float *qh_base = q_raw + h * q_head_stride;
-    device const float *gate_base = q_raw + h * 2u * head_dim + head_dim;
-    device const float *kh_base = k_raw + kvh * head_dim;
+    device const float *qh_base = q_base + h * q_head_stride;
+    device const float *gate_base = q_base + h * 2u * head_dim + head_dim;
+    device const float *kh_base = k_base + kvh * head_dim;
 
     float q_in = (lane < head_dim) ? qh_base[lane] : 0.0f;
     float k_in = (lane < head_dim) ? kh_base[lane] : 0.0f;
@@ -1001,7 +1013,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
         uint off = seq_pos * kv_len + kvh * head_dim + lane;
         k_cache[off] = half(kv);
-        v_cache[off] = half(v_raw[kvh * head_dim + lane]);
+        v_cache[off] = half(v_base[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1039,7 +1051,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
         float acc = 0.0f;
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
-                ? v_raw[kvh * head_dim + lane]
+                ? v_base[kvh * head_dim + lane]
                 : float(v_cache[t * kv_len + kvh * head_dim + lane]);
             acc += scores[t] * vv;
         }
