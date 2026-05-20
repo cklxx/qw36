@@ -86,6 +86,24 @@ kernel void qw36_matmul_f32(
     y[gid] = acc;
 }
 
+kernel void qw36_f32_to_f16_f32(
+    device half        *out [[buffer(0)]],
+    device const float *in  [[buffer(1)]],
+    constant uint      &n   [[buffer(2)]],
+    uint                tid [[thread_position_in_grid]])
+{
+    if (tid < n) out[tid] = half(in[tid]);
+}
+
+kernel void qw36_f16_to_f32_f32(
+    device float      *out [[buffer(0)]],
+    device const half *in  [[buffer(1)]],
+    constant uint     &n   [[buffer(2)]],
+    uint               tid [[thread_position_in_grid]])
+{
+    if (tid < n) out[tid] = float(in[tid]);
+}
+
 /* ---------------------------------------------------------------- */
 /* SwiGLU MLP composition stays in host code (three matmuls + silu); */
 /* a dedicated fused kernel can come later.                          */
@@ -476,9 +494,149 @@ kernel void qw36_attn_combine_f32(
 }
 
 /* ---------------------------------------------------------------- */
-/* Attention is split across q/k/v matmul, head_norm_rope, kv_append, */
-/* attn_scores, attn_softmax, and attn_combine.                       */
+/* Decode attention fast path: after q/k/v matmul, reduce the six tiny */
+/* post-projection dispatches to two kernels.                          */
 /* ---------------------------------------------------------------- */
+kernel void qw36_attn_prep_decode_f32(
+    device float       *q            [[buffer(0)]],
+    device float       *k            [[buffer(1)]],
+    device const float *v            [[buffer(2)]],
+    device float       *k_cache      [[buffer(3)]],
+    device float       *v_cache      [[buffer(4)]],
+    device const uchar *q_norm       [[buffer(5)]],
+    device const uchar *k_norm       [[buffer(6)]],
+    constant uint      &n_heads      [[buffer(7)]],
+    constant uint      &n_kv         [[buffer(8)]],
+    constant uint      &head_dim     [[buffer(9)]],
+    constant uint      &seq_pos      [[buffer(10)]],
+    constant uint      &seq_capacity [[buffer(11)]],
+    constant float     &theta        [[buffer(12)]],
+    constant float     &partial      [[buffer(13)]],
+    constant float     &eps          [[buffer(14)]],
+    constant uint      &q_w_dtype    [[buffer(15)]],
+    constant uint      &k_w_dtype    [[buffer(16)]],
+    uint                gid          [[thread_position_in_grid]])
+{
+    uint rot_dim = uint(float(head_dim) * partial);
+    if (rot_dim > head_dim) rot_dim = head_dim;
+    rot_dim &= ~1u;
+    uint half_dim = rot_dim / 2;
+
+    if (gid < n_heads) {
+        device float *qh = q + gid * head_dim;
+        float ss = 0.0f;
+        for (uint d = 0; d < head_dim; ++d) ss += qh[d] * qh[d];
+        float scale = rsqrt(ss / float(head_dim) + eps);
+        for (uint pair = 0; pair < half_dim; ++pair) {
+            uint d0 = pair;
+            uint d1 = pair + half_dim;
+            float x0 = qh[d0] * scale * qw36_load_scalar(q_norm, q_w_dtype, d0);
+            float x1 = qh[d1] * scale * qw36_load_scalar(q_norm, q_w_dtype, d1);
+            float inv_freq = 1.0f / pow(theta, (2.0f * float(pair)) / float(rot_dim));
+            float angle = float(seq_pos) * inv_freq;
+            float c = cos(angle);
+            float s = sin(angle);
+            qh[d0] = x0 * c - x1 * s;
+            qh[d1] = x0 * s + x1 * c;
+        }
+        for (uint d = rot_dim; d < head_dim; ++d)
+            qh[d] *= scale * qw36_load_scalar(q_norm, q_w_dtype, d);
+        return;
+    }
+
+    uint kvh = gid - n_heads;
+    if (kvh >= n_kv) return;
+    device float *kh = k + kvh * head_dim;
+    float ss = 0.0f;
+    for (uint d = 0; d < head_dim; ++d) ss += kh[d] * kh[d];
+    float scale = rsqrt(ss / float(head_dim) + eps);
+    for (uint pair = 0; pair < half_dim; ++pair) {
+        uint d0 = pair;
+        uint d1 = pair + half_dim;
+        float x0 = kh[d0] * scale * qw36_load_scalar(k_norm, k_w_dtype, d0);
+        float x1 = kh[d1] * scale * qw36_load_scalar(k_norm, k_w_dtype, d1);
+        float inv_freq = 1.0f / pow(theta, (2.0f * float(pair)) / float(rot_dim));
+        float angle = float(seq_pos) * inv_freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        kh[d0] = x0 * c - x1 * s;
+        kh[d1] = x0 * s + x1 * c;
+    }
+    for (uint d = rot_dim; d < head_dim; ++d)
+        kh[d] *= scale * qw36_load_scalar(k_norm, k_w_dtype, d);
+
+    if (seq_pos >= seq_capacity) return;
+    uint kv_len = n_kv * head_dim;
+    device float *kc = k_cache + seq_pos * kv_len + kvh * head_dim;
+    device float *vc = v_cache + seq_pos * kv_len + kvh * head_dim;
+    device const float *vh = v + kvh * head_dim;
+    for (uint d = 0; d < head_dim; ++d) {
+        kc[d] = kh[d];
+        vc[d] = vh[d];
+    }
+}
+
+kernel void qw36_attn_score_combine_tg_f32(
+    device float       *y            [[buffer(0)]],
+    device const float *q            [[buffer(1)]],
+    device const float *k_cache      [[buffer(2)]],
+    device const float *v_cache      [[buffer(3)]],
+    constant uint      &n_heads      [[buffer(4)]],
+    constant uint      &n_kv         [[buffer(5)]],
+    constant uint      &head_dim     [[buffer(6)]],
+    constant uint      &seq_pos      [[buffer(7)]],
+    constant uint      &seq_capacity [[buffer(8)]],
+    constant uint      &tg_size      [[buffer(9)]],
+    threadgroup float  *scratch      [[threadgroup(0)]],
+    uint                lane         [[thread_index_in_threadgroup]],
+    uint3               tg_pos       [[threadgroup_position_in_grid]])
+{
+    uint h = tg_pos.x;
+    if (h >= n_heads || seq_pos >= seq_capacity) return;
+
+    uint count = seq_pos + 1;
+    uint kvh = h * n_kv / n_heads;
+    uint kv_len = n_kv * head_dim;
+    device const float *qh = q + h * head_dim;
+    threadgroup float *partials = scratch;
+    threadgroup float *scores = scratch + tg_size;
+    float inv_sqrt_d = rsqrt(float(head_dim));
+
+    for (uint t = 0; t < count; ++t) {
+        device const float *kh = k_cache + t * kv_len + kvh * head_dim;
+        partials[lane] = (lane < head_dim) ? qh[lane] * kh[lane] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+            if (lane < stride) partials[lane] += partials[lane + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) scores[t] = partials[0] * inv_sqrt_d;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        float maxv = scores[0];
+        for (uint t = 1; t < count; ++t) maxv = max(maxv, scores[t]);
+        float sum = 0.0f;
+        for (uint t = 0; t < count; ++t) {
+            float e = exp(scores[t] - maxv);
+            scores[t] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (uint t = 0; t < count; ++t) scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane < head_dim) {
+        float acc = 0.0f;
+        for (uint t = 0; t < count; ++t) {
+            uint off = t * kv_len + kvh * head_dim + lane;
+            acc += scores[t] * v_cache[off];
+        }
+        y[h * head_dim + lane] = acc;
+    }
+}
 
 /* =============================================================================
  * Gated Delta Rule step — transliterated from agent-infer's

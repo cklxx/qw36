@@ -89,6 +89,7 @@ other agent picks up from there.
 | 2026-05-20 | Claude | engine    | c479cad  | Q5_K dequant (DN was reading zeros silently). |
 | 2026-05-20 | Claude | engine    | 727bb10  | mRoPE per-axis sections from `qwen35.rope.dimension_sections`. |
 | 2026-05-20 | Codex  | engine    | d24bbbd  | persistent GPU state (task #28): residual / rms / Q/K/V / KV cache / MLP scratch / logits live on device. DN/MoE still bridge through host. |
+| 2026-05-20 | Codex  | metal     | -        | Opt-in `QW36_METAL_FP16_WEIGHTS=1`: large lazy weights materialize as fp16 and run MPS half GEMV with f32↔f16 staging; q/k norm+RoPE+KV append and score/softmax/combine use fused decode kernels. Qwen3.5-0.8B `Hello -n 50`: 79.6 tok/s decode. |
 
 ## Reference: agent-infer Metal kernel for Gated Delta Rule
 

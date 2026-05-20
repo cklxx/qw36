@@ -115,6 +115,41 @@ static float bf16_to_f32(uint16_t b) {
     return u.f;
 }
 
+static uint16_t f32_to_f16(float f) {
+    union { float f; uint32_t u; } in;
+    in.f = f;
+    uint32_t x = in.u;
+    uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t mant = x & 0x007fffffu;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x00800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) {
+        if (mant == 0) return (uint16_t)(sign | 0x7c00u);
+        return (uint16_t)(sign | 0x7c00u | (mant >> 13) | 1u);
+    }
+
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x00001000u) half++;
+    return (uint16_t)half;
+}
+
+static size_t qw36_dtype_nbytes(qw36_dtype dtype) {
+    switch (dtype) {
+        case QW36_DTYPE_F32:  return 4;
+        case QW36_DTYPE_F16:  return 2;
+        case QW36_DTYPE_BF16: return 2;
+        default: return 0;
+    }
+}
+
 /* Read element i of a tensor in storage dtype, return fp32. */
 static float load_elem_f32(const void *data, qw36_dtype dt, size_t i) {
     switch (dt) {
@@ -1452,6 +1487,22 @@ static int lazy_materialize_f32(qw36_engine *eng, qw36_lazy_w *lw) {
     return 0;
 }
 
+static int lazy_materialize_f16(qw36_engine *eng, qw36_lazy_w *lw) {
+    if (!lw || lw->dtype == QW36_DTYPE_F16) return 0;
+    size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1);
+    if (lw->n_extra) numel *= (size_t)lw->n_extra;
+    float *tmp = materialize_f32(lw->data, lw->dtype, numel);
+    if (!tmp) return -1;
+    uint16_t *p = (uint16_t *)malloc(numel * sizeof(uint16_t));
+    if (!p) { free(tmp); return -1; }
+    for (size_t i = 0; i < numel; i++) p[i] = f32_to_f16(tmp[i]);
+    free(tmp);
+    if (!eng_own_(eng, p)) { free(p); return -1; }
+    lw->data  = p;
+    lw->dtype = QW36_DTYPE_F16;
+    return 0;
+}
+
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
@@ -1756,6 +1807,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     if (backend) {
         eng->ctx = backend->init(err, err_cap);
         if (!eng->ctx) { qw36_engine_close(eng); return NULL; }
+        const char *fp16_env = getenv("QW36_METAL_FP16_WEIGHTS");
+        const int fp16_lazy_weights =
+            backend->name && strcmp(backend->name, "metal") == 0 &&
+            fp16_env && atoi(fp16_env) != 0;
 
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
@@ -1763,7 +1818,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             NULL
         };
         for (size_t i = 0; lws[i]; i++) {
-            if (lazy_materialize_f32(eng, lws[i])) {
+            int mrc = fp16_lazy_weights
+                ? lazy_materialize_f16(eng, lws[i])
+                : lazy_materialize_f32(eng, lws[i]);
+            if (mrc) {
                 if (err && err_cap) snprintf(err, err_cap,
                     "%s: backend materialize failed (unsupported dtype %d)",
                     backend->name, lws[i]->ggml_type);
@@ -1774,9 +1832,12 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         if (w->lm_head == w->embed_tokens) ((qw36_lazy_w *)w->lm_head)->gpu_buf =
             ((qw36_lazy_w *)w->embed_tokens)->gpu_buf;
 
-        #define MAT(field) do { \
+        #define MAT_AS(field, want_f16_) do { \
             qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
-            if (lw && lazy_materialize_f32(eng, lw)) { \
+            int mrc = lw ? ((want_f16_) \
+                ? lazy_materialize_f16(eng, lw) \
+                : lazy_materialize_f32(eng, lw)) : 0; \
+            if (mrc) { \
                 if (err && err_cap) snprintf(err, err_cap, \
                     "%s: backend materialize failed at blk.%u." #field, \
                     backend->name, l); \
@@ -1785,14 +1846,27 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         } while (0)
         for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
             qw36_layer_weights *L = &eng->weights.layers[l];
-            MAT(q_proj); MAT(k_proj); MAT(v_proj); MAT(o_proj);
-            MAT(dn_qkv); MAT(dn_gate); MAT(dn_alpha); MAT(dn_beta); MAT(dn_out);
-            MAT(gate_proj); MAT(up_proj); MAT(down_proj);
-            MAT(moe_router);
-            MAT(moe_expert_gate); MAT(moe_expert_up); MAT(moe_expert_down);
-            MAT(moe_shared_gate); MAT(moe_shared_up); MAT(moe_shared_down);
+            MAT_AS(q_proj, fp16_lazy_weights);
+            MAT_AS(k_proj, fp16_lazy_weights);
+            MAT_AS(v_proj, fp16_lazy_weights);
+            MAT_AS(o_proj, fp16_lazy_weights);
+            MAT_AS(dn_qkv, fp16_lazy_weights);
+            MAT_AS(dn_gate, fp16_lazy_weights);
+            MAT_AS(dn_alpha, 0);
+            MAT_AS(dn_beta, 0);
+            MAT_AS(dn_out, fp16_lazy_weights);
+            MAT_AS(gate_proj, fp16_lazy_weights);
+            MAT_AS(up_proj, fp16_lazy_weights);
+            MAT_AS(down_proj, fp16_lazy_weights);
+            MAT_AS(moe_router, 0);
+            MAT_AS(moe_expert_gate, fp16_lazy_weights);
+            MAT_AS(moe_expert_up, fp16_lazy_weights);
+            MAT_AS(moe_expert_down, fp16_lazy_weights);
+            MAT_AS(moe_shared_gate, fp16_lazy_weights);
+            MAT_AS(moe_shared_up, fp16_lazy_weights);
+            MAT_AS(moe_shared_down, fp16_lazy_weights);
         }
-        #undef MAT
+        #undef MAT_AS
 
         /* Now wrap every materialized buffer as a device-visible view.
          * For Apple Metal this is zero-copy via MTLBuffer NoCopy; for
@@ -1802,8 +1876,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             if (lw && lw->data && !lw->gpu_buf) { \
                 size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1); \
                 if (lw->n_extra) numel *= (size_t)lw->n_extra; \
+                size_t elem = qw36_dtype_nbytes(lw->dtype); \
+                if (!elem) { qw36_engine_close(eng); return NULL; } \
                 lw->gpu_buf = backend->upload(eng->ctx, lw->data, \
-                    numel * sizeof(float), QW36_DTYPE_F32); \
+                    numel * elem, lw->dtype); \
             } \
         } while (0)
         for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
@@ -1821,14 +1897,18 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         if (w->embed_tokens) {
             qw36_lazy_w *lw = (qw36_lazy_w *)w->embed_tokens;
             size_t numel = (size_t)lw->cols * lw->rows;
+            size_t elem = qw36_dtype_nbytes(lw->dtype);
+            if (!elem) { qw36_engine_close(eng); return NULL; }
             lw->gpu_buf = backend->upload(eng->ctx, lw->data,
-                numel * sizeof(float), QW36_DTYPE_F32);
+                numel * elem, lw->dtype);
         }
         if (w->lm_head && w->lm_head != w->embed_tokens) {
             qw36_lazy_w *lw = (qw36_lazy_w *)w->lm_head;
             size_t numel = (size_t)lw->cols * lw->rows;
+            size_t elem = qw36_dtype_nbytes(lw->dtype);
+            if (!elem) { qw36_engine_close(eng); return NULL; }
             lw->gpu_buf = backend->upload(eng->ctx, lw->data,
-                numel * sizeof(float), QW36_DTYPE_F32);
+                numel * elem, lw->dtype);
         } else if (w->lm_head == w->embed_tokens) {
             ((qw36_lazy_w *)w->lm_head)->gpu_buf =
                 ((qw36_lazy_w *)w->embed_tokens)->gpu_buf;

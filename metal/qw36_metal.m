@@ -25,6 +25,8 @@ struct qw36_gpu_ctx {
     id<MTLLibrary>      library;
     id<MTLComputePipelineState> rmsnorm;
     id<MTLComputePipelineState> matmul;
+    id<MTLComputePipelineState> f32_to_f16;
+    id<MTLComputePipelineState> f16_to_f32;
     id<MTLComputePipelineState> silu_mul;
     id<MTLComputePipelineState> dn_conv1d_silu;
     id<MTLComputePipelineState> dn_prep_gdr;
@@ -38,6 +40,8 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> attn_scores;
     id<MTLComputePipelineState> attn_softmax;
     id<MTLComputePipelineState> attn_combine;
+    id<MTLComputePipelineState> attn_prep_decode;
+    id<MTLComputePipelineState> attn_score_combine_tg;
     /* Cache of MPSMatrixVectorMultiplication objects keyed by
      * "<rows>x<cols>" — building one of these per matmul has measurable
      * cost (Metal shader compile lookup); cache cuts the per-call overhead
@@ -54,6 +58,8 @@ struct qw36_gpu_ctx {
     id<MTLCommandBuffer> batch_cb;
     BOOL batch_active;
 
+    qw36_gpu_buf *matmul_x_f16_scratch;
+    qw36_gpu_buf *matmul_y_f16_scratch;
     qw36_gpu_buf *attn_q_scratch;
     qw36_gpu_buf *attn_k_scratch;
     qw36_gpu_buf *attn_v_scratch;
@@ -483,6 +489,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
 
     ctx->rmsnorm          = metal_make_pipeline(ctx, @"qw36_rmsnorm_f32", err, err_cap);
     ctx->matmul           = metal_make_pipeline(ctx, @"qw36_matmul_f32", err, err_cap);
+    ctx->f32_to_f16       = metal_make_pipeline(ctx, @"qw36_f32_to_f16_f32", err, err_cap);
+    ctx->f16_to_f32       = metal_make_pipeline(ctx, @"qw36_f16_to_f32_f32", err, err_cap);
     ctx->silu_mul         = metal_make_pipeline(ctx, @"qw36_silu_mul_f32", err, err_cap);
     ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
     ctx->dn_prep_gdr      = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk", err, err_cap);
@@ -496,13 +504,19 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_scores      = metal_make_pipeline(ctx, @"qw36_attn_scores_f32", err, err_cap);
     ctx->attn_softmax     = metal_make_pipeline(ctx, @"qw36_attn_softmax_f32", err, err_cap);
     ctx->attn_combine     = metal_make_pipeline(ctx, @"qw36_attn_combine_f32", err, err_cap);
+    ctx->attn_prep_decode = metal_make_pipeline(ctx, @"qw36_attn_prep_decode_f32", err, err_cap);
+    ctx->attn_score_combine_tg = metal_make_pipeline(ctx, @"qw36_attn_score_combine_tg_f32", err, err_cap);
 
-    if (!ctx->rmsnorm || !ctx->matmul || !ctx->silu_mul ||
+    if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
+        !ctx->f16_to_f32 || !ctx->silu_mul ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
         !ctx->dn_prep_gdr || !ctx->dn_reorder_gdr_y ||
         !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
-        !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine) {
+        !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine ||
+        !ctx->attn_prep_decode || !ctx->attn_score_combine_tg) {
+        ctx->attn_score_combine_tg = nil;
+        ctx->attn_prep_decode = nil;
         ctx->attn_combine = nil;
         ctx->attn_softmax = nil;
         ctx->attn_scores = nil;
@@ -516,6 +530,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->dn_prep_gdr = nil;
         ctx->dn_conv1d_silu = nil;
         ctx->silu_mul = nil;
+        ctx->f16_to_f32 = nil;
+        ctx->f32_to_f16 = nil;
         ctx->matmul = nil;
         ctx->rmsnorm = nil;
         ctx->library = nil;
@@ -548,9 +564,13 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     metal_release_buf(ctx->attn_v_scratch);
     metal_release_buf(ctx->attn_k_scratch);
     metal_release_buf(ctx->attn_q_scratch);
+    metal_release_buf(ctx->matmul_y_f16_scratch);
+    metal_release_buf(ctx->matmul_x_f16_scratch);
     ctx->mps_cache = nil;
     ctx->buf_pool  = nil;
     ctx->attn_combine = nil;
+    ctx->attn_prep_decode = nil;
+    ctx->attn_score_combine_tg = nil;
     ctx->attn_softmax = nil;
     ctx->attn_scores = nil;
     ctx->kv_append = nil;
@@ -563,6 +583,8 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->dn_prep_gdr = nil;
     ctx->dn_conv1d_silu = nil;
     ctx->silu_mul = nil;
+    ctx->f16_to_f32 = nil;
+    ctx->f32_to_f16 = nil;
     ctx->matmul = nil;
     ctx->rmsnorm = nil;
     ctx->library = nil;
@@ -717,7 +739,10 @@ static qw36_gpu_buf *metal_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dty
 static void metal_free(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf)
 {
     if (!buf) return;
-    if (ctx && buf->mtl) metal_pool_release(ctx, buf->mtl);
+    /* Don't recycle buffers while a command buffer is still being encoded:
+     * a later op in the same batch could otherwise alias a resource that an
+     * earlier encoded op has not consumed yet. */
+    if (ctx && buf->mtl && !ctx->batch_active) metal_pool_release(ctx, buf->mtl);
     buf->mtl = nil;
     if (buf->host_copy) { free(buf->host_copy); buf->host_copy = NULL; }
     free(buf);
@@ -808,12 +833,62 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
     }
 
     if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
+        x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F16) {
+        qw36_gpu_buf *xh = metal_scratch(ctx, &ctx->matmul_x_f16_scratch,
+            (size_t)cols * sizeof(uint16_t), QW36_DTYPE_F16);
+        qw36_gpu_buf *yh = metal_scratch(ctx, &ctx->matmul_y_f16_scratch,
+            (size_t)rows * sizeof(uint16_t), QW36_DTYPE_F16);
+        if (!xh || !yh) {
+            metal_zero_output(ctx, y, (size_t)rows * sizeof(float));
+            return;
+        }
+        metal_dispatch_1d(ctx, ctx->f32_to_f16, cols, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:xh->mtl offset:0 atIndex:0];
+            [enc setBuffer:x->mtl  offset:0 atIndex:1];
+            [enc setBytes:&cols length:sizeof(cols) atIndex:2];
+        });
+
+        NSString *key = [NSString stringWithFormat:@"%ux%u:h",
+                         (unsigned)rows, (unsigned)cols];
+        MPSMatrixVectorMultiplication *gemv = ctx->mps_cache[key];
+        if (!gemv) {
+            gemv = [[MPSMatrixVectorMultiplication alloc]
+                       initWithDevice:ctx->device rows:rows columns:cols];
+            ctx->mps_cache[key] = gemv;
+        }
+        MPSMatrixDescriptor *w_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                                  columns:cols
+                                                 rowBytes:(NSUInteger)cols * sizeof(uint16_t)
+                                                 dataType:MPSDataTypeFloat16];
+        MPSVectorDescriptor *x_desc =
+            [MPSVectorDescriptor vectorDescriptorWithLength:cols
+                                                   dataType:MPSDataTypeFloat16];
+        MPSVectorDescriptor *y_desc =
+            [MPSVectorDescriptor vectorDescriptorWithLength:rows
+                                                   dataType:MPSDataTypeFloat16];
+        MPSMatrix *wm = [[MPSMatrix alloc] initWithBuffer:w->mtl descriptor:w_desc];
+        MPSVector *xv = [[MPSVector alloc] initWithBuffer:xh->mtl descriptor:x_desc];
+        MPSVector *yv = [[MPSVector alloc] initWithBuffer:yh->mtl descriptor:y_desc];
+        int owns_cb = 0;
+        id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
+        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        metal_dispatch_1d(ctx, ctx->f16_to_f32, rows, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:y->mtl  offset:0 atIndex:0];
+            [enc setBuffer:yh->mtl offset:0 atIndex:1];
+            [enc setBytes:&rows length:sizeof(rows) atIndex:2];
+        });
+        return;
+    }
+
+    if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
         x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F32) {
         /* Cache the MPSMatrixVectorMultiplication kernel by shape so we
          * don't re-create it on every call (lookup is ~3-5× cheaper than
          * alloc+init). The descriptor / MPSMatrix / MPSVector objects are
          * cheap to recreate per call. */
-        NSString *key = [NSString stringWithFormat:@"%ux%u",
+        NSString *key = [NSString stringWithFormat:@"%ux%u:f",
                          (unsigned)rows, (unsigned)cols];
         MPSMatrixVectorMultiplication *gemv = ctx->mps_cache[key];
         if (!gemv) {
@@ -887,49 +962,67 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *v = metal_scratch(ctx, &ctx->attn_v_scratch,
         (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
-    qw36_gpu_buf *scores = metal_scratch(ctx, &ctx->attn_scores_scratch,
-        (size_t)n_heads * positions * sizeof(float), QW36_DTYPE_F32);
-    if (!q || !k || !v || !scores) return;
+    if (!q || !k || !v) return;
 
     metal_matmul(ctx, q, x, wq, 1, q_len, hidden);
     metal_matmul(ctx, k, x, wk, 1, kv_len, hidden);
     metal_matmul(ctx, v, x, wv, 1, kv_len, hidden);
 
     float rms_eps = 1.0e-6f;
-    metal_dispatch_1d(ctx, ctx->head_norm_rope, n_heads, ^(id<MTLComputeCommandEncoder> enc) {
-        uint32_t w_dtype = (uint32_t)q_norm->dtype;
-        [enc setBuffer:q->mtl      offset:0 atIndex:0];
-        [enc setBuffer:q_norm->mtl offset:0 atIndex:1];
-        [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:2];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:3];
-        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:4];
-        [enc setBytes:&rope_theta length:sizeof(rope_theta) atIndex:5];
-        [enc setBytes:&partial_rotary_factor length:sizeof(partial_rotary_factor) atIndex:6];
-        [enc setBytes:&rms_eps length:sizeof(rms_eps) atIndex:7];
-        [enc setBytes:&w_dtype length:sizeof(w_dtype) atIndex:8];
-    });
-    metal_dispatch_1d(ctx, ctx->head_norm_rope, n_kv, ^(id<MTLComputeCommandEncoder> enc) {
-        uint32_t w_dtype = (uint32_t)k_norm->dtype;
-        [enc setBuffer:k->mtl      offset:0 atIndex:0];
-        [enc setBuffer:k_norm->mtl offset:0 atIndex:1];
-        [enc setBytes:&n_kv length:sizeof(n_kv) atIndex:2];
-        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:3];
-        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:4];
-        [enc setBytes:&rope_theta length:sizeof(rope_theta) atIndex:5];
-        [enc setBytes:&partial_rotary_factor length:sizeof(partial_rotary_factor) atIndex:6];
-        [enc setBytes:&rms_eps length:sizeof(rms_eps) atIndex:7];
-        [enc setBytes:&w_dtype length:sizeof(w_dtype) atIndex:8];
+    NSUInteger prep_n = (NSUInteger)n_heads + n_kv;
+    metal_dispatch_1d(ctx, ctx->attn_prep_decode, prep_n, ^(id<MTLComputeCommandEncoder> enc) {
+        uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
+        uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
+        [enc setBuffer:q->mtl       offset:0 atIndex:0];
+        [enc setBuffer:k->mtl       offset:0 atIndex:1];
+        [enc setBuffer:v->mtl       offset:0 atIndex:2];
+        [enc setBuffer:k_cache->mtl offset:0 atIndex:3];
+        [enc setBuffer:v_cache->mtl offset:0 atIndex:4];
+        [enc setBuffer:q_norm->mtl  offset:0 atIndex:5];
+        [enc setBuffer:k_norm->mtl  offset:0 atIndex:6];
+        [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:7];
+        [enc setBytes:&n_kv length:sizeof(n_kv) atIndex:8];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:9];
+        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:10];
+        [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:11];
+        [enc setBytes:&rope_theta length:sizeof(rope_theta) atIndex:12];
+        [enc setBytes:&partial_rotary_factor length:sizeof(partial_rotary_factor) atIndex:13];
+        [enc setBytes:&rms_eps length:sizeof(rms_eps) atIndex:14];
+        [enc setBytes:&q_w_dtype length:sizeof(q_w_dtype) atIndex:15];
+        [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:16];
     });
 
-    metal_dispatch_1d(ctx, ctx->kv_append, kv_len, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:k_cache->mtl offset:0 atIndex:0];
-        [enc setBuffer:v_cache->mtl offset:0 atIndex:1];
-        [enc setBuffer:k->mtl       offset:0 atIndex:2];
-        [enc setBuffer:v->mtl       offset:0 atIndex:3];
-        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:4];
-        [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:5];
-        [enc setBytes:&kv_len length:sizeof(kv_len) atIndex:6];
-    });
+    uint32_t tg_size = 1;
+    while (tg_size < head_dim) tg_size <<= 1;
+    if (tg_size <= 256 &&
+        tg_size <= ctx->attn_score_combine_tg.maxTotalThreadsPerThreadgroup &&
+        positions <= 4096) {
+        int owns_cb = 0;
+        id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:ctx->attn_score_combine_tg];
+        [enc setBuffer:y->mtl       offset:0 atIndex:0];
+        [enc setBuffer:q->mtl       offset:0 atIndex:1];
+        [enc setBuffer:k_cache->mtl offset:0 atIndex:2];
+        [enc setBuffer:v_cache->mtl offset:0 atIndex:3];
+        [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:4];
+        [enc setBytes:&n_kv length:sizeof(n_kv) atIndex:5];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:6];
+        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:7];
+        [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:8];
+        [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:9];
+        [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        return;
+    }
+
+    qw36_gpu_buf *scores = metal_scratch(ctx, &ctx->attn_scores_scratch,
+        (size_t)n_heads * positions * sizeof(float), QW36_DTYPE_F32);
+    if (!scores) return;
 
     NSUInteger score_n = (NSUInteger)n_heads * positions;
     metal_dispatch_1d(ctx, ctx->attn_scores, score_n, ^(id<MTLComputeCommandEncoder> enc) {
