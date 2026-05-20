@@ -46,6 +46,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> attn_prep_decode;
     id<MTLComputePipelineState> attn_score_combine_tg;
     id<MTLComputePipelineState> attn_decode_fused;
+    id<MTLComputePipelineState> attn_decode_fused_f16kv;
     /* Cache of MPSMatrixVectorMultiplication objects keyed by
      * "<rows>x<cols>" — building one of these per matmul has measurable
      * cost (Metal shader compile lookup); cache cuts the per-call overhead
@@ -519,6 +520,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_prep_decode = metal_make_pipeline(ctx, @"qw36_attn_prep_decode_f32", err, err_cap);
     ctx->attn_score_combine_tg = metal_make_pipeline(ctx, @"qw36_attn_score_combine_tg_f32", err, err_cap);
     ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
+    ctx->attn_decode_fused_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_f32", err, err_cap);
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
         !ctx->f16_to_f32 || !ctx->silu_mul ||
@@ -529,7 +531,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine ||
         !ctx->attn_prep_decode || !ctx->attn_score_combine_tg ||
-        !ctx->attn_decode_fused) {
+        !ctx->attn_decode_fused || !ctx->attn_decode_fused_f16kv) {
+        ctx->attn_decode_fused_f16kv = nil;
         ctx->attn_decode_fused = nil;
         ctx->attn_score_combine_tg = nil;
         ctx->attn_prep_decode = nil;
@@ -596,6 +599,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->attn_prep_decode = nil;
     ctx->attn_score_combine_tg = nil;
     ctx->attn_decode_fused = nil;
+    ctx->attn_decode_fused_f16kv = nil;
     ctx->attn_softmax = nil;
     ctx->attn_scores = nil;
     ctx->kv_append = nil;
@@ -1008,12 +1012,17 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         tg_size <= 256 &&
         tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
         positions <= 4096) {
+        const int f16_kv =
+            k_cache->dtype == QW36_DTYPE_F16 &&
+            v_cache->dtype == QW36_DTYPE_F16;
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
         uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
-        [enc setComputePipelineState:ctx->attn_decode_fused];
+        [enc setComputePipelineState:f16_kv
+            ? ctx->attn_decode_fused_f16kv
+            : ctx->attn_decode_fused];
         [enc setBuffer:y->mtl       offset:0 atIndex:0];
         [enc setBuffer:q->mtl       offset:0 atIndex:1];
         [enc setBuffer:k->mtl       offset:0 atIndex:2];
@@ -1033,8 +1042,10 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&q_w_dtype length:sizeof(q_w_dtype) atIndex:16];
         [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:17];
         [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:18];
-        [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:19];
-        [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
+        if (!f16_kv) {
+            [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:19];
+            [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
+        }
         [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)

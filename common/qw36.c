@@ -1600,7 +1600,18 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         snprintf(key, sizeof(key), "%s.rope.dimension_sections", eng->arch);
         int n = qw36_gguf_get_u32_array(eng->gguf, key,
                                         c->rope_sections, 4);
-        c->rope_n_sections = (n > 0) ? (uint32_t)n : 0;
+        /* Agent-infer's MLX text-decode path calls fast::rope(rotary_dim=
+         * head_dim, traditional=false) — i.e. plain NEOX over the full
+         * head, ignoring qwen35.rope.dimension_sections. We follow the
+         * same convention by default; set QW36_USE_MROPE_SECTIONS=1 to
+         * re-enable the per-axis chopping (which previously zeroed 75%
+         * of the rotation and was likely the source of bad logits). */
+        const char *mrope_env = getenv("QW36_USE_MROPE_SECTIONS");
+        if (mrope_env && atoi(mrope_env) != 0) {
+            c->rope_n_sections = (n > 0) ? (uint32_t)n : 0;
+        } else {
+            c->rope_n_sections = 0;
+        }
     }
     {
         uint32_t tie = 0;
