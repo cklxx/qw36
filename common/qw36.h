@@ -68,6 +68,11 @@ typedef struct {
     /* RoPE */
     float    rope_theta;
     float    partial_rotary_factor;   /* fraction of head_dim that rotates */
+    /* mRoPE (Qwen3.5/3.6): per-axis pair counts. For text decode only the
+     * first section uses seq_pos; later sections use axis-2/3/4 positions
+     * which are zero, so those pairs effectively stay unrotated. */
+    uint32_t rope_sections[4];
+    uint32_t rope_n_sections;        /* 0 ⇒ no mRoPE, use plain RoPE */
 
     /* MoE (zero if dense) */
     uint32_t moe_num_experts;

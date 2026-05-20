@@ -819,23 +819,47 @@ static void swiglu_mlp_f32(float *y, const float *x,
     matmul_f32(y, scratch_gate, w_down, hidden, inter);
 }
 
-/* In-place RoPE on a single head. Rotates the first `rot_dim` components;
- * the tail is left untouched (partial rotary). Pair convention:
- * (x[i], x[i + d/2]) — the half-rotation / NEOX convention used by
- * llama.cpp's ggml_rope NEOX mode. Qwen3 / Qwen3.5 / Qwen3.6 GGUFs all
- * expect this layout; ggml's standard mode-0 (interleaved (2i, 2i+1))
- * would mismatch and produce garbage logits. */
-static void rope_head(float *x, size_t pos, size_t rot_dim, float theta_base)
+/* In-place RoPE on a single head.
+ *
+ * If sections != NULL and n_sections > 0: applies *multi-axis* RoPE
+ * (Qwen3.5 mRoPE). Pair p is in section s if it lies in [sum_{<s} sect,
+ * sum_{<=s} sect). Section 0 uses the time position (`pos`); later
+ * sections use axis 1/2/3 positions, which are 0 in pure-text decode and
+ * therefore leave their pairs unrotated.
+ *
+ * Otherwise (sections == NULL): plain RoPE over all `rot_dim/2` pairs
+ * using `pos`. Pair convention is the half-rotation / NEOX layout
+ * (x[i], x[i + d/2]) which matches the Qwen GGUF tensors. */
+static void rope_head(float *x, size_t pos, size_t rot_dim, float theta_base,
+                      const uint32_t *sections, uint32_t n_sections)
 {
     size_t half = rot_dim / 2;
-    for (size_t i = 0; i < half; i++) {
-        float inv_freq = 1.0f /
-            powf(theta_base, (2.0f * (float)i) / (float)rot_dim);
-        float angle = (float)pos * inv_freq;
-        float c = cosf(angle), s = sinf(angle);
-        float x0 = x[i], x1 = x[i + half];
-        x[i]        = x0 * c - x1 * s;
-        x[i + half] = x0 * s + x1 * c;
+    size_t p = 0;
+    while (p < half) {
+        size_t axis_pos = pos;
+        size_t take = half - p;
+        if (n_sections) {
+            /* find current section */
+            size_t cum = 0; uint32_t s = 0;
+            for (; s < n_sections && cum + sections[s] <= p; s++) cum += sections[s];
+            if (s >= n_sections) {
+                /* past last section ⇒ unrotated */
+                break;
+            }
+            take = (size_t)sections[s] - (p - cum);
+            axis_pos = (s == 0) ? pos : 0;
+        }
+        for (size_t i = 0; i < take; i++) {
+            size_t pair_idx = p + i;
+            float inv_freq = 1.0f /
+                powf(theta_base, (2.0f * (float)pair_idx) / (float)rot_dim);
+            float angle = (float)axis_pos * inv_freq;
+            float c = cosf(angle), s_ = sinf(angle);
+            float x0 = x[pair_idx], x1 = x[pair_idx + half];
+            x[pair_idx]        = x0 * c - x1 * s_;
+            x[pair_idx + half] = x0 * s_ + x1 * c;
+        }
+        p += take;
     }
 }
 
@@ -885,12 +909,12 @@ static void attention_f32(float *y,
     for (uint32_t h = 0; h < n_heads; h++) {
         float *qh = q + h * head_dim;
         rmsnorm_f32(qh, qh, q_norm, head_dim, rms_eps);
-        rope_head(qh, seq_pos, rot_dim, rope_theta);
+        rope_head(qh, seq_pos, rot_dim, rope_theta, NULL, 0);
     }
     for (uint32_t h = 0; h < n_kv; h++) {
         float *kh = k_row + h * head_dim;
         rmsnorm_f32(kh, kh, k_norm, head_dim, rms_eps);
-        rope_head(kh, seq_pos, rot_dim, rope_theta);
+        rope_head(kh, seq_pos, rot_dim, rope_theta, NULL, 0);
     }
 
     /* Attention. */
@@ -1218,6 +1242,19 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         float prf;
         if (eng_get_f32(eng, "rope.partial_rotary_factor", &prf) == 0 && prf > 0)
             c->partial_rotary_factor = prf;
+    }
+    /* Qwen3.5/3.6 mRoPE per-axis pair counts. Stored as
+     * <arch>.rope.dimension_sections — for the 0.8B model this is
+     * [11, 11, 10, 0] giving 32 pairs over 4 axes. Pairs after the sum
+     * (or in section 0 for text decode) use seq_pos; other sections use
+     * axis-1/2/3 positions which are 0 in text mode and so leave their
+     * pairs unrotated. */
+    {
+        char key[128];
+        snprintf(key, sizeof(key), "%s.rope.dimension_sections", eng->arch);
+        int n = qw36_gguf_get_u32_array(eng->gguf, key,
+                                        c->rope_sections, 4);
+        c->rope_n_sections = (n > 0) ? (uint32_t)n : 0;
     }
     {
         uint32_t tie = 0;
@@ -1839,13 +1876,17 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                 float *qh = st->q + h * c->head_dim;
                 rmsnorm_dispatch(qh, qh, (const float *)L->q_norm,
                                  c->head_dim, c->rms_norm_eps);
-                rope_head(qh, st->seq_pos, rot_dim, c->rope_theta);
+                rope_head(qh, st->seq_pos, rot_dim, c->rope_theta,
+                                 c->rope_n_sections ? c->rope_sections : NULL,
+                                 c->rope_n_sections);
             }
             for (uint32_t h = 0; h < c->num_key_value_heads; h++) {
                 float *kh = k_row + h * c->head_dim;
                 rmsnorm_dispatch(kh, kh, (const float *)L->k_norm,
                                  c->head_dim, c->rms_norm_eps);
-                rope_head(kh, st->seq_pos, rot_dim, c->rope_theta);
+                rope_head(kh, st->seq_pos, rot_dim, c->rope_theta,
+                                 c->rope_n_sections ? c->rope_sections : NULL,
+                                 c->rope_n_sections);
             }
 
             /* Attention: for each head h, score against k_cache[0..=seq_pos]

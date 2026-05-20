@@ -36,6 +36,11 @@ int qw36_gguf_get_u32(const qw36_gguf_file *f, const char *key, uint32_t *out);
 int qw36_gguf_get_f32(const qw36_gguf_file *f, const char *key, float *out);
 int qw36_gguf_get_str(const qw36_gguf_file *f, const char *key,
                       const char **out);
+/* Read an array of int32 / uint32 values into a user-provided buffer.
+ * On success returns the number of elements actually written (≤ cap).
+ * On absence or type mismatch returns -1. */
+int qw36_gguf_get_u32_array(const qw36_gguf_file *f, const char *key,
+                            uint32_t *out, uint32_t cap);
 
 /* Tensor lookup. Returned struct points into the file (no copy). */
 int qw36_gguf_get_tensor(const qw36_gguf_file *f, const char *name,

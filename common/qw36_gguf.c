@@ -481,6 +481,23 @@ int qw36_gguf_get_str(const qw36_gguf_file *f, const char *key, const char **out
     return 0;
 }
 
+int qw36_gguf_get_u32_array(const qw36_gguf_file *f, const char *key,
+                            uint32_t *out, uint32_t cap)
+{
+    const gguf_kv *k = find_kv(f, key);
+    if (!k || k->type != GGUF_T_ARRAY) return -1;
+    gguf_value_type et = k->v.arr.elem_type;
+    if (et != GGUF_T_UINT32 && et != GGUF_T_INT32) return -1;
+    uint32_t n = (uint32_t)k->v.arr.n;
+    if (n > cap) n = cap;
+    const uint8_t *p = (const uint8_t *)k->v.arr.raw;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t v; memcpy(&v, p + i * 4, 4);
+        out[i] = v;
+    }
+    return (int)n;
+}
+
 size_t qw36_gguf_tensor_count(const qw36_gguf_file *f) {
     return f ? f->n_tensors : 0;
 }
