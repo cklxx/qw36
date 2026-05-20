@@ -1557,6 +1557,96 @@ kernel void qw36_matmul_q4_k_f32(
     }
 }
 
+/* qmv_quad-style Q4_K matmul (decode, M=1, output rows tiled by 64)
+ *
+ * Experimental GGUF Q4_K variant of MLX's qmv_quad schedule. One
+ * 32-thread SIMD threadgroup contains 8 quadgroups; each quadgroup emits
+ * 8 output rows and its 4 lanes split K into contiguous quarters. The
+ * lane-local partial sums are reduced with quad_sum only, so this path
+ * avoids the 256-thread kernel's threadgroup cache + barrier reduction.
+ *
+ * The Q4_K decode is intentionally identical to qw36_gguf_q4_k_value:
+ *   val = q * (d * sc[sub]) - dmin * mn[sub]
+ * Output stays fp32 to match the existing quant-matmul contract. */
+kernel void qw36_matmul_q4_k_qmv_quad_f32(
+    device float       *y    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device const uchar *w    [[buffer(2)]],
+    constant uint      &K    [[buffer(3)]],
+    constant uint      &N    [[buffer(4)]],
+    uint3 tg                 [[threadgroup_position_in_grid]],
+    uint quad_gid            [[quadgroup_index_in_threadgroup]],
+    uint quad_lid            [[thread_index_in_quadgroup]])
+{
+    constexpr uint quads_per_simd = 8u;
+    constexpr uint results_per_quadgroup = 8u;
+    uint out0 = tg.y * quads_per_simd * results_per_quadgroup + quad_gid;
+    uint K_blocks = K >> 8;
+    uint row_bytes = K_blocks * 144u;
+
+    float acc[results_per_quadgroup];
+    bool active[results_per_quadgroup];
+    float d_cache[results_per_quadgroup];
+    float dmin_cache[results_per_quadgroup];
+    uchar sc_cache[results_per_quadgroup][8];
+    uchar mn_cache[results_per_quadgroup][8];
+    for (uint r = 0; r < results_per_quadgroup; ++r) {
+        uint row = out0 + r * quads_per_simd;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+        d_cache[r] = 0.0f;
+        dmin_cache[r] = 0.0f;
+        for (uint s = 0; s < 8u; ++s) {
+            sc_cache[r][s] = 0;
+            mn_cache[r][s] = 0;
+        }
+    }
+
+    uint values_per_lane = K >> 2;
+    uint k_begin = quad_lid * values_per_lane;
+    uint k_end = (quad_lid == 3u) ? K : min(k_begin + values_per_lane, K);
+    uint cached_sb = 0xffffffffu;
+
+    for (uint k = k_begin; k < k_end; ++k) {
+        uint sb = k >> 8;
+        uint local = k & 255u;
+        uint iter = local >> 6;
+        uint h = (local >> 5) & 1u;
+        uint lane = local & 31u;
+        uint sub = iter * 2u + h;
+
+        if (sb != cached_sb) {
+            cached_sb = sb;
+            for (uint r = 0; r < results_per_quadgroup; ++r) {
+                if (!active[r]) continue;
+                uint row = out0 + r * quads_per_simd;
+                device const uchar *p = w + row * row_bytes + sb * 144u;
+                d_cache[r] = qw36_gguf_f16(p);
+                dmin_cache[r] = qw36_gguf_f16(p + 2);
+                qw36_gguf_q4_scales(p + 4, sc_cache[r], mn_cache[r]);
+            }
+        }
+
+        float xv = x[k];
+        for (uint r = 0; r < results_per_quadgroup; ++r) {
+            if (!active[r]) continue;
+            uint row = out0 + r * quads_per_simd;
+            device const uchar *p = w + row * row_bytes + sb * 144u;
+            uchar byte = p[16u + iter * 32u + lane];
+            float q = (h == 0u) ? float(byte & 0x0fu) : float(byte >> 4);
+            float wval = q * (d_cache[r] * float(sc_cache[r][sub]))
+                       - dmin_cache[r] * float(mn_cache[r][sub]);
+            acc[r] += xv * wval;
+        }
+    }
+
+    for (uint r = 0; r < results_per_quadgroup; ++r) {
+        float v = quad_sum(acc[r]);
+        uint row = out0 + r * quads_per_simd;
+        if (quad_lid == 0u && row < N) y[row] = v;
+    }
+}
+
 kernel void qw36_matmul_q6_k_f32(
     device float       *y    [[buffer(0)]],
     device const float *x    [[buffer(1)]],

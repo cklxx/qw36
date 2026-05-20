@@ -74,6 +74,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> matmul_qmv_quad_f16;
     id<MTLComputePipelineState> matmul_mma_f16;
     id<MTLComputePipelineState> matmul_q4_k;
+    id<MTLComputePipelineState> matmul_q4_k_quad;
     id<MTLComputePipelineState> matmul_q5_k;
     id<MTLComputePipelineState> matmul_q6_k;
     id<MTLComputePipelineState> matmul_q8_0;
@@ -692,6 +693,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->matmul_qmv_quad_f16 = metal_make_pipeline(ctx, @"qw36_matmul_qmv_quad_f16", err, err_cap);
     ctx->matmul_mma_f16 = metal_make_pipeline(ctx, @"qw36_matmul_mma_f16_f32", err, err_cap);
     ctx->matmul_q4_k = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_f32", err, err_cap);
+    ctx->matmul_q4_k_quad = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_qmv_quad_f32", err, err_cap);
     ctx->matmul_q5_k = metal_make_pipeline(ctx, @"qw36_matmul_q5_k_f32", err, err_cap);
     ctx->matmul_q6_k = metal_make_pipeline(ctx, @"qw36_matmul_q6_k_f32", err, err_cap);
     ctx->matmul_q8_0 = metal_make_pipeline(ctx, @"qw36_matmul_q8_0_f32", err, err_cap);
@@ -789,6 +791,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->attn_decode_fused = nil;
     ctx->attn_decode_fused_f16kv = nil;
     ctx->matmul_mma_f16 = nil;
+    ctx->matmul_q4_k_quad = nil;
     ctx->attn_softmax = nil;
     ctx->attn_scores = nil;
     ctx->kv_append = nil;
@@ -1149,6 +1152,35 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             default: break;
         }
         if (qpipe) {
+            static int q4k_quad = -1;
+            if (q4k_quad < 0) {
+                const char *e = getenv("QW36_METAL_Q4K_QUAD");
+                q4k_quad = (e && atoi(e)) ? 1 : 0;
+            }
+            if (q4k_quad && w->dtype == QW36_DTYPE_Q4_K &&
+                ctx->matmul_q4_k_quad && (cols % 256u) == 0) {
+                double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+                NSString *perf_label = ctx->perf_enabled
+                    ? [NSString stringWithFormat:@"q4k_quad_%ux%u",
+                       (unsigned)rows, (unsigned)cols]
+                    : nil;
+                int owns_cb = 0;
+                id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+                id<MTLComputeCommandEncoder> enc =
+                    metal_compute_encoder_for_op(ctx, cb, owns_cb);
+                [enc setComputePipelineState:ctx->matmul_q4_k_quad];
+                [enc setBuffer:y->mtl offset:0 atIndex:0];
+                [enc setBuffer:x->mtl offset:0 atIndex:1];
+                [enc setBuffer:w->mtl offset:0 atIndex:2];
+                [enc setBytes:&cols length:sizeof(cols) atIndex:3];
+                [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(1, (rows + 63u) / 64u, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                metal_finish_compute_encoder(ctx, enc, owns_cb);
+                metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
+                return;
+            }
+
             /* Q4_K kernel caches per-block scales in threadgroup memory
              * (18 floats per Q4_K block + 8 SIMD-partial floats). Others
              * still use the simple 256-float reduction scratch. */
