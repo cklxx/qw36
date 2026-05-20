@@ -923,22 +923,78 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
                                  uint32_t key_dim, uint32_t val_dim)
 {
     if (!ctx || !y || !qkv || !beta_raw || !alpha_raw || !dt_bias ||
-        !a_log || !state)
+        !a_log || !state || !n_key || !n_value || !key_dim || !val_dim)
         return;
-    NSUInteger n = (NSUInteger)n_value * (NSUInteger)val_dim;
-    metal_dispatch_1d(ctx, ctx->dn_gated_delta, n, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:y->mtl         offset:0 atIndex:0];
-        [enc setBuffer:qkv->mtl       offset:0 atIndex:1];
-        [enc setBuffer:beta_raw->mtl  offset:0 atIndex:2];
-        [enc setBuffer:alpha_raw->mtl offset:0 atIndex:3];
-        [enc setBuffer:dt_bias->mtl   offset:0 atIndex:4];
-        [enc setBuffer:a_log->mtl     offset:0 atIndex:5];
-        [enc setBuffer:state->mtl     offset:0 atIndex:6];
-        [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:7];
-        [enc setBytes:&n_value  length:sizeof(n_value)  atIndex:8];
-        [enc setBytes:&key_dim  length:sizeof(key_dim)  atIndex:9];
-        [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:10];
+    if (key_dim % 32 != 0) return;
+
+    id<MTLCommandBuffer> cb = nil;
+    id<MTLComputeCommandEncoder> enc = nil;
+    qw36_gpu_buf *q = metal_alloc(ctx, (size_t)n_key * key_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *k = metal_alloc(ctx, (size_t)n_key * key_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *v = metal_alloc(ctx, (size_t)n_value * val_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *g = metal_alloc(ctx, (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *beta = metal_alloc(ctx, (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *y_grouped = metal_alloc(ctx, (size_t)n_value * val_dim * sizeof(float), QW36_DTYPE_F32);
+    if (!q || !k || !v || !g || !beta || !y_grouped) goto done;
+
+    NSUInteger prep_n = (NSUInteger)n_key * key_dim;
+    NSUInteger v_n = (NSUInteger)n_value * val_dim;
+    if (v_n > prep_n) prep_n = v_n;
+    metal_dispatch_1d(ctx, ctx->dn_prep_gdr, prep_n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:q->mtl         offset:0 atIndex:0];
+        [enc setBuffer:k->mtl         offset:0 atIndex:1];
+        [enc setBuffer:v->mtl         offset:0 atIndex:2];
+        [enc setBuffer:g->mtl         offset:0 atIndex:3];
+        [enc setBuffer:beta->mtl      offset:0 atIndex:4];
+        [enc setBuffer:qkv->mtl       offset:0 atIndex:5];
+        [enc setBuffer:alpha_raw->mtl offset:0 atIndex:6];
+        [enc setBuffer:beta_raw->mtl  offset:0 atIndex:7];
+        [enc setBuffer:dt_bias->mtl   offset:0 atIndex:8];
+        [enc setBuffer:a_log->mtl     offset:0 atIndex:9];
+        [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:10];
+        [enc setBytes:&n_value  length:sizeof(n_value)  atIndex:11];
+        [enc setBytes:&key_dim  length:sizeof(key_dim)  atIndex:12];
+        [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:13];
     });
+
+    uint32_t T = 1;
+    int owns_cb = 0;
+    cb = metal_cb_for_op(ctx, &owns_cb);
+    enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->dn_gated_delta];
+    [enc setBuffer:q->mtl         offset:0 atIndex:0];
+    [enc setBuffer:k->mtl         offset:0 atIndex:1];
+    [enc setBuffer:v->mtl         offset:0 atIndex:2];
+    [enc setBuffer:g->mtl         offset:0 atIndex:3];
+    [enc setBuffer:beta->mtl      offset:0 atIndex:4];
+    [enc setBuffer:state->mtl     offset:0 atIndex:5];
+    [enc setBuffer:y_grouped->mtl offset:0 atIndex:6];
+    [enc setBuffer:state->mtl     offset:0 atIndex:7];
+    [enc setBytes:&T        length:sizeof(T)        atIndex:8];
+    [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:9];
+    [enc setBytes:&n_value  length:sizeof(n_value)  atIndex:10];
+    [enc setBytes:&key_dim  length:sizeof(key_dim)  atIndex:11];
+    [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:12];
+    [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
+  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+
+    metal_dispatch_1d(ctx, ctx->dn_reorder_gdr_y, v_n, ^(id<MTLComputeCommandEncoder> renc) {
+        [renc setBuffer:y->mtl         offset:0 atIndex:0];
+        [renc setBuffer:y_grouped->mtl offset:0 atIndex:1];
+        [renc setBytes:&n_key   length:sizeof(n_key)   atIndex:2];
+        [renc setBytes:&n_value length:sizeof(n_value) atIndex:3];
+        [renc setBytes:&val_dim length:sizeof(val_dim) atIndex:4];
+    });
+
+done:
+    metal_free(ctx, y_grouped);
+    metal_free(ctx, beta);
+    metal_free(ctx, g);
+    metal_free(ctx, v);
+    metal_free(ctx, k);
+    metal_free(ctx, q);
 }
 
 static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,

@@ -267,13 +267,17 @@ kernel void qw36_compute_g_beta_norm_qk(
     if (gid < v_total) {
         uint raw_v = gid / Dv;
         uint d = gid - raw_v * Dv;
-        uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+        uint grouped_v = raw_v;
+        if (Hk != 0 && Hv % Hk == 0)
+            grouped_v = (raw_v % Hk) * group + raw_v / Hk;
         v_out[grouped_v * Dv + d] = qkv[q_total * 2 + raw_v * Dv + d];
     }
 
     if (gid < Hv) {
         uint raw_v = gid;
-        uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+        uint grouped_v = raw_v;
+        if (Hk != 0 && Hv % Hk == 0)
+            grouped_v = (raw_v % Hk) * group + raw_v / Hk;
         float av = alpha_raw[raw_v] + dt_bias[raw_v];
         float softplus = av > 20.0f ? av : log(1.0f + exp(av));
         g_out[grouped_v] = exp(-exp(a_log[raw_v]) * softplus);
@@ -295,7 +299,9 @@ kernel void qw36_dn_reorder_grouped_y_to_raw_f32(
     uint d = gid - raw_v * Dv;
     uint group = (Hk == 0) ? 1 : (Hv / Hk);
     if (group == 0) group = 1;
-    uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+    uint grouped_v = raw_v;
+    if (Hk != 0 && Hv % Hk == 0)
+        grouped_v = (raw_v % Hk) * group + raw_v / Hk;
     y_raw[gid] = y_grouped[grouped_v * Dv + d];
 }
 
