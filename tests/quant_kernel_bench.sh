@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Side-by-side bench of QUANT_GPU paths. Pre/post optimization.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+MODEL="${1:-/Users/bytedance/code/agent-infer/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf}"
+
+if [ ! -f "$MODEL" ]; then
+    echo "model not found: $MODEL"; exit 0
+fi
+
+if [ ! -x ./qw36_metal ]; then make -s metal; fi
+
+echo "=== baseline (fp16 path, no quant) ==="
+for i in 1 2 3; do
+  QW36_METAL_FP16_WEIGHTS=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+done
+
+echo
+echo "=== QUANT_GPU current (default kernel) ==="
+for i in 1 2 3; do
+  QW36_METAL_QUANT_GPU=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+done
+
+echo
+echo "=== QUANT_GPU + Q4K_QUAD opt-in (when codex lands the new kernel) ==="
+for i in 1 2 3; do
+  QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+done
+
+echo
+echo "=== correctness check (Hello continuation) ==="
+QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 16 2>&1 | tail -3
