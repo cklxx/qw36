@@ -1,0 +1,9 @@
+qw36_amd
+qw36_metal
+qw36_cuda
+*.o
+*.air
+*.metallib
+models/
+*.gguf
+.DS_Store
