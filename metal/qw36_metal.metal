@@ -1436,19 +1436,15 @@ kernel void qw36_matmul_q8_0_f32(
 }
 
 /* ----------------------------------------------------------------- *
- * Custom fp16-weight GEMV (M=1 decode).
+ * qmv_quad-style fp16 GEMV (M=1 decode).
  *
- * Replaces MPSMatrixVectorMultiplication for the fp16 fast path:
- * matmul reads fp16 weight + fp16 OR fp32 input, writes fp16 OR fp32
- * output. We control the encoder (compute pipeline) so consecutive
- * fp16 matmuls can share one encoder — which the MPS path can't, since
- * MPS encodes through its own command encoder per call.
- *
- * Layout: one threadgroup per output row, TG=256 threads cooperate
- * over K via simd_sum + cross-simd reduction. Each thread accumulates
- * fp32 partials then casts on store.
+ * Dense fp16 variant of MLX's qmv_quad_impl: one 32-thread SIMD
+ * threadgroup is split into 8 quadgroups. Each quadgroup computes 8
+ * output rows, so a TG emits up to 64 rows. The 4 lanes in a quad split
+ * K by lane id (K/4 values each), reuse each x[k] across 8 output rows,
+ * and reduce with quad_sum only. No threadgroup memory or barriers.
  * ----------------------------------------------------------------- */
-kernel void qw36_matmul_f16gemv_f32(
+kernel void qw36_matmul_qmv_quad_f16(
     device uchar       *y        [[buffer(0)]],
     device const uchar *x        [[buffer(1)]],
     device const half  *w        [[buffer(2)]],
@@ -1456,26 +1452,105 @@ kernel void qw36_matmul_f16gemv_f32(
     constant uint      &N        [[buffer(4)]],
     constant uint      &x_dtype  [[buffer(5)]],
     constant uint      &y_dtype  [[buffer(6)]],
+    uint3 tg                     [[threadgroup_position_in_grid]],
+    uint quad_gid                [[quadgroup_index_in_threadgroup]],
+    uint quad_lid                [[thread_index_in_quadgroup]])
+{
+    constexpr uint quads_per_simd = 8u;
+    constexpr uint results_per_quadgroup = 8u;
+    uint out0 = tg.y * quads_per_simd * results_per_quadgroup + quad_gid;
+
+    float acc[results_per_quadgroup];
+    for (uint r = 0; r < results_per_quadgroup; ++r) acc[r] = 0.0f;
+
+    uint vec_end = K & ~15u;
+    for (uint k = quad_lid * 4u; k < vec_end; k += 16u) {
+        float4 xv;
+        if (x_dtype == QW36_DTYPE_F16) {
+            xv = float4(*((device const half4 *)(((device const half *)x) + k)));
+        } else {
+            xv = *((device const float4 *)(((device const float *)x) + k));
+        }
+        for (uint r = 0; r < results_per_quadgroup; ++r) {
+            uint row = out0 + r * quads_per_simd;
+            if (row < N) {
+                float4 wv = float4(*((device const half4 *)(w + row * K + k)));
+                acc[r] += dot(xv, wv);
+            }
+        }
+    }
+    for (uint k = vec_end + quad_lid; k < K; k += 4u) {
+        float xv = qw36_load_scalar((device const uchar *)x, x_dtype, k);
+        for (uint r = 0; r < results_per_quadgroup; ++r) {
+            uint row = out0 + r * quads_per_simd;
+            if (row < N) acc[r] += xv * float(w[row * K + k]);
+        }
+    }
+
+    for (uint r = 0; r < results_per_quadgroup; ++r) {
+        float v = quad_sum(acc[r]);
+        uint row = out0 + r * quads_per_simd;
+        if (quad_lid == 0u && row < N) qw36_store_scalar(y, y_dtype, row, v);
+    }
+}
+
+/* ----------------------------------------------------------------- *
+ * Fused residual_add + rmsnorm.
+ *
+ *   x += y;                                  // residual_add
+ *   out = x * rsqrt(mean(x^2) + eps) * w;    // rmsnorm
+ *
+ * One pass over the same hidden-sized buffers, saves a full kernel
+ * dispatch per (residual_add → rmsnorm) pair — there are two such
+ * pairs per layer (post-attn → MLP rmsnorm, post-MLP → next layer's
+ * input rmsnorm), so 24 layers × 2 = 48 dispatches / token.
+ *
+ * Threadgroup grid: 1 (single TG operates on the full hidden vec).
+ * tg_size: rounded up to next 32 of hidden (= 1024 for Qwen3.5-0.8B).
+ * ----------------------------------------------------------------- */
+kernel void qw36_residual_rmsnorm_f32(
+    device uchar       *x        [[buffer(0)]],   /* updated in-place: x += y */
+    device const uchar *y        [[buffer(1)]],
+    device uchar       *out      [[buffer(2)]],   /* rmsnorm output */
+    device const uchar *w        [[buffer(3)]],
+    constant uint      &hidden   [[buffer(4)]],
+    constant float     &eps      [[buffer(5)]],
+    constant uint      &x_dtype  [[buffer(6)]],
+    constant uint      &y_dtype  [[buffer(7)]],
+    constant uint      &out_dtype [[buffer(8)]],
+    constant uint      &w_dtype  [[buffer(9)]],
     threadgroup float  *scratch  [[threadgroup(0)]],
     uint tid                     [[thread_position_in_threadgroup]],
-    uint n                       [[threadgroup_position_in_grid]])
+    uint tg_size                 [[threads_per_threadgroup]])
 {
-    if (n >= N) return;
-    const uint TG = 256u;
-    device const half *row = w + n * K;
-    float sum = 0.0f;
-    for (uint k = tid; k < K; k += TG) {
-        float xv = qw36_load_scalar((device const uchar *)x, x_dtype, k);
-        sum += xv * float(row[k]);
+    // Pass 1: x[i] = x[i] + y[i]; accumulate ss = sum(x[i]^2) in fp32.
+    float local_ss = 0.0f;
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float a = qw36_load_scalar(x, x_dtype, i);
+        float b = qw36_load_scalar(y, y_dtype, i);
+        float v = a + b;
+        qw36_store_scalar(x, x_dtype, i, v);
+        local_ss += v * v;
     }
-    float simd_v = simd_sum(sum);
+    // simd_sum + cross-simd reduction
+    float simd_v = simd_sum(local_ss);
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5;
     if (simd_lane == 0u) scratch[simd_id] = simd_v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < (TG >> 5)) {
-        float v = scratch[tid];
-        v = simd_sum(v);
-        if (tid == 0u) qw36_store_scalar(y, y_dtype, n, v);
+    uint simd_count = (tg_size + 31u) >> 5;
+    if (tid == 0u) {
+        float sum = 0.0f;
+        for (uint i = 0; i < simd_count; ++i) sum += scratch[i];
+        scratch[0] = rsqrt(sum / float(hidden) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = scratch[0];
+
+    // Pass 2: out[i] = x[i] * scale * w[i].
+    for (uint i = tid; i < hidden; i += tg_size) {
+        float v = qw36_load_scalar(x, x_dtype, i);
+        float ww = qw36_load_scalar(w, w_dtype, i);
+        qw36_store_scalar(out, out_dtype, i, v * scale * ww);
     }
 }

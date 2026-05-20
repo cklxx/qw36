@@ -137,6 +137,18 @@ typedef struct qw36_gpu_backend {
                          qw36_gpu_buf *x, qw36_gpu_buf *y,
                          uint32_t n);
 
+    /* Fused residual_add + rmsnorm:
+     *   x += y
+     *   out = x * rsqrt(mean(x^2) + eps) * w
+     * w_buf must be a backend-resident upload of the rmsnorm gamma.
+     * Saves one full kernel dispatch per (residual_add, rmsnorm) pair
+     * vs the separate kernels. Optional — backends without it should
+     * leave the pointer NULL and callers will fall back. */
+    void (*residual_rmsnorm)(qw36_gpu_ctx *ctx,
+                             qw36_gpu_buf *x, qw36_gpu_buf *y,
+                             qw36_gpu_buf *out, qw36_gpu_buf *w_buf,
+                             uint32_t hidden, float eps);
+
     /* Embedding lookup: y = embed[token]. */
     void (*embedding_lookup)(qw36_gpu_ctx *ctx,
                              qw36_gpu_buf *y, qw36_gpu_buf *embed,

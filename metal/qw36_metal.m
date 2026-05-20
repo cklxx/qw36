@@ -24,6 +24,7 @@ struct qw36_gpu_ctx {
     id<MTLCommandQueue> queue;
     id<MTLLibrary>      library;
     id<MTLComputePipelineState> rmsnorm;
+    id<MTLComputePipelineState> residual_rmsnorm;
     id<MTLComputePipelineState> matmul;
     id<MTLComputePipelineState> f32_to_f16;
     id<MTLComputePipelineState> f16_to_f32;
@@ -59,7 +60,7 @@ struct qw36_gpu_ctx {
     id<MTLBuffer> matmul_xh_src;
     NSUInteger    matmul_xh_cols;
 
-    id<MTLComputePipelineState> matmul_f16gemv;
+    id<MTLComputePipelineState> matmul_qmv_quad_f16;
     id<MTLComputePipelineState> matmul_q4_k;
     id<MTLComputePipelineState> matmul_q5_k;
     id<MTLComputePipelineState> matmul_q6_k;
@@ -530,6 +531,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->dn_reorder_gdr_y = metal_make_pipeline(ctx, @"qw36_dn_reorder_grouped_y_to_raw_f32", err, err_cap);
     ctx->dn_gated_rmsnorm = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f32", err, err_cap);
     ctx->residual_add     = metal_make_pipeline(ctx, @"qw36_residual_add_f32", err, err_cap);
+    ctx->residual_rmsnorm = metal_make_pipeline(ctx, @"qw36_residual_rmsnorm_f32", err, err_cap);
     ctx->embedding_lookup = metal_make_pipeline(ctx, @"qw36_embedding_lookup_f32", err, err_cap);
     ctx->head_norm_rope   = metal_make_pipeline(ctx, @"qw36_head_norm_rope_f32", err, err_cap);
     ctx->kv_append        = metal_make_pipeline(ctx, @"qw36_kv_append_f32", err, err_cap);
@@ -540,7 +542,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_score_combine_tg = metal_make_pipeline(ctx, @"qw36_attn_score_combine_tg_f32", err, err_cap);
     ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
     ctx->attn_decode_fused_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_f32", err, err_cap);
-    ctx->matmul_f16gemv = metal_make_pipeline(ctx, @"qw36_matmul_f16gemv_f32", err, err_cap);
+    ctx->matmul_qmv_quad_f16 = metal_make_pipeline(ctx, @"qw36_matmul_qmv_quad_f16", err, err_cap);
     ctx->matmul_q4_k = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_f32", err, err_cap);
     ctx->matmul_q5_k = metal_make_pipeline(ctx, @"qw36_matmul_q5_k_f32", err, err_cap);
     ctx->matmul_q6_k = metal_make_pipeline(ctx, @"qw36_matmul_q6_k_f32", err, err_cap);
@@ -999,21 +1001,25 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         (x->dtype == QW36_DTYPE_F32 || x->dtype == QW36_DTYPE_F16) &&
         (y->dtype == QW36_DTYPE_F32 || y->dtype == QW36_DTYPE_F16))
     {
-        /* Opt-in: when QW36_METAL_F16_GEMV_CUSTOM=1, route the fp16-weight
-         * matmul through our own per-row GEMV compute kernel instead of
-         * MPSMatrixVectorMultiplication. Used to bisect the fp16-state
-         * step-0 logit divergence (#48) and to enable persistent compute
-         * encoders across matmul + rmsnorm + residual_add. */
-        static int custom_f16gemv = -1;
-        if (custom_f16gemv < 0) {
-            const char *e = getenv("QW36_METAL_F16_GEMV_CUSTOM");
-            custom_f16gemv = (e && atoi(e)) ? 1 : 0;
+        /* Opt-in qmv_quad-style GEMV: one SIMD threadgroup produces up to
+         * 64 output rows using 8 quadgroups. This avoids MPS GEMV object
+         * encoding overhead on the fp16 weight path while retaining fp32
+         * accumulation inside the shader. */
+        static int qmv_quad_f16gemv = -1;
+        static uint32_t qmv_quad_max_rows = 0;
+        if (qmv_quad_f16gemv < 0) {
+            const char *e = getenv("QW36_METAL_F16_GEMV_QUAD");
+            qmv_quad_f16gemv = (e && atoi(e)) ? 1 : 0;
+            const char *mr = getenv("QW36_METAL_F16_GEMV_QUAD_MAX_ROWS");
+            int parsed = mr ? atoi(mr) : 512;
+            qmv_quad_max_rows = parsed > 0 ? (uint32_t)parsed : UINT32_MAX;
         }
-        if (custom_f16gemv && ctx->matmul_f16gemv && w->mtl) {
+        if (qmv_quad_f16gemv && rows <= qmv_quad_max_rows &&
+            ctx->matmul_qmv_quad_f16 && w->mtl) {
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:ctx->matmul_f16gemv];
+            [enc setComputePipelineState:ctx->matmul_qmv_quad_f16];
             uint32_t x_dtype = (uint32_t)x->dtype;
             uint32_t y_dtype = (uint32_t)y->dtype;
             [enc setBuffer:y->mtl offset:0 atIndex:0];
@@ -1023,9 +1029,8 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
             [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
             [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:6];
-            [enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc dispatchThreadgroups:MTLSizeMake(1, (rows + 63u) / 64u, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             [enc endEncoding];
             if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
             return;
@@ -1592,6 +1597,47 @@ static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf 
     });
 }
 
+/* Fused residual_add + rmsnorm:
+ *   x += y; out = x * rsqrt(mean(x^2) + eps) * w_buf
+ * One TG covers the full hidden vector; up to 256 threads cooperate.
+ * Skips the per-pair dispatch overhead that hits twice per layer. */
+static void metal_residual_rmsnorm(qw36_gpu_ctx *ctx,
+                                   qw36_gpu_buf *x, qw36_gpu_buf *y,
+                                   qw36_gpu_buf *out, qw36_gpu_buf *w_buf,
+                                   uint32_t hidden, float eps)
+{
+    if (!ctx || !x || !y || !out || !w_buf || !hidden) return;
+    metal_invalidate_matmul_xh(ctx);
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->residual_rmsnorm];
+    uint32_t x_dtype = (uint32_t)x->dtype;
+    uint32_t y_dtype = (uint32_t)y->dtype;
+    uint32_t out_dtype = (uint32_t)out->dtype;
+    uint32_t w_dtype = (uint32_t)w_buf->dtype;
+    [enc setBuffer:x->mtl     offset:0 atIndex:0];
+    [enc setBuffer:y->mtl     offset:0 atIndex:1];
+    [enc setBuffer:out->mtl   offset:0 atIndex:2];
+    [enc setBuffer:w_buf->mtl offset:0 atIndex:3];
+    [enc setBytes:&hidden length:sizeof(hidden) atIndex:4];
+    [enc setBytes:&eps    length:sizeof(eps)    atIndex:5];
+    [enc setBytes:&x_dtype   length:sizeof(x_dtype)   atIndex:6];
+    [enc setBytes:&y_dtype   length:sizeof(y_dtype)   atIndex:7];
+    [enc setBytes:&out_dtype length:sizeof(out_dtype) atIndex:8];
+    [enc setBytes:&w_dtype   length:sizeof(w_dtype)   atIndex:9];
+
+    NSUInteger tg = ctx->residual_rmsnorm.maxTotalThreadsPerThreadgroup;
+    if (tg > 256) tg = 256;
+    if (tg > hidden) tg = hidden;
+    NSUInteger simd_count = (tg + 31u) >> 5;
+    [enc setThreadgroupMemoryLength:simd_count * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    [enc endEncoding];
+    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+}
+
 static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *embed,
                                    uint32_t token, uint32_t hidden)
 {
@@ -1645,6 +1691,7 @@ static qw36_gpu_backend g_metal_backend = {
     .dn_gated_rmsnorm  = metal_dn_gated_rmsnorm,
     .moe_forward       = metal_moe_forward,
     .residual_add      = metal_residual_add,
+    .residual_rmsnorm  = metal_residual_rmsnorm,
     .embedding_lookup  = metal_embedding_lookup,
 };
 

@@ -441,6 +441,27 @@ int qw36__rmsnorm_dispatch_dev(qw36_gpu_buf *out, qw36_gpu_buf *x,
     return 0;
 }
 
+/* Fused residual_add + rmsnorm dispatch:
+ *   x += y; out = x * rsqrt(mean(x^2) + eps) * w
+ * Returns -1 when backend lacks the fused kernel (caller should fall
+ * back to the two-call path). */
+int qw36__residual_rmsnorm_dispatch_dev(qw36_gpu_buf *x, qw36_gpu_buf *y,
+                                         qw36_gpu_buf *out, const float *w,
+                                         size_t n, float eps)
+{
+    qw36_engine *eng = qw36__active_engine;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!x || !y || !out || !w || n > UINT32_MAX ||
+        !qw36__active_backend(&be, &ctx) || !be->residual_rmsnorm)
+        return -1;
+    qw36_gpu_buf *wb = qw36__gpu_cached_upload(eng, w, n * sizeof(float),
+                                               QW36_DTYPE_F32);
+    if (!wb) return -1;
+    be->residual_rmsnorm(ctx, x, y, out, wb, (uint32_t)n, eps);
+    return 0;
+}
+
 void qw36__residual_add_dispatch(float *x, const float *y, size_t n)
 {
     qw36_gpu_backend *be;

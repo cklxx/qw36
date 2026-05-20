@@ -106,6 +106,9 @@ void qw36__rmsnorm_dispatch(float *out, const float *x, const float *w,
                             size_t n, float eps);
 int qw36__rmsnorm_dispatch_dev(qw36_gpu_buf *out, qw36_gpu_buf *x,
                                const float *w, size_t n, float eps);
+int qw36__residual_rmsnorm_dispatch_dev(qw36_gpu_buf *x, qw36_gpu_buf *y,
+                                         qw36_gpu_buf *out, const float *w,
+                                         size_t n, float eps);
 void qw36__residual_add_dispatch(float *x, const float *y, size_t n);
 int qw36__residual_add_dispatch_dev(qw36_gpu_buf *x, qw36_gpu_buf *y,
                                     size_t n);
