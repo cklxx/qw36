@@ -22,9 +22,9 @@ Current decode throughput on `Qwen3.5-0.8B-Q4_K_M.gguf` (Apple M-class GPU):
 | llama.cpp reference, same model        | 170          |
 
 The full perf ladder lives in [`DIVISION_OF_WORK.md`](DIVISION_OF_WORK.md).
-**Output is not yet coherent** on this model — see [Known
-limitations](#known-limitations) and
-[`tests/correctness_diag.md`](tests/correctness_diag.md).
+The Qwen3.5 Q-gate fix makes the 0.8B baseline produce coherent text on
+both CPU and Metal; `tests/precision_cpu_vs_metal.sh` keeps the fp32 Metal
+path bit-identical to CPU at step 0.
 
 ---
 
@@ -120,17 +120,19 @@ All four binaries share `common/qw36_cli.c`. Flags:
 
 ---
 
-## Environment variables
+## Environment knobs
 
-Debug knobs, all read at startup or per-step in `common/qw36.c`:
+Runtime and debug knobs are read at startup unless noted otherwise:
 
 | var                          | effect                                                                                          |
 |------------------------------|-------------------------------------------------------------------------------------------------|
-| `QW36_METAL_FP16_WEIGHTS=1`  | Metal only. Materialize large lazy weights as fp16 and dispatch MPS half GEMV. ~55 → 81 tok/s on 0.8B-Q4_K_M. Introduces ~1e-3 numerical drift relative to fp32 — off by default so `tests/precision_cpu_vs_metal.sh` stays bit-equal. |
-| `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `‖x‖` and first three components of the residual stream before/after each block. Useful for diffing against a reference run. |
-| `QW36_SKIP_DN=1`             | Zero out the Gated DeltaNet block's contribution to the residual stream. Used to isolate whether DN layers are the source of incoherent output (they contribute nonsense — see `correctness_diag.md` — but vanilla GQA layers also misbehave). |
-| `QW36_SKIP_CONV1D=1`         | Skip the depthwise short-conv inside DN; pass QKV through `silu` only. Distinguishes conv-state ordering bugs from recurrent-state bugs. |
-| `QW36_ROPE_NEOX=1`           | Switch between RoPE pair conventions: `(x[2i], x[2i+1])` (interleaved, default) and `(x[i], x[i+d/2])` (NEOX half-rotation). Documented in `tests/correctness_diag.md`; wiring may still be partial — grep `qw36.c` before relying on it. |
+| `QW36_METAL_FP16_WEIGHTS=1`  | Metal only. Materialize large lazy weights as fp16 and dispatch MPS half GEMV. Typical Qwen3.5-0.8B-Q4_K_M decode improves from ~55 tok/s to ~83 tok/s. |
+| `QW36_METAL_FP16_KV=1`       | Metal only. Store the persistent KV cache as fp16. Long-context decode benefits because attention scans half the cache bytes. Enabled by default when fp16 weights are enabled unless explicitly set to `0`. |
+| `QW36_METAL_QUANT_GPU=1`     | Metal only. Use GPU-native quant matmul instead of host fp32/fp16 materialization. This saves roughly 1 GB RAM on the 0.8B model and currently runs around 40 tok/s, so it is an opt-in low-memory path. |
+| `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `||x||` and the first residual components before/after each block. Useful for bisecting the first divergent layer. |
+| `QW36_MAX_LAYERS=<n>`        | Stop forward after the first `n` layers. Used with layer traces for range bisection. |
+| `QW36_BYPASS_LAYERS=<spec>`  | Bypass selected layer ids or ranges during forward. Used to isolate a bad block without changing model loading. |
+| `QW36_SKIP_DN=1`             | Skip Gated DeltaNet layers, leaving vanilla attention layers active. Useful for separating DN regressions from GQA regressions. |
 
 ---
 
@@ -236,39 +238,33 @@ Runs, in order:
   regressed (see below).
 - `tests/e2e_qwen35_smoke.sh ./qw36_metal` — same, on Metal. Same caveat.
 
-The open correctness investigation lives at
-**[`tests/correctness_diag.md`](tests/correctness_diag.md)**. It tracks
-what's been ruled out (tokenizer, dequant, GQA mapping, mRoPE sections,
-CPU↔Metal divergence — all fine) and the remaining hypotheses (weight
-access pattern, RoPE pair convention, QK-norm formula, conv1d state
-ordering). That doc is the source of truth for the output-coherence bug.
+The layer-trace workflow lives in
+**[`tests/correctness_diag.md`](tests/correctness_diag.md)** and
+`tools/diff_layers.py`. It records the Q-gate root cause and the tensor
+dumps used to keep Qwen3.5/3.6 vanilla attention aligned with the MLX
+reference.
 
 ---
 
 ## Known limitations
 
-1. **Output is not yet coherent** on `Qwen3.5-0.8B-Q4_K_M.gguf` (task
-   #31). CPU and Metal produce the same degenerate token distribution
-   (top-1 is `{$`, `:$`, ` $` regardless of prompt) while llama.cpp on
-   the same file is fluent. The bug is somewhere in the shared forward
-   path, not the GPU port. See `tests/correctness_diag.md`.
-2. **GPU MoE is built but unvalidated.** `metal/qw36_metal.m` implements
+1. **GPU MoE is built but unvalidated.** `metal/qw36_metal.m` implements
    `moe_forward` (route + top-K, expert gate/up, down+combine), but no
    MoE GGUF is on disk locally so we have no numeric reference. CUDA/AMD
    MoE not yet implemented.
-3. **35B-A3B does not fit.** Eager weight materialization at engine-open
+2. **35B-A3B does not fit.** Eager weight materialization at engine-open
    would need ~140 GB fp32 / ~70 GB fp16. A streaming / lazy-quantized
    matmul path that keeps weights in Q4_K on the device and dequantizes
    per row inside the kernel is the prereq (task TBD).
-4. **Hybrid layer coverage.** Vanilla GQA layers work end-to-end. Gated
-   DeltaNet layers run on Metal but contribute to the incoherent
-   output; setting `QW36_SKIP_DN=1` removes DN but the remaining vanilla
-   layers are still off — both paths need debugging in lockstep.
-5. **Decode rate degrades with context.** 81 tok/s at n=16 falls to 74
+3. **Hybrid layer coverage.** Vanilla GQA and Gated DeltaNet run
+   end-to-end on CPU and Metal for the 0.8B baseline. CUDA/AMD still lag
+   Metal parity for the latest quant, DN, and MoE paths.
+4. **Decode rate degrades with context.** 81 tok/s at n=16 falls to 74
    at n=128 because attention score/softmax/combine are three separate
    Metal dispatches per layer; fusing into one MSL kernel is task #30.
-6. **`QW36_ROPE_NEOX=1`** is documented in `correctness_diag.md` but
-   not yet wired into the RoPE call sites — treat as a planned knob.
+5. **`QW36_ROPE_NEOX=1`** is documented in `correctness_diag.md` but
+   not currently part of the default Qwen3.5 path; treat it as a
+   diagnostic knob.
 
 ---
 
@@ -278,7 +274,12 @@ ordering). That doc is the source of truth for the output-coherence bug.
 qw36/
 ├── common/                 shared host C
 │   ├── qw36.h              public API: config, weights, state, sampler
-│   ├── qw36.c              CPU reference forward, dequant, lazy_w, gated_delta_decode
+│   ├── qw36.c              engine lifecycle, state alloc, forward, prefill, sampling
+│   ├── qw36_dequant.c      GGUF dtype conversion and block dequantization
+│   ├── qw36_ops.c          lazy matmul, embedding lookup, scalar/GPU op dispatch
+│   ├── qw36_attn_*.c       vanilla GQA and Gated DeltaNet layer bodies
+│   ├── qw36_mlp.c          SwiGLU / dense MLP layer body
+│   ├── qw36_moe.c          router, top-k expert combine, shared expert
 │   ├── qw36_gpu.h          backend vtable (frozen)
 │   ├── qw36_gguf.[ch]      GGUF v3 mmap loader
 │   ├── qw36_tokenizer.[ch] BBPE tokenizer + special-token vocab
@@ -289,10 +290,12 @@ qw36/
 ├── amd/                    HIP:  qw36_amd.cpp
 ├── tools/
 │   ├── download_model.sh   pull a Qwen3 GGUF from HF
-│   └── dump_tensor.c       (planned) dequant + print first N elems for diffing
+│   ├── dump_tensor.c       dequant + print first N elems for diffing
+│   └── diff_layers.py      compare qw36 and MLX intermediate tensor dumps
 ├── tests/
 │   ├── precision_cpu_vs_metal.sh
 │   ├── e2e_qwen35_smoke.sh
+│   ├── kernel_golden.sh
 │   └── correctness_diag.md ← open issue tracker
 ├── DIVISION_OF_WORK.md     who-owns-what + perf ladder
 ├── Makefile                top-level dispatch

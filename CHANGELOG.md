@@ -3,6 +3,32 @@
 All notable changes to qw36 are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-20
+
+### Correctness
+- Fixed the Qwen3.5/3.6 vanilla-attention Q-gate path. `attn_q.weight`
+  outputs `{q, q_gate}` per head, and the attention output is now gated
+  by `sigmoid(q_gate)` before `o_proj`.
+- Added the layer-trace diff harness:
+  `tools/mlx_dump_intermediates.py` and `tools/diff_layers.py`.
+
+### Architecture
+- Split the common engine into focused modules:
+  `qw36_attn_vanilla.c`, `qw36_attn_deltanet.c`, `qw36_mlp.c`,
+  `qw36_moe.c`, `qw36_ops.c`, and `qw36_dequant.c`.
+- Kept `qw36.c` focused on engine lifecycle, state allocation, forward
+  scheduling, prefill, and sampling.
+
+### Metal
+- Added the Metal Q-gate fused kernel path.
+- Added GGUF GPU-native quant matmul for Q4_K, Q5_K, Q6_K, and Q8_0.
+- Added Q4_K sub-block scale caching.
+- Deduplicated `xh` f32-to-f16 conversion in the fp16 MPS GEMV path.
+- Added the MPS weight matrix wrapper cache.
+- Extended fp16 residual-stream infrastructure so rmsnorm,
+  residual_add, silu_mul, embedding_lookup, matmul, and fused attention
+  accept dtype-aware buffers.
+
 ## [0.1.0] - 2026-05-20
 
 Initial release. Pure-C inference framework for Qwen 3.5 / 3.6 with three
@@ -44,4 +70,5 @@ in long context) on the Qwen3.5-0.8B-Q4_K_M baseline.
 - `tools/dump_tensor.c` — fp32 dump of a single tensor for cross-checking
   against llama.cpp.
 
+[0.2.0]: https://github.com/cklxx/qw36/releases/tag/v0.2.0
 [0.1.0]: https://github.com/cklxx/qw36/releases/tag/v0.1.0
