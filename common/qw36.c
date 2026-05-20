@@ -1217,10 +1217,20 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             matmul_lazy(alpha,  st->x_rms, (const qw36_lazy_w *)L->dn_alpha, row_scratch);
             matmul_lazy(beta,   st->x_rms, (const qw36_lazy_w *)L->dn_beta,  row_scratch);
 
-            /* Conv1d + SiLU on the QKV channels (depthwise causal). */
-            conv1d_silu_decode(qkv, (const float *)L->dn_conv1d,
-                               st->conv_state[l], qkv_act,
-                               qkv_dim, c->dn_conv_kernel_size);
+            /* Conv1d + SiLU on the QKV channels (depthwise causal).
+             * QW36_SKIP_CONV1D=1 forwards qkv directly (just silu, no conv).*/
+            static int skip_conv = -1;
+            if (skip_conv < 0) {
+                const char *e = getenv("QW36_SKIP_CONV1D");
+                skip_conv = e && atoi(e) ? 1 : 0;
+            }
+            if (skip_conv) {
+                for (uint32_t i = 0; i < qkv_dim; i++) qkv_act[i] = silu(qkv[i]);
+            } else {
+                conv1d_silu_decode(qkv, (const float *)L->dn_conv1d,
+                                   st->conv_state[l], qkv_act,
+                                   qkv_dim, c->dn_conv_kernel_size);
+            }
 
             /* Gated delta rule step. */
             gated_delta_decode(qkv_act, beta, alpha,
