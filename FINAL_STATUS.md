@@ -37,11 +37,39 @@ to 200 tok/s in progress (#30/#40).
 
 Per-layer cost is ~245us (consistent across MAX_LAYERS=N benches), so 24
 layers cost ~5.88ms + 2.46ms (embed + lm_head + sample) ≈ 8.34ms / token
-= ~120 tok/s. lm_head + final-norm path is already at memory-bandwidth
-limit (~1.55ms for 300MB fp16 lm_head ÷ 200 GB/s bw). To reach 200 tok/s
-(5ms / token) the layer budget would need to drop to ~106us/layer — 2.3×
-faster — which requires writing a custom fp16/bf16 GEMV that *beats* MPS
-on these shapes. Codex's qmv_quad attempt was slower on this host.
+= ~120 tok/s.
+
+### Theoretical ceiling reached for the fp16 path
+
+The 0.8B model materialised to fp16 is ~1.6 GB resident weights. Reading
+every weight once per token at the ~200 GB/s peak unified-memory bandwidth
+of this M-class GPU bottoms out at **8 ms / token = 125 tok/s**. Our
+8.34 ms = 96% of that ceiling. lm_head alone is 1.97 ms (MPS) vs 1.55 ms
+theoretical bw limit, i.e. 78 % bw efficient — and similar story per
+MLP / attention GEMV.
+
+### Why MLX gets 244 tok/s and we don't
+
+MLX-4bit reads ~0.4 GB per token (1.6 GB fp16 → ~0.4 GB at 4 bits), giving
+a 2 ms / token bw ceiling = ~500 tok/s. They get 244 = 49% of that with
+their hand-tuned `qmv_quad` quantised matmul. Our `QW36_METAL_QUANT_GPU=1`
+path (Q4_K + Q5_K + Q6_K kernels) is correct but the per-call cost is
+3-4× MPS-fp16's, so it lands at 58 tok/s — the bandwidth win is eaten by
+kernel overhead. Catching MLX requires a proper hand-tuned quant matmul
+that matches MLX's `qmv_quad` efficiency (multi-day kernel work; codex's
+generic 256-thread TG version isn't there).
+
+### Optimisations we tried that did not beat MPS on this host
+
+| experiment                              | result          |
+|-----------------------------------------|-----------------|
+| `qmv_quad`-style fp16 GEMV (codex G)    | slower than MPS |
+| Custom fp16 GEMV (single TG/row)        | slower than MPS |
+| MMA-based fp16 GEMV (codex Q)           | M=1 wastes 7/8 of the 8×8 tile; 4.16 ms vs MPS 1.97 ms on lm_head |
+| `QW36_METAL_F16_GEMV_QUAD` opt-in       | left in tree as `0` default |
+| Fused silu_mul + down_proj custom GEMV  | wash with MPS+silu_mul    |
+| fp16 residual state (x_dev / x_rms fp16) | step-0 logit drift; left as opt-in |
+| persistent compute encoder (codex O)    | minimal — CPU encode already <0.1% of budget |
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
