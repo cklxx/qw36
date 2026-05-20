@@ -21,6 +21,12 @@ Current result: `QW36_METAL_FP16_XRMS=1` keeps the expected step-0 top-1
 So the bad edge is the attention output buffer `q_dev` feeding `o_proj`,
 not the RMSNorm output feeding q/k/v/gate/up projections.
 
+`QW36_METAL_F16_GEMV_QUAD=1` adds a qmv_quad-style fp16 GEMV to replace
+MPS on selected row counts. It does not fix the `q_dev=fp16` divergence,
+so the issue is not just an MPS half-input quirk; fp16 attention-output
+storage itself is too lossy or the writer/reader layout still needs a
+separate diff.
+
 ## MLX vs qw36 perf analysis (session 2026-05-20)
 
 | model + path                          | tok/s | notes |
