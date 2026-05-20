@@ -872,6 +872,16 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             default: break;
         }
         if (qpipe) {
+            /* Q4_K kernel caches per-block scales in threadgroup memory
+             * (18 floats per Q4_K block + 8 SIMD-partial floats). Others
+             * still use the simple 256-float reduction scratch. */
+            NSUInteger tg_bytes = 256 * sizeof(float);
+            if (w->dtype == QW36_DTYPE_Q4_K) {
+                NSUInteger k_blocks = cols / 256u;
+                tg_bytes = (18u * k_blocks + 8u) * sizeof(float);
+                if (tg_bytes < 256 * sizeof(float))
+                    tg_bytes = 256 * sizeof(float);
+            }
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -881,8 +891,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setBuffer:w->mtl offset:0 atIndex:2];
             [enc setBytes:&cols length:sizeof(cols) atIndex:3];
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
-            [enc setThreadgroupMemoryLength:(NSUInteger)256 * sizeof(float)
-                                    atIndex:0];
+            [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];

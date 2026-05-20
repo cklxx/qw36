@@ -1243,35 +1243,78 @@ static inline float qw36_gguf_q8_0_value(device const uchar *row, int k)
     return qw36_gguf_f16(p) * float(qw36_gguf_i8(p[2 + lane]));
 }
 
-/* Q4_K matmul: y[n] = sum_k x[k] * dequant(w_row_n[k])
- * Threadgroup grid: (N rows, 1, 1). Threads per group: 256. */
+/* Q4_K matmul (decode, M=1, output row n)
+ * Each threadgroup handles one output row. We first cache d, dmin and the
+ * 8 per-sub-block scale/min entries for every Q4_K block on this row into
+ * threadgroup memory (max 16 blocks → 192 bytes), then each thread does a
+ * strided per-element walk reading only the cached constants + a single
+ * quant byte. Saves the redundant fp16 + 6-bit unpack each thread used to
+ * do per element. */
 kernel void qw36_matmul_q4_k_f32(
     device float       *y    [[buffer(0)]],
     device const float *x    [[buffer(1)]],
     device const uchar *w    [[buffer(2)]],
     constant uint      &K    [[buffer(3)]],
     constant uint      &N    [[buffer(4)]],
-    threadgroup float  *partial [[threadgroup(0)]],
+    threadgroup float  *scratch [[threadgroup(0)]],
     uint tid                 [[thread_position_in_threadgroup]],
     uint n                   [[threadgroup_position_in_grid]])
 {
     if (n >= N) return;
     const uint TG = 256u;
-    uint row_bytes = (K / 256u) * 144u;
+    uint K_blocks = K >> 8;            /* num Q4_K blocks per row */
+    uint row_bytes = K_blocks * 144u;
     device const uchar *row = w + n * row_bytes;
+
+    /* Layout in scratch:
+     *   scratch[0..K_blocks-1]            : d
+     *   scratch[K_blocks..2*K_blocks-1]   : dmin
+     *   scratch[2*K_blocks..18*K_blocks-1]: sc/mn (8 sc + 8 mn floats per block, packed)
+     * For K=3584 → K_blocks=14, total <= 14*(2+16)=252 floats = 1 KiB. */
+    threadgroup float *d_cache    = scratch;
+    threadgroup float *dmin_cache = scratch + K_blocks;
+    threadgroup float *sc_cache   = scratch + 2u * K_blocks;       /* [K_blocks][8] */
+    threadgroup float *mn_cache   = scratch + 2u * K_blocks + 8u * K_blocks;
+    if (tid < K_blocks) {
+        device const uchar *p = row + tid * 144u;
+        d_cache[tid] = qw36_gguf_f16(p);
+        dmin_cache[tid] = qw36_gguf_f16(p + 2);
+        uchar sc[8], mn[8];
+        qw36_gguf_q4_scales(p + 4, sc, mn);
+        for (uint s = 0; s < 8u; s++) {
+            sc_cache[tid * 8u + s] = float(sc[s]);
+            mn_cache[tid * 8u + s] = float(mn[s]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     float sum = 0.0f;
     for (uint k = tid; k < K; k += TG) {
-        sum += x[k] * qw36_gguf_q4_k_value(row, int(k));
+        uint sb = k >> 8;
+        uint local = k & 255u;
+        uint iter = local >> 6;
+        uint h = (local >> 5) & 1u;
+        uint lane = local & 31u;
+        uint sub = iter * 2u + h;
+        device const uchar *p = row + sb * 144u;
+        uchar byte = p[16u + iter * 32u + lane];
+        float q = (h == 0u) ? float(byte & 0x0fu) : float(byte >> 4);
+        float d = d_cache[sb];
+        float dmn = dmin_cache[sb];
+        float wval = q * (d * sc_cache[sb * 8u + sub])
+                   - dmn * mn_cache[sb * 8u + sub];
+        sum += x[k] * wval;
     }
-    /* simd_sum-based reduction: collapse each 32-wide SIMD group with one
-     * intrinsic, then reduce the 8 partials in a single SIMD step. */
+
     float simd_v = simd_sum(sum);
     uint simd_lane = tid & 31u;
     uint simd_id = tid >> 5;
-    if (simd_lane == 0u) partial[simd_id] = simd_v;
+    /* Reuse the tail of scratch (past the cache) for per-SIMD partials. */
+    threadgroup float *part = scratch + 18u * K_blocks;
+    if (simd_lane == 0u) part[simd_id] = simd_v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < (TG >> 5)) {
-        float v = partial[tid];
+        float v = part[tid];
         v = simd_sum(v);
         if (tid == 0u) y[n] = v;
     }
