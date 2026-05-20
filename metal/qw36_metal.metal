@@ -123,14 +123,18 @@ kernel void qw36_f16_to_f32_f32(
 /* a dedicated fused kernel can come later.                          */
 /* ---------------------------------------------------------------- */
 kernel void qw36_silu_mul_f32(
-    device float       *gate_io  [[buffer(0)]], /* in: gate, out: silu(gate)*up */
-    device const float *up       [[buffer(1)]],
+    device uchar       *gate_io  [[buffer(0)]], /* in: gate, out: silu(gate)*up */
+    device const uchar *up       [[buffer(1)]],
     constant uint      &n        [[buffer(2)]],
+    constant uint      &gate_dtype [[buffer(3)]],
+    constant uint      &up_dtype [[buffer(4)]],
     uint                tid      [[thread_position_in_grid]])
 {
     if (tid >= n) return;
-    float g = gate_io[tid];
-    gate_io[tid] = (g / (1.0f + exp(-g))) * up[tid];
+    float g = qw36_load_scalar(gate_io, gate_dtype, tid);
+    float u = qw36_load_scalar(up, up_dtype, tid);
+    qw36_store_scalar(gate_io, gate_dtype, tid,
+                      (g / (1.0f + exp(-g))) * u);
 }
 
 kernel void qw36_moe_route_f32(

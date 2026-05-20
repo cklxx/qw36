@@ -1284,9 +1284,13 @@ static void metal_swiglu(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
     metal_matmul(ctx, gate, x, w_gate, 1, inter, hidden);
     metal_matmul(ctx, up,   x, w_up,   1, inter, hidden);
     metal_dispatch_1d(ctx, ctx->silu_mul, inter, ^(id<MTLComputeCommandEncoder> enc) {
+        uint32_t gate_dtype = (uint32_t)gate->dtype;
+        uint32_t up_dtype = (uint32_t)up->dtype;
         [enc setBuffer:gate->mtl offset:0 atIndex:0];
         [enc setBuffer:up->mtl   offset:0 atIndex:1];
         [enc setBytes:&inter length:sizeof(inter) atIndex:2];
+        [enc setBytes:&gate_dtype length:sizeof(gate_dtype) atIndex:3];
+        [enc setBytes:&up_dtype length:sizeof(up_dtype) atIndex:4];
     });
     metal_matmul(ctx, y, gate, w_down, 1, hidden, inter);
 }
