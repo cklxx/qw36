@@ -1434,3 +1434,48 @@ kernel void qw36_matmul_q8_0_f32(
         if (tid == 0u) y[n] = v;
     }
 }
+
+/* ----------------------------------------------------------------- *
+ * Custom fp16-weight GEMV (M=1 decode).
+ *
+ * Replaces MPSMatrixVectorMultiplication for the fp16 fast path:
+ * matmul reads fp16 weight + fp16 OR fp32 input, writes fp16 OR fp32
+ * output. We control the encoder (compute pipeline) so consecutive
+ * fp16 matmuls can share one encoder — which the MPS path can't, since
+ * MPS encodes through its own command encoder per call.
+ *
+ * Layout: one threadgroup per output row, TG=256 threads cooperate
+ * over K via simd_sum + cross-simd reduction. Each thread accumulates
+ * fp32 partials then casts on store.
+ * ----------------------------------------------------------------- */
+kernel void qw36_matmul_f16gemv_f32(
+    device uchar       *y        [[buffer(0)]],
+    device const uchar *x        [[buffer(1)]],
+    device const half  *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    constant uint      &x_dtype  [[buffer(5)]],
+    constant uint      &y_dtype  [[buffer(6)]],
+    threadgroup float  *scratch  [[threadgroup(0)]],
+    uint tid                     [[thread_position_in_threadgroup]],
+    uint n                       [[threadgroup_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint TG = 256u;
+    device const half *row = w + n * K;
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += TG) {
+        float xv = qw36_load_scalar((device const uchar *)x, x_dtype, k);
+        sum += xv * float(row[k]);
+    }
+    float simd_v = simd_sum(sum);
+    uint simd_lane = tid & 31u;
+    uint simd_id = tid >> 5;
+    if (simd_lane == 0u) scratch[simd_id] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (TG >> 5)) {
+        float v = scratch[tid];
+        v = simd_sum(v);
+        if (tid == 0u) qw36_store_scalar(y, y_dtype, n, v);
+    }
+}
