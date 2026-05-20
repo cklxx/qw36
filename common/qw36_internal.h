@@ -65,6 +65,11 @@ typedef struct qw36_forward_ctx {
      * and qw36__mlp_forward must skip its own post_attn_layernorm
      * dispatch. Reset to 0 at the start of every layer in qw36_forward. */
     int post_attn_rmsnorm_done;
+    /* Same idea between layers: qw36__mlp_forward may fold its closing
+     * residual_add with the next layer's input_layernorm. When set,
+     * qw36__attn_vanilla / qw36__attn_deltanet must skip their own
+     * input_layernorm dispatch. Reset to 0 per layer in qw36_forward. */
+    int input_rmsnorm_done;
 } qw36_forward_ctx;
 
 extern qw36_engine *qw36__active_engine;
@@ -159,7 +164,8 @@ int qw36__attention_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
 int qw36__deltanet_dispatch_dev(qw36_state *st,
                                 const qw36_layer_weights *L,
                                 const qw36_config *c,
-                                uint32_t layer_idx);
+                                uint32_t layer_idx,
+                                int skip_input_rmsnorm);
 void qw36__conv1d_silu_decode(const float *x, const float *conv_w,
                               float *conv_state, float *y,
                               uint32_t channels, uint32_t k);

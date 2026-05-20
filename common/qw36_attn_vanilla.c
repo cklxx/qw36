@@ -154,10 +154,12 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
         int erc = qw36__ensure_x_dev(fc);
         if (erc) return erc;
         int grc = 0;
-        grc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
-                                          (qw36_gpu_buf *)st->x_dev,
-                                          (const float *)L->input_layernorm,
-                                          hidden, c->rms_norm_eps);
+        if (!fc->input_rmsnorm_done) {
+            grc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
+                                              (qw36_gpu_buf *)st->x_dev,
+                                              (const float *)L->input_layernorm,
+                                              hidden, c->rms_norm_eps);
+        }
         grc |= qw36__attention_dispatch_dev((qw36_gpu_buf *)st->q_dev,
                                             (qw36_gpu_buf *)st->x_rms_dev, L,
                                             (qw36_gpu_buf *)st->k_cache_dev[layer_idx],

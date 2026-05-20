@@ -189,7 +189,8 @@ void qw36__conv1d_silu_decode(const float *x, const float *conv_w,
 int qw36__deltanet_dispatch_dev(qw36_state *st,
                                  const qw36_layer_weights *L,
                                  const qw36_config *c,
-                                 uint32_t layer_idx)
+                                 uint32_t layer_idx,
+                                 int skip_input_rmsnorm)
 {
     qw36_engine *eng = qw36__active_engine;
     qw36_gpu_backend *be;
@@ -238,10 +239,12 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     if (!conv_w || !dt_bias || !a_log || !dn_norm) return -1;
 
     int rc = 0;
-    rc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
-                               (qw36_gpu_buf *)st->x_dev,
-                               (const float *)L->input_layernorm,
-                               c->hidden_size, c->rms_norm_eps);
+    if (!skip_input_rmsnorm) {
+        rc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
+                                   (qw36_gpu_buf *)st->x_dev,
+                                   (const float *)L->input_layernorm,
+                                   c->hidden_size, c->rms_norm_eps);
+    }
     rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_qkv_dev,
                           (qw36_gpu_buf *)st->x_rms_dev,
                           (const qw36_lazy_w *)L->dn_qkv);
@@ -310,7 +313,8 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     if (fc->gpu_state) {
         int erc = qw36__ensure_x_dev(fc);
         if (erc) return erc;
-        int drc = qw36__deltanet_dispatch_dev(st, L, c, layer_idx);
+        int drc = qw36__deltanet_dispatch_dev(st, L, c, layer_idx,
+                                              fc->input_rmsnorm_done);
         if (drc >= 0) {
             if (drc == 1) fc->post_attn_rmsnorm_done = 1;
             *fc->x_dev_valid = 1;

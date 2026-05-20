@@ -28,7 +28,8 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
                       const qw36_layer_weights *L,
                       uint32_t layer_idx)
 {
-    (void)layer_idx;
+    /* layer_idx lets us peek at the NEXT layer's input_layernorm so we
+     * can fold the closing residual_add into a fused residual+rmsnorm. */
     if (!fc || !L || !fc->eng || !fc->st || !fc->cfg) return -1;
 
     qw36_engine *eng = fc->eng;
@@ -60,9 +61,30 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
                                          (const qw36_lazy_w *)L->up_proj,
                                          (const qw36_lazy_w *)L->down_proj,
                                          (uint32_t)hidden, (uint32_t)inter);
-        grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
-                                               (qw36_gpu_buf *)st->x_rms_dev,
-                                               hidden);
+        /* Fuse with next layer's input rmsnorm when one exists. */
+        const qw36_layer_weights *L_next =
+            (layer_idx + 1 < fc->cfg->num_hidden_layers)
+                ? &fc->weights->layers[layer_idx + 1]
+                : NULL;
+        int fused = 0;
+        if (L_next && L_next->input_layernorm &&
+            eng->backend->residual_rmsnorm)
+        {
+            if (qw36__residual_rmsnorm_dispatch_dev(
+                    (qw36_gpu_buf *)st->x_dev,
+                    (qw36_gpu_buf *)st->x_rms_dev,
+                    (qw36_gpu_buf *)st->x_rms_dev,
+                    (const float *)L_next->input_layernorm,
+                    hidden, c->rms_norm_eps) == 0) {
+                fused = 1;
+                fc->input_rmsnorm_done = 1;
+            }
+        }
+        if (!fused) {
+            grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                                   (qw36_gpu_buf *)st->x_rms_dev,
+                                                   hidden);
+        }
         if (grc == 0) {
             *fc->x_dev_valid = 1;
             *fc->x_host_valid = 0;
@@ -106,9 +128,29 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
                     sd ? sd->gpu_buf : NULL,
                     (uint32_t)hidden, mi, c->moe_num_experts,
                     c->moe_experts_per_tok, c->moe_norm_topk_prob);
-                grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
-                                                       (qw36_gpu_buf *)st->x_rms_dev,
-                                                       hidden);
+                const qw36_layer_weights *L_next_moe =
+                    (layer_idx + 1 < fc->cfg->num_hidden_layers)
+                        ? &fc->weights->layers[layer_idx + 1]
+                        : NULL;
+                int fused_moe = 0;
+                if (L_next_moe && L_next_moe->input_layernorm &&
+                    eng->backend->residual_rmsnorm)
+                {
+                    if (qw36__residual_rmsnorm_dispatch_dev(
+                            (qw36_gpu_buf *)st->x_dev,
+                            (qw36_gpu_buf *)st->x_rms_dev,
+                            (qw36_gpu_buf *)st->x_rms_dev,
+                            (const float *)L_next_moe->input_layernorm,
+                            hidden, c->rms_norm_eps) == 0) {
+                        fused_moe = 1;
+                        fc->input_rmsnorm_done = 1;
+                    }
+                }
+                if (!fused_moe) {
+                    grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                                           (qw36_gpu_buf *)st->x_rms_dev,
+                                                           hidden);
+                }
             }
             if (grc == 0) {
                 *fc->x_dev_valid = 1;
