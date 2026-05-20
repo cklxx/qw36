@@ -872,18 +872,31 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
          * reproduce/bisect #46. This remains opt-in because it currently
          * changes step-0 logits when fed into MPS half GEMV. */
         const char *fp16_edges_env = getenv("QW36_METAL_FP16_EDGES");
-        const int use_fp16_matmul_edges =
+        const char *fp16_xrms_env = getenv("QW36_METAL_FP16_XRMS");
+        const char *fp16_q_env = getenv("QW36_METAL_FP16_Q");
+        const int allow_fp16_edge =
             be->name && strcmp(be->name, "metal") == 0 &&
-            fp16_weights_env && atoi(fp16_weights_env) != 0 &&
-            fp16_edges_env && atoi(fp16_edges_env) != 0;
-        const qw36_dtype edge_dtype =
-            use_fp16_matmul_edges ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
-        const size_t edge_elem_bytes =
-            use_fp16_matmul_edges ? sizeof(uint16_t) : sizeof(float);
+            fp16_weights_env && atoi(fp16_weights_env) != 0;
+        const int use_fp16_edges =
+            allow_fp16_edge && fp16_edges_env && atoi(fp16_edges_env) != 0;
+        const int use_fp16_xrms =
+            use_fp16_edges ||
+            (allow_fp16_edge && fp16_xrms_env && atoi(fp16_xrms_env) != 0);
+        const int use_fp16_q =
+            use_fp16_edges ||
+            (allow_fp16_edge && fp16_q_env && atoi(fp16_q_env) != 0);
+        const qw36_dtype xrms_dtype =
+            use_fp16_xrms ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
+        const qw36_dtype q_dev_dtype =
+            use_fp16_q ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
+        const size_t xrms_elem_bytes =
+            use_fp16_xrms ? sizeof(uint16_t) : sizeof(float);
+        const size_t q_dev_elem_bytes =
+            use_fp16_q ? sizeof(uint16_t) : sizeof(float);
         st->dev_x_dtype = QW36_DTYPE_F32;
         st->x_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
-        st->x_rms_dev = be->alloc(ctx, hidden * edge_elem_bytes, edge_dtype);
-        st->q_dev = be->alloc(ctx, q_dim * edge_elem_bytes, edge_dtype);
+        st->x_rms_dev = be->alloc(ctx, hidden * xrms_elem_bytes, xrms_dtype);
+        st->q_dev = be->alloc(ctx, q_dim * q_dev_elem_bytes, q_dev_dtype);
         st->k_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->v_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->attn_scores_dev = be->alloc(ctx,

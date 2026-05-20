@@ -12,3 +12,11 @@ Repro:
 QW36_METAL_FP16_WEIGHTS=1 QW36_METAL_FP16_EDGES=1 \
   ./qw36_metal -m <model.gguf> -p Hello -n 1 --no-special --debug-top 5
 ```
+
+For bisection, use `QW36_METAL_FP16_XRMS=1` or `QW36_METAL_FP16_Q=1`
+instead of `QW36_METAL_FP16_EDGES=1`.
+
+Current result: `QW36_METAL_FP16_XRMS=1` keeps the expected step-0 top-1
+`,` (id 11). `QW36_METAL_FP16_Q=1` flips top-1 to `uela` (id 22995).
+So the bad edge is the attention output buffer `q_dev` feeding `o_proj`,
+not the RMSNorm output feeding q/k/v/gate/up projections.
