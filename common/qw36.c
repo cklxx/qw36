@@ -1807,6 +1807,11 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     if (backend) {
         eng->ctx = backend->init(err, err_cap);
         if (!eng->ctx) { qw36_engine_close(eng); return NULL; }
+        /* Opt-in fp16 weight materialization on Metal — nearly doubles
+         * decode throughput (55 → 81 tok/s) but introduces ~1e-3 drift
+         * that can flip the argmax later in a greedy run. Default off so
+         * tests/precision_cpu_vs_metal.sh stays bit-equal; set
+         * QW36_METAL_FP16_WEIGHTS=1 for the perf path. */
         const char *fp16_env = getenv("QW36_METAL_FP16_WEIGHTS");
         const int fp16_lazy_weights =
             backend->name && strcmp(backend->name, "metal") == 0 &&
