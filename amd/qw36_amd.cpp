@@ -441,6 +441,16 @@ static void amd_download(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
     hipStreamSynchronize(ctx->stream);
 }
 
+static void amd_copy_from_host(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
+                               const void *host, size_t bytes)
+{
+    if (!ctx || !buf || !host) return;
+    if (bytes > buf->bytes) bytes = buf->bytes;
+    if (!bytes) return;
+    hipMemcpyAsync(buf->dptr, host, bytes, hipMemcpyHostToDevice, ctx->stream);
+    hipStreamSynchronize(ctx->stream);
+}
+
 static qw36_gpu_buf *amd_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dtype)
 {
     if (!ctx) return nullptr;
@@ -882,6 +892,7 @@ static qw36_gpu_backend g_amd_backend = {
     /* end_batch         */ nullptr,
     /* upload            */ amd_upload,
     /* download          */ amd_download,
+    /* copy_from_host    */ amd_copy_from_host,
     /* alloc             */ amd_alloc,
     /* free              */ amd_free,
     /* rmsnorm           */ amd_rmsnorm,

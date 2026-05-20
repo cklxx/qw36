@@ -54,6 +54,8 @@ typedef struct qw36_gpu_backend {
                             size_t bytes, qw36_dtype dtype);
     void          (*download)(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
                               void *host, size_t bytes);
+    void          (*copy_from_host)(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
+                                    const void *host, size_t bytes);
     qw36_gpu_buf *(*alloc)(qw36_gpu_ctx *ctx, size_t bytes,
                            qw36_dtype dtype);
     void          (*free)(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf);

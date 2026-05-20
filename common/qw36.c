@@ -39,6 +39,13 @@ typedef struct {
     qw36_gpu_buf *gpu_buf;     /* non-NULL after upload to GPU backend */
 } qw36_lazy_w;
 
+typedef struct {
+    const void   *host;
+    size_t        bytes;
+    qw36_dtype    dtype;
+    qw36_gpu_buf *gpu_buf;
+} qw36_gpu_cache_entry;
+
 struct qw36_engine {
     qw36_config       cfg;
     qw36_weights      weights;
@@ -52,6 +59,12 @@ struct qw36_engine {
     void             **owned;
     size_t             owned_n;
     size_t             owned_cap;
+
+    /* Small fp32 tensors (norm weights, DN biases) uploaded on first use by
+     * GPU-resident forward paths. Large lazy_w matrices keep their own gpu_buf. */
+    qw36_gpu_cache_entry *gpu_cache;
+    size_t                gpu_cache_n;
+    size_t                gpu_cache_cap;
 
     /* Cached arch prefix ("qwen3" / "qwen3moe" / "qwen35" / "qwen35moe"). */
     char               arch[32];
@@ -446,6 +459,79 @@ static int active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out)
     return 1;
 }
 
+static qw36_gpu_buf *gpu_cached_upload(qw36_engine *eng, const void *host,
+                                        size_t bytes, qw36_dtype dtype)
+{
+    if (!eng || !eng->backend || !eng->ctx || !eng->backend->upload ||
+        !host || !bytes)
+        return NULL;
+    for (size_t i = 0; i < eng->gpu_cache_n; i++) {
+        qw36_gpu_cache_entry *e = &eng->gpu_cache[i];
+        if (e->host == host && e->bytes == bytes && e->dtype == dtype)
+            return e->gpu_buf;
+    }
+    if (eng->gpu_cache_n >= eng->gpu_cache_cap) {
+        size_t nc = eng->gpu_cache_cap ? eng->gpu_cache_cap * 2 : 128;
+        qw36_gpu_cache_entry *arr =
+            (qw36_gpu_cache_entry *)realloc(eng->gpu_cache,
+                                            nc * sizeof(*arr));
+        if (!arr) return NULL;
+        eng->gpu_cache = arr;
+        eng->gpu_cache_cap = nc;
+    }
+    qw36_gpu_buf *gb = eng->backend->upload(eng->ctx, host, bytes, dtype);
+    if (!gb) return NULL;
+    eng->gpu_cache[eng->gpu_cache_n++] = (qw36_gpu_cache_entry){
+        host, bytes, dtype, gb
+    };
+    return gb;
+}
+
+static void gpu_cache_free(qw36_engine *eng)
+{
+    if (!eng) return;
+    if (eng->backend && eng->backend->free && eng->ctx) {
+        for (size_t i = 0; i < eng->gpu_cache_n; i++)
+            eng->backend->free(eng->ctx, eng->gpu_cache[i].gpu_buf);
+    }
+    free(eng->gpu_cache);
+    eng->gpu_cache = NULL;
+    eng->gpu_cache_n = eng->gpu_cache_cap = 0;
+}
+
+static int state_backend(qw36_state *st, qw36_gpu_backend **be_out,
+                         qw36_gpu_ctx **ctx_out)
+{
+    if (!st || !st->gpu_backend || !st->gpu_ctx) return 0;
+    qw36_gpu_backend *be = (qw36_gpu_backend *)st->gpu_backend;
+    qw36_gpu_ctx *ctx = (qw36_gpu_ctx *)st->gpu_ctx;
+    if (!be->alloc || !be->free || !be->download || !be->copy_from_host)
+        return 0;
+    if (be_out) *be_out = be;
+    if (ctx_out) *ctx_out = ctx;
+    return 1;
+}
+
+static int state_copy_from_host(qw36_state *st, void *dst_dev,
+                                const void *src, size_t bytes)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!dst_dev || !src || !state_backend(st, &be, &ctx)) return -1;
+    be->copy_from_host(ctx, (qw36_gpu_buf *)dst_dev, src, bytes);
+    return 0;
+}
+
+static int state_download_to_host(qw36_state *st, void *src_dev,
+                                  void *dst, size_t bytes)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!src_dev || !dst || !state_backend(st, &be, &ctx)) return -1;
+    be->download(ctx, (qw36_gpu_buf *)src_dev, dst, bytes);
+    return 0;
+}
+
 /* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c].
  * Dispatches to the GPU backend when one is attached and the weight has
  * an uploaded gpu_buf; otherwise falls back to per-row CPU dequant + dot.
@@ -492,6 +578,20 @@ cpu_path:
         for (size_t c = 0; c < cols; c++) acc += (double)row_scratch[c] * x[c];
         y[r] = (float)acc;
     }
+    return 0;
+}
+
+static int matmul_lazy_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
+                           const qw36_lazy_w *w)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!y || !x || !w || !w->gpu_buf || !w->rows || !w->cols ||
+        w->rows > UINT32_MAX || w->cols > UINT32_MAX ||
+        !active_backend(&be, &ctx) || !be->matmul)
+        return -1;
+    be->matmul(ctx, y, x, w->gpu_buf, 1,
+               (uint32_t)w->rows, (uint32_t)w->cols);
     return 0;
 }
 
@@ -787,6 +887,18 @@ static int embed_lookup_lazy(const qw36_lazy_w *w, uint32_t token, float *out) {
     return dequant_row(w, token, out);
 }
 
+static int embed_lookup_lazy_dev(qw36_gpu_buf *out, const qw36_lazy_w *w,
+                                 uint32_t token)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!out || !w || !w->gpu_buf || w->cols > UINT32_MAX ||
+        !active_backend(&be, &ctx) || !be->embedding_lookup)
+        return -1;
+    be->embedding_lookup(ctx, out, w->gpu_buf, token, (uint32_t)w->cols);
+    return 0;
+}
+
 /* --------------------------------------------------------------------- */
 /* CPU reference math — all fp32, scalar. The GPU backends must match.   */
 /* --------------------------------------------------------------------- */
@@ -1001,6 +1113,22 @@ static void rmsnorm_dispatch(float *out, const float *x, const float *w,
     rmsnorm_f32(out, x, w, n, eps);
 }
 
+static int rmsnorm_dispatch_dev(qw36_gpu_buf *out, qw36_gpu_buf *x,
+                                const float *w, size_t n, float eps)
+{
+    qw36_engine *eng = qw36_active_engine;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!out || !x || !w || n > UINT32_MAX ||
+        !active_backend(&be, &ctx) || !be->rmsnorm)
+        return -1;
+    qw36_gpu_buf *wb = gpu_cached_upload(eng, w, n * sizeof(float),
+                                         QW36_DTYPE_F32);
+    if (!wb) return -1;
+    be->rmsnorm(ctx, out, x, wb, (uint32_t)n, eps);
+    return 0;
+}
+
 static void residual_add_dispatch(float *x, const float *y, size_t n)
 {
     qw36_gpu_backend *be;
@@ -1019,6 +1147,18 @@ static void residual_add_dispatch(float *x, const float *y, size_t n)
         if (yb) be->free(ctx, yb);
     }
     for (size_t i = 0; i < n; i++) x[i] += y[i];
+}
+
+static int residual_add_dispatch_dev(qw36_gpu_buf *x, qw36_gpu_buf *y,
+                                     size_t n)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!x || !y || n > UINT32_MAX ||
+        !active_backend(&be, &ctx) || !be->residual_add)
+        return -1;
+    be->residual_add(ctx, x, y, (uint32_t)n);
+    return 0;
 }
 
 static int swiglu_dispatch(float *y, const float *x,
@@ -1056,6 +1196,23 @@ static int swiglu_dispatch(float *y, const float *x,
     for (uint32_t i = 0; i < inter; i++)
         scratch_gate[i] = silu(scratch_gate[i]) * scratch_up[i];
     if (matmul_lazy(y, scratch_gate, w_down, row_scratch)) return -1;
+    return 0;
+}
+
+static int swiglu_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
+                               const qw36_lazy_w *w_gate,
+                               const qw36_lazy_w *w_up,
+                               const qw36_lazy_w *w_down,
+                               uint32_t hidden, uint32_t inter)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!y || !x || !w_gate || !w_up || !w_down ||
+        !w_gate->gpu_buf || !w_up->gpu_buf || !w_down->gpu_buf ||
+        !active_backend(&be, &ctx) || !be->swiglu_mlp)
+        return -1;
+    be->swiglu_mlp(ctx, y, x, w_gate->gpu_buf, w_up->gpu_buf,
+                   w_down->gpu_buf, hidden, inter);
     return 0;
 }
 
@@ -1114,6 +1271,41 @@ static int attention_dispatch(float *y, const float *x,
     if (knb) be->free(ctx, knb);
     if (kb) be->free(ctx, kb);
     if (vb) be->free(ctx, vb);
+    return 0;
+}
+
+static int attention_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
+                                  const qw36_layer_weights *L,
+                                  qw36_gpu_buf *k_cache,
+                                  qw36_gpu_buf *v_cache,
+                                  const qw36_config *c,
+                                  uint32_t seq_pos,
+                                  uint32_t seq_capacity)
+{
+    const qw36_lazy_w *wq = (const qw36_lazy_w *)L->q_proj;
+    const qw36_lazy_w *wk = (const qw36_lazy_w *)L->k_proj;
+    const qw36_lazy_w *wv = (const qw36_lazy_w *)L->v_proj;
+    qw36_engine *eng = qw36_active_engine;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!y || !x || !k_cache || !v_cache ||
+        !wq || !wk || !wv || !wq->gpu_buf || !wk->gpu_buf || !wv->gpu_buf ||
+        !L->q_norm || !L->k_norm ||
+        !active_backend(&be, &ctx) || !be->attention)
+        return -1;
+
+    qw36_gpu_buf *qnb = gpu_cached_upload(eng, L->q_norm,
+        (size_t)c->head_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *knb = gpu_cached_upload(eng, L->k_norm,
+        (size_t)c->head_dim * sizeof(float), QW36_DTYPE_F32);
+    if (!qnb || !knb) return -1;
+
+    be->attention(ctx, y, x, wq->gpu_buf, wk->gpu_buf, wv->gpu_buf,
+                  qnb, knb, k_cache, v_cache,
+                  c->hidden_size, c->num_attention_heads,
+                  c->num_key_value_heads, c->head_dim,
+                  seq_pos, seq_capacity,
+                  c->rope_theta, c->partial_rotary_factor);
     return 0;
 }
 
@@ -1553,6 +1745,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
 void qw36_engine_close(qw36_engine *eng)
 {
     if (!eng) return;
+    gpu_cache_free(eng);
     if (eng->backend && eng->backend->destroy && eng->ctx)
         eng->backend->destroy(eng->ctx);
     if (eng->owned) {
@@ -1649,6 +1842,39 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
     if (!st->x || !st->x_rms || !st->q || !st->k || !st->v ||
         !st->attn_scores || !st->gate || !st->up || !st->logits) goto fail;
 
+    if (eng->backend && eng->ctx && eng->backend->alloc && eng->backend->free) {
+        qw36_gpu_backend *be = eng->backend;
+        qw36_gpu_ctx *ctx = eng->ctx;
+        st->gpu_backend = (void *)be;
+        st->gpu_ctx = (void *)ctx;
+        st->k_cache_dev = (void **)calloc(L, sizeof(void *));
+        st->v_cache_dev = (void **)calloc(L, sizeof(void *));
+        if (!st->k_cache_dev || !st->v_cache_dev) goto fail;
+
+        const size_t cache_bytes =
+            (size_t)seq_capacity * kv_dim * sizeof(float);
+        for (size_t l = 0; l < L; l++) {
+            st->k_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
+            st->v_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
+            if (!st->k_cache_dev[l] || !st->v_cache_dev[l]) goto fail;
+        }
+
+        st->x_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
+        st->x_rms_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
+        st->q_dev = be->alloc(ctx, q_dim * sizeof(float), QW36_DTYPE_F32);
+        st->k_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
+        st->v_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
+        st->attn_scores_dev = be->alloc(ctx,
+            (attn_scratch_n + rs_n) * sizeof(float), QW36_DTYPE_F32);
+        st->gate_dev = be->alloc(ctx, inter * sizeof(float), QW36_DTYPE_F32);
+        st->up_dev = be->alloc(ctx, inter * sizeof(float), QW36_DTYPE_F32);
+        st->logits_dev = be->alloc(ctx, vocab * sizeof(float), QW36_DTYPE_F32);
+        if (!st->x_dev || !st->x_rms_dev || !st->q_dev ||
+            !st->k_dev || !st->v_dev || !st->attn_scores_dev ||
+            !st->gate_dev || !st->up_dev || !st->logits_dev)
+            goto fail;
+    }
+
     return st;
 
 fail:
@@ -1659,6 +1885,30 @@ fail:
 void qw36_state_free(qw36_state *st)
 {
     if (!st) return;
+    qw36_gpu_backend *be = NULL;
+    qw36_gpu_ctx *ctx = NULL;
+    (void)state_backend(st, &be, &ctx);
+    if (be && ctx && be->free) {
+        if (st->k_cache_dev) {
+            for (uint32_t l = 0; l < st->num_layers; l++)
+                be->free(ctx, (qw36_gpu_buf *)st->k_cache_dev[l]);
+        }
+        if (st->v_cache_dev) {
+            for (uint32_t l = 0; l < st->num_layers; l++)
+                be->free(ctx, (qw36_gpu_buf *)st->v_cache_dev[l]);
+        }
+        be->free(ctx, (qw36_gpu_buf *)st->x_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->x_rms_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->q_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->k_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->v_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->attn_scores_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->gate_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->up_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->logits_dev);
+    }
+    free(st->k_cache_dev);
+    free(st->v_cache_dev);
     if (st->k_cache) {
         for (uint32_t l = 0; l < st->num_layers; l++) free(st->k_cache[l]);
         free(st->k_cache);
@@ -1696,11 +1946,19 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
      * GPU backend without explicit parameter threading. Restored on exit. */
     qw36_engine *prev_active = qw36_active_engine;
     qw36_active_engine = eng;
-    if (eng->backend && eng->backend->begin_batch && eng->ctx)
+    int forward_batch_active = 0;
+    if (eng->backend && eng->backend->begin_batch && eng->ctx) {
         eng->backend->begin_batch(eng->ctx);
-#define QW36_FORWARD_RETURN(code_) do { \
-        if (eng->backend && eng->backend->end_batch && eng->ctx) \
+        forward_batch_active = 1;
+    }
+#define QW36_FORWARD_END_BATCH() do { \
+        if (forward_batch_active && eng->backend && eng->backend->end_batch && eng->ctx) { \
             eng->backend->end_batch(eng->ctx); \
+            forward_batch_active = 0; \
+        } \
+    } while (0)
+#define QW36_FORWARD_RETURN(code_) do { \
+        QW36_FORWARD_END_BATCH(); \
         qw36_active_engine = prev_active; \
         return (code_); \
     } while (0)
@@ -1714,9 +1972,45 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
       + (size_t)c->num_attention_heads * c->head_dim;
     float *row_scratch = st->attn_scores + attn_scratch_n;
 
+    qw36_gpu_backend *state_be = NULL;
+    qw36_gpu_ctx *state_ctx = NULL;
+    int gpu_state = state_backend(st, &state_be, &state_ctx) &&
+                    state_be == eng->backend && state_ctx == eng->ctx &&
+                    st->x_dev && st->x_rms_dev && st->q_dev && st->logits_dev;
+    int x_dev_valid = 0;
+    int x_host_valid = 0;
+#define X_DEV      ((qw36_gpu_buf *)st->x_dev)
+#define X_RMS_DEV  ((qw36_gpu_buf *)st->x_rms_dev)
+#define Q_DEV      ((qw36_gpu_buf *)st->q_dev)
+#define LOGITS_DEV ((qw36_gpu_buf *)st->logits_dev)
+#define K_CACHE_DEV(layer_) ((qw36_gpu_buf *)st->k_cache_dev[(layer_)])
+#define V_CACHE_DEV(layer_) ((qw36_gpu_buf *)st->v_cache_dev[(layer_)])
+#define ENSURE_X_HOST() do { \
+        if (!x_host_valid && x_dev_valid) { \
+            if (state_download_to_host(st, st->x_dev, st->x, hidden * sizeof(float))) \
+                QW36_FORWARD_RETURN(-8); \
+            x_host_valid = 1; \
+        } \
+    } while (0)
+#define ENSURE_X_DEV() do { \
+        if (!x_dev_valid && x_host_valid && gpu_state) { \
+            if (state_copy_from_host(st, st->x_dev, st->x, hidden * sizeof(float))) \
+                QW36_FORWARD_RETURN(-8); \
+            x_dev_valid = 1; \
+        } \
+    } while (0)
+
     /* Embed: dequant row `token` from embed_tokens. */
-    if (embed_lookup_lazy((const qw36_lazy_w *)w->embed_tokens, token, st->x))
-        QW36_FORWARD_RETURN(-3);
+    if (gpu_state &&
+        embed_lookup_lazy_dev(X_DEV, (const qw36_lazy_w *)w->embed_tokens,
+                              token) == 0) {
+        x_dev_valid = 1;
+    } else {
+        if (embed_lookup_lazy((const qw36_lazy_w *)w->embed_tokens, token, st->x))
+            QW36_FORWARD_RETURN(-3);
+        x_host_valid = 1;
+        if (gpu_state) ENSURE_X_DEV();
+    }
 
     /* Optional debug: per-layer norm trace, enabled by env var. */
     static int debug_layer = -1;
@@ -1725,6 +2019,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         debug_layer = e && atoi(e) ? 1 : 0;
     }
     if (debug_layer) {
+        ENSURE_X_HOST();
         double ss = 0.0;
         for (size_t i = 0; i < hidden; i++) ss += (double)st->x[i] * st->x[i];
         fprintf(stderr, "[layer 0 in]  ||x||=%.4f x[0..3]=%.3f %.3f %.3f\n",
@@ -1737,6 +2032,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 
         if (!L->q_proj && L->dn_qkv) {
             /* === Gated DeltaNet branch === */
+            ENSURE_X_HOST();
             const uint32_t n_v   = c->dn_num_value_heads;
             const uint32_t n_k   = c->dn_num_key_heads;
             const uint32_t kd    = c->dn_key_head_dim;
@@ -1836,6 +2132,8 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             free(blk);
 
             /* MLP block (shared with full-attention path below). */
+            x_host_valid = 1;
+            x_dev_valid = 0;
             goto mlp_block;
         }
 
@@ -1843,6 +2141,35 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             /* Layer is neither vanilla nor DeltaNet — unknown variant. */
             QW36_FORWARD_RETURN(-2);
         }
+
+        if (gpu_state && eng->backend && eng->backend->rmsnorm &&
+            eng->backend->matmul && eng->backend->attention &&
+            eng->backend->residual_add &&
+            L->q_proj && L->k_proj && L->v_proj && L->o_proj &&
+            L->q_norm && L->k_norm &&
+            st->k_cache_dev && st->v_cache_dev &&
+            st->k_cache_dev[l] && st->v_cache_dev[l])
+        {
+            ENSURE_X_DEV();
+            int grc = 0;
+            grc |= rmsnorm_dispatch_dev(X_RMS_DEV, X_DEV,
+                                        (const float *)L->input_layernorm,
+                                        hidden, c->rms_norm_eps);
+            grc |= attention_dispatch_dev(Q_DEV, X_RMS_DEV, L,
+                                          K_CACHE_DEV(l), V_CACHE_DEV(l),
+                                          c, st->seq_pos, st->seq_capacity);
+            grc |= matmul_lazy_dev(X_RMS_DEV, Q_DEV,
+                                   (const qw36_lazy_w *)L->o_proj);
+            grc |= residual_add_dispatch_dev(X_DEV, X_RMS_DEV, hidden);
+            if (grc == 0) {
+                x_dev_valid = 1;
+                x_host_valid = 0;
+                goto mlp_block;
+            }
+            QW36_FORWARD_RETURN(-7);
+        }
+
+        ENSURE_X_HOST();
 
         /* --- vanilla full-attention block --- */
         rmsnorm_dispatch(st->x_rms, x, (const float *)L->input_layernorm,
@@ -1947,18 +2274,48 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         matmul_lazy(st->x_rms, staging,
                     (const qw36_lazy_w *)L->o_proj, row_scratch);
         residual_add_dispatch(x, st->x_rms, hidden);
+        x_host_valid = 1;
+        x_dev_valid = 0;
 
-mlp_block:
+    mlp_block: ;
         if (debug_layer) {
+            ENSURE_X_HOST();
             double ss = 0.0;
             for (size_t i = 0; i < hidden; i++) ss += (double)x[i] * x[i];
             fprintf(stderr, "[L%u post-attn] ||x||=%.4f\n", l, sqrt(ss));
         }
         /* --- mlp block (shared by vanilla and DeltaNet branches) --- */
-        rmsnorm_dispatch(st->x_rms, x, (const float *)L->post_attn_layernorm,
-                         hidden, c->rms_norm_eps);
+        int mlp_gpu_done = 0;
+        if (gpu_state && !L->moe_router &&
+            L->gate_proj && L->up_proj && L->down_proj &&
+            eng->backend && eng->backend->rmsnorm &&
+            eng->backend->swiglu_mlp && eng->backend->residual_add) {
+            ENSURE_X_DEV();
+            int grc = 0;
+            grc |= rmsnorm_dispatch_dev(X_RMS_DEV, X_DEV,
+                                        (const float *)L->post_attn_layernorm,
+                                        hidden, c->rms_norm_eps);
+            grc |= swiglu_dispatch_dev(X_RMS_DEV, X_RMS_DEV,
+                                       (const qw36_lazy_w *)L->gate_proj,
+                                       (const qw36_lazy_w *)L->up_proj,
+                                       (const qw36_lazy_w *)L->down_proj,
+                                       (uint32_t)hidden, (uint32_t)inter);
+            grc |= residual_add_dispatch_dev(X_DEV, X_RMS_DEV, hidden);
+            if (grc == 0) {
+                x_dev_valid = 1;
+                x_host_valid = 0;
+                mlp_gpu_done = 1;
+            } else {
+                QW36_FORWARD_RETURN(-9);
+            }
+        }
 
-        if (L->moe_router) {
+        if (!mlp_gpu_done) {
+            ENSURE_X_HOST();
+            rmsnorm_dispatch(st->x_rms, x, (const float *)L->post_attn_layernorm,
+                             hidden, c->rms_norm_eps);
+
+            if (L->moe_router) {
             /* MoE path. Expert intermediate may be smaller than dense
              * intermediate; we use moe_intermediate_size from config. */
             const uint32_t mi = c->moe_intermediate_size
@@ -1999,14 +2356,37 @@ mlp_block:
                 residual_add_dispatch(x, st->x_rms, hidden);
             }
         }
+            x_host_valid = 1;
+            x_dev_valid = 0;
+        }
         if (debug_layer) {
+            ENSURE_X_HOST();
             double ss = 0.0;
             for (size_t i = 0; i < hidden; i++) ss += (double)x[i] * x[i];
             fprintf(stderr, "[L%u out]  ||x||=%.4f\n", l, sqrt(ss));
         }
     }
 
-    /* Final norm + lm_head (lazy). */
+    /* Final norm + lm_head. For GPU-resident state, this is the only planned
+     * device->host transfer in the decode step: logits for sampling. */
+    if (gpu_state && eng->backend && eng->backend->rmsnorm && eng->backend->matmul) {
+        ENSURE_X_DEV();
+        int grc = 0;
+        grc |= rmsnorm_dispatch_dev(X_RMS_DEV, X_DEV, (const float *)w->final_norm,
+                                    hidden, c->rms_norm_eps);
+        grc |= matmul_lazy_dev(LOGITS_DEV, X_RMS_DEV,
+                               (const qw36_lazy_w *)w->lm_head);
+        if (grc == 0) {
+            QW36_FORWARD_END_BATCH();
+            if (state_download_to_host(st, st->logits_dev, st->logits,
+                                       (size_t)c->vocab_size * sizeof(float)))
+                QW36_FORWARD_RETURN(-8);
+            st->seq_pos++;
+            QW36_FORWARD_RETURN(0);
+        }
+    }
+
+    ENSURE_X_HOST();
     rmsnorm_dispatch(st->x_rms, st->x, (const float *)w->final_norm,
                      hidden, c->rms_norm_eps);
     matmul_lazy(st->logits, st->x_rms,
@@ -2014,6 +2394,15 @@ mlp_block:
 
     st->seq_pos++;
     QW36_FORWARD_RETURN(0);
+#undef ENSURE_X_DEV
+#undef ENSURE_X_HOST
+#undef V_CACHE_DEV
+#undef K_CACHE_DEV
+#undef LOGITS_DEV
+#undef Q_DEV
+#undef X_RMS_DEV
+#undef X_DEV
+#undef QW36_FORWARD_END_BATCH
 #undef QW36_FORWARD_RETURN
 }
 

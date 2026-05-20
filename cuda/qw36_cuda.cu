@@ -432,6 +432,16 @@ static void cuda_download(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
     cudaStreamSynchronize(ctx->stream);
 }
 
+static void cuda_copy_from_host(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
+                                const void *host, size_t bytes)
+{
+    if (!ctx || !buf || !host) return;
+    if (bytes > buf->bytes) bytes = buf->bytes;
+    if (!bytes) return;
+    cudaMemcpyAsync(buf->dptr, host, bytes, cudaMemcpyHostToDevice, ctx->stream);
+    cudaStreamSynchronize(ctx->stream);
+}
+
 static qw36_gpu_buf *cuda_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dtype)
 {
     if (!ctx) return nullptr;
@@ -858,6 +868,7 @@ static qw36_gpu_backend g_cuda_backend = {
     /* end_batch         */ nullptr,
     /* upload            */ cuda_upload,
     /* download          */ cuda_download,
+    /* copy_from_host    */ cuda_copy_from_host,
     /* alloc             */ cuda_alloc,
     /* free              */ cuda_free,
     /* rmsnorm           */ cuda_rmsnorm,

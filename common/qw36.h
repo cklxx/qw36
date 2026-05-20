@@ -188,6 +188,22 @@ typedef struct {
     float *gate;            /* [intermediate] */
     float *up;
     float *logits;          /* [vocab] */
+
+    /* Persistent backend buffers. These are opaque qw36_gpu_buf* values kept
+     * as void* here so the public C header does not depend on qw36_gpu.h. */
+    void *gpu_backend;
+    void *gpu_ctx;
+    void **k_cache_dev;
+    void **v_cache_dev;
+    void *x_dev;
+    void *x_rms_dev;
+    void *q_dev;
+    void *k_dev;
+    void *v_dev;
+    void *attn_scores_dev;
+    void *gate_dev;
+    void *up_dev;
+    void *logits_dev;
 } qw36_state;
 
 /* --------------------------------------------------------------------- */

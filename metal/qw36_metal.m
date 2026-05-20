@@ -596,6 +596,15 @@ static void metal_download(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
     memcpy(host, [buf->mtl contents], bytes);
 }
 
+static void metal_copy_from_host(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
+                                 const void *host, size_t bytes)
+{
+    if (!buf || !host) return;
+    metal_flush_batch(ctx);
+    if (bytes > buf->bytes) bytes = buf->bytes;
+    memcpy([buf->mtl contents], host, bytes);
+}
+
 static qw36_gpu_buf *metal_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dtype)
 {
     if (!ctx) return NULL;
@@ -917,6 +926,7 @@ static qw36_gpu_backend g_metal_backend = {
     .end_batch         = metal_end_batch,
     .upload            = metal_upload,
     .download          = metal_download,
+    .copy_from_host    = metal_copy_from_host,
     .alloc             = metal_alloc,
     .free              = metal_free,
     .rmsnorm           = metal_rmsnorm,
