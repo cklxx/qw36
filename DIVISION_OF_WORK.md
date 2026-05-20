@@ -92,6 +92,7 @@ other agent picks up from there.
 | 2026-05-20 | Codex  | metal     | -        | Opt-in `QW36_METAL_FP16_WEIGHTS=1`: large lazy weights materialize as fp16 and run MPS half GEMV with f32↔f16 staging; q/k norm+RoPE+KV append and score/softmax/combine use fused decode kernels. Qwen3.5-0.8B `Hello -n 50`: 79.6 tok/s decode. |
 | 2026-05-20 | Codex  | metal     | -        | task #23 first pass: Metal MoE route/top-k, expert gate/up, down+combine kernels wired through `backend->moe_forward`; CPU fallback remains. Built on Apple Silicon; no local MoE GGUF found for numeric validation. |
 | 2026-05-20 | Codex  | metal     | -        | task #30: full decode-attention fp16 fast path folds q/k RMSNorm + RoPE + KV append + score/softmax/combine into one MSL dispatch per vanilla layer, using `simd_sum` two-stage head reductions. Qwen3.5-0.8B `Hello`: 82.1 tok/s (`n=50`), 81.8 tok/s (`n=128`). `tests/precision_cpu_vs_metal.sh` passes on the fp32 path. |
+| 2026-05-20 | Codex  | metal     | -        | 200 tok/s follow-up: Metal fp16 KV cache now allocates device KV buffers as F16 when `QW36_METAL_FP16_WEIGHTS=1` (override with `QW36_METAL_FP16_KV=0`) and uses a dedicated `qw36_attn_decode_fused_f16kv_f32` kernel. `qw36_prefill` skips final norm/lm_head/logit download for all non-final prompt tokens. BF16 MPS GEMV was tested and rejected: MPS aborts with "Only 32b and 16b floating point data and 8-bit integer types are supported." Naive fused MLP down-proj was tested and rejected: 44.9 tok/s vs ~82 tok/s. |
 
 ## Reference: agent-infer Metal kernel for Gated Delta Rule
 
@@ -140,26 +141,30 @@ Tracking on Qwen3.5-0.8B-Q4_K_M, M-class GPU:
 | fp16 weights (opt-in)       | e286627  | **81** | `QW36_METAL_FP16_WEIGHTS=1`, MPS half GEMV |
 | Metal MoE first pass        | efc7f6c  | 81   | task #23 — no MoE in 0.8B so no-op here |
 | full fused decode attention | -        | **82** | task #30 — prep+score+softmax+combine in one fp16 fast-path MSL dispatch |
+| fp16 KV + prefill skip      | -        | **82** | dedicated f16-KV attention path; prefill avoids unused logits on non-final prompt tokens |
 
 Sustained (longer ctx) at fp16:
-- n=50:  82.1 tok/s
-- n=128: 81.8 tok/s
+- n=50:  83.1 tok/s best observed under load
+- n=128: 81.3 tok/s with or without fp16 KV at short context
 
-Decode rate now holds around 82 tok/s through `n=128`. Closing the
-remaining gap to ≥85 sustained likely needs:
+Decode rate now holds around 80-82 tok/s through `n=128` on this busy
+workstation. Closing the upgraded 200 tok/s target likely needs:
 
-1. **Further fused decode attention**: the fp16 fast path is one MSL
-   dispatch per vanilla layer, but still stores per-position scores in
-   threadgroup memory and normalizes in a serial lane-0 softmax. A true
-   streaming softmax across lanes may recover the last few tok/s if it
-   avoids extra barriers.
-2. **fp16 KV cache**: halves the bytes scanned in attention. The
-   conversion only happens once at kv_append; reads stay cheap.
-3. **lm_head over fp16 weights**: already covered by
-   `QW36_METAL_FP16_WEIGHTS=1` but `output_norm` weight upload is still
-   in scope to verify.
+1. **GPU-side quantized matmul**: current fp16 path still materializes
+   all lazy weights to half and drives many MPS GEMVs. Agent-infer-level
+   speed likely needs dequant+matvec fusion for Q4_K/Q5_K/Q6_K rows.
+2. **Real fused MLP**: a naive one-thread-per-output MSL down projection
+   is much slower than MPS. A useful fusion needs tiled/simdgroup matvec
+   or an MPSGraph/MLX-style fused graph.
+3. **Long-context validation**: fp16 KV is wired, but at the current
+   9-token prompt + 128 decode benchmark the KV scan is too small to
+   move the needle. Re-test at 1K-4K context before optimizing further.
+4. **Command buffer streaming**: decode still needs one CPU-visible
+   logits download per generated token. Prefill now skips unused logits;
+   deeper streaming needs an API that separates "advance state" from
+   "produce logits".
 
-`task #30` tracks 1–3.
+`task #30+` tracks the 200 tok/s performance ladder.
 
 ## Known blocker for Qwen 3.6 end-to-end
 

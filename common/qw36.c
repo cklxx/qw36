@@ -482,6 +482,7 @@ static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
  * without threading the engine pointer through every helper signature.
  * Single-threaded today; promote to __thread when batched/multi-stream. */
 static qw36_engine *qw36_active_engine = NULL;
+static int qw36_skip_logits_this_forward = 0;
 
 static int active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out)
 {
@@ -2056,10 +2057,12 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             if (!st->conv_state_dev || !st->delta_state_dev) goto fail;
         }
 
-        const char *fp16_kv_env = getenv("QW36_METAL_FP16_WEIGHTS");
+        const char *fp16_weights_env = getenv("QW36_METAL_FP16_WEIGHTS");
+        const char *fp16_kv_env = getenv("QW36_METAL_FP16_KV");
         const int use_fp16_dev_kv =
             be->name && strcmp(be->name, "metal") == 0 &&
-            fp16_kv_env && atoi(fp16_kv_env) != 0;
+            fp16_weights_env && atoi(fp16_weights_env) != 0 &&
+            (!fp16_kv_env || atoi(fp16_kv_env) != 0);
         const qw36_dtype dev_kv_dtype =
             use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
         const size_t dev_kv_elem_bytes =
@@ -2198,6 +2201,8 @@ void qw36_state_free(qw36_state *st)
 
 int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 {
+    const int skip_logits = qw36_skip_logits_this_forward;
+    qw36_skip_logits_this_forward = 0;
     if (!eng || !st) return -1;
     const qw36_config  *c = &eng->cfg;
     const qw36_weights *w = &eng->weights;
@@ -2677,6 +2682,11 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         }
     }
 
+    if (skip_logits) {
+        st->seq_pos++;
+        QW36_FORWARD_RETURN(0);
+    }
+
     /* Final norm + lm_head. For GPU-resident state, this is the only planned
      * device->host transfer in the decode step: logits for sampling. */
     if (gpu_state && eng->backend && eng->backend->rmsnorm && eng->backend->matmul) {
@@ -2720,7 +2730,9 @@ int qw36_prefill(qw36_engine *eng, qw36_state *st,
                  const uint32_t *tokens, size_t length)
 {
     for (size_t i = 0; i < length; i++) {
+        qw36_skip_logits_this_forward = (i + 1 < length);
         int rc = qw36_forward(eng, st, tokens[i]);
+        qw36_skip_logits_this_forward = 0;
         if (rc) return rc;
     }
     return 0;
