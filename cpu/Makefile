@@ -13,6 +13,11 @@ LDLIBS   := -lm
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
+    $(COMMON)/qw36_ops.c \
+    $(COMMON)/qw36_attn_vanilla.c \
+    $(COMMON)/qw36_attn_deltanet.c \
+    $(COMMON)/qw36_mlp.c \
+    $(COMMON)/qw36_moe.c \
     $(COMMON)/qw36_gguf.c \
     $(COMMON)/qw36_tokenizer.c \
     $(COMMON)/qw36_cli.c
@@ -25,7 +30,7 @@ OUT := $(ROOT)/qw36_cpu
 
 all: $(OUT)
 
-$(OUT): $(COMMON_SRC) $(BACKEND_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
+$(OUT): $(COMMON_SRC) $(BACKEND_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h $(COMMON)/qw36_internal.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(COMMON_SRC) $(BACKEND_SRC) -o $@ $(LDLIBS)
 
 clean:

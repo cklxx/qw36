@@ -10,6 +10,11 @@ LDLIBS    ?= -lrocblas
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
+    $(COMMON)/qw36_ops.c \
+    $(COMMON)/qw36_attn_vanilla.c \
+    $(COMMON)/qw36_attn_deltanet.c \
+    $(COMMON)/qw36_mlp.c \
+    $(COMMON)/qw36_moe.c \
     $(COMMON)/qw36_gguf.c \
     $(COMMON)/qw36_tokenizer.c \
     $(COMMON)/qw36_cli.c
@@ -22,7 +27,7 @@ OUT := $(ROOT)/qw36_amd
 
 all: $(OUT)
 
-$(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
+$(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h $(COMMON)/qw36_internal.h
 	$(HIPCC) $(CXXFLAGS) $(INCLUDES) -x hip $(BACKEND_SRC) \
 	    -x c $(COMMON_SRC) \
 	    $(LDLIBS) -o $@

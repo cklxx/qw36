@@ -11,6 +11,11 @@ FRAMEWORKS := -framework Foundation -framework Metal -framework MetalKit \
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
+    $(COMMON)/qw36_ops.c \
+    $(COMMON)/qw36_attn_vanilla.c \
+    $(COMMON)/qw36_attn_deltanet.c \
+    $(COMMON)/qw36_mlp.c \
+    $(COMMON)/qw36_moe.c \
     $(COMMON)/qw36_gguf.c \
     $(COMMON)/qw36_tokenizer.c \
     $(COMMON)/qw36_cli.c
@@ -29,7 +34,7 @@ $(METALLIB): $(METAL_SRC)
 	xcrun -sdk macosx metal    -c $(METAL_SRC) -o $(METAL_SRC:.metal=.air)
 	xcrun -sdk macosx metallib $(METAL_SRC:.metal=.air) -o $@
 
-$(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
+$(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h $(COMMON)/qw36_internal.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(BACKEND_SRC) $(COMMON_SRC) \
 	    $(FRAMEWORKS) -o $@
 
