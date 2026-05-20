@@ -19,6 +19,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+    uint64_t calls;
+    double total_gpu_us;
+    double total_cpu_us;
+    double max_gpu_us;
+    double max_cpu_us;
+} metal_perf_stat;
+
 struct qw36_gpu_ctx {
     id<MTLDevice>       device;
     id<MTLCommandQueue> queue;
@@ -75,6 +83,7 @@ struct qw36_gpu_ctx {
      * decode workload. */
     NSMutableDictionary<NSString *, MPSMatrixVectorMultiplication *> *mps_cache;
     NSMutableDictionary<NSString *, MPSMatrix *> *mps_matrix_cache;
+    NSMutableDictionary<NSValue *, NSString *> *pipeline_labels;
     NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *buf_pool;
 
     /* When non-nil, every metal op encodes into this command buffer
@@ -85,6 +94,8 @@ struct qw36_gpu_ctx {
     id<MTLCommandBuffer> batch_cb;
     id<MTLComputeCommandEncoder> batch_compute_encoder;
     BOOL batch_active;
+    BOOL perf_enabled;
+    NSMutableDictionary<NSString *, NSValue *> *perf_stats;
 
     qw36_gpu_buf *matmul_x_f16_scratch;
     qw36_gpu_buf *matmul_y_f16_scratch;
@@ -115,6 +126,16 @@ struct qw36_gpu_buf {
 };
 
 static void metal_flush_compute_encoder(qw36_gpu_ctx *ctx);
+static double metal_perf_now_us(void);
+static void metal_perf_record(qw36_gpu_ctx *ctx, NSString *label,
+                              double cpu_us, double gpu_us);
+static void metal_perf_print(qw36_gpu_ctx *ctx);
+static void metal_perf_free(qw36_gpu_ctx *ctx);
+static void metal_commit_wait_profile(qw36_gpu_ctx *ctx, id<MTLCommandBuffer> cb,
+                                      int owns_cb, NSString *label,
+                                      double start_us);
+static NSString *metal_pipeline_label(qw36_gpu_ctx *ctx,
+                                      id<MTLComputePipelineState> pipe);
 
 static void metal_release_buf(qw36_gpu_buf *buf)
 {
@@ -122,6 +143,116 @@ static void metal_release_buf(qw36_gpu_buf *buf)
     buf->mtl = nil;
     free(buf->host_copy);
     free(buf);
+}
+
+static double metal_perf_now_us(void)
+{
+    return CFAbsoluteTimeGetCurrent() * 1000000.0;
+}
+
+static void metal_perf_record(qw36_gpu_ctx *ctx, NSString *label,
+                              double cpu_us, double gpu_us)
+{
+    if (!ctx || !ctx->perf_enabled || !label) return;
+    if (!ctx->perf_stats)
+        ctx->perf_stats = [[NSMutableDictionary alloc] init];
+    NSValue *val = ctx->perf_stats[label];
+    metal_perf_stat *st = val ? (metal_perf_stat *)[val pointerValue] : NULL;
+    if (!st) {
+        st = (metal_perf_stat *)calloc(1, sizeof(*st));
+        if (!st) return;
+        ctx->perf_stats[label] = [NSValue valueWithPointer:st];
+    }
+    st->calls++;
+    st->total_cpu_us += cpu_us;
+    st->total_gpu_us += gpu_us;
+    if (cpu_us > st->max_cpu_us) st->max_cpu_us = cpu_us;
+    if (gpu_us > st->max_gpu_us) st->max_gpu_us = gpu_us;
+}
+
+static void metal_perf_print(qw36_gpu_ctx *ctx)
+{
+    if (!ctx || !ctx->perf_enabled || !ctx->perf_stats.count) return;
+    NSArray<NSString *> *keys = [ctx->perf_stats allKeys];
+    keys = [keys sortedArrayUsingComparator:^NSComparisonResult(NSString *a,
+                                                                NSString *b) {
+        metal_perf_stat *sa = (metal_perf_stat *)[ctx->perf_stats[a] pointerValue];
+        metal_perf_stat *sb = (metal_perf_stat *)[ctx->perf_stats[b] pointerValue];
+        double ga = sa ? sa->total_gpu_us : 0.0;
+        double gb = sb ? sb->total_gpu_us : 0.0;
+        if (ga < gb) return NSOrderedDescending;
+        if (ga > gb) return NSOrderedAscending;
+        return [a compare:b];
+    }];
+
+    double total_gpu = 0.0, total_cpu = 0.0;
+    uint64_t total_calls = 0;
+    for (NSString *k in keys) {
+        metal_perf_stat *st = (metal_perf_stat *)[ctx->perf_stats[k] pointerValue];
+        if (!st) continue;
+        total_calls += st->calls;
+        total_gpu += st->total_gpu_us;
+        total_cpu += st->total_cpu_us;
+    }
+
+    fprintf(stderr,
+            "[metal-perf] standalone profiling mode: %llu calls, gpu %.3fms, cpu-wall %.3fms\n",
+            (unsigned long long)total_calls, total_gpu / 1000.0,
+            total_cpu / 1000.0);
+    fprintf(stderr,
+            "[metal-perf] %-38s %8s %10s %10s %10s %10s\n",
+            "pipeline", "calls", "gpu_ms", "avg_us", "max_us", "cpu_ms");
+    for (NSString *k in keys) {
+        metal_perf_stat *st = (metal_perf_stat *)[ctx->perf_stats[k] pointerValue];
+        if (!st || !st->calls) continue;
+        fprintf(stderr,
+                "[metal-perf] %-38s %8llu %10.3f %10.2f %10.2f %10.3f\n",
+                [k UTF8String],
+                (unsigned long long)st->calls,
+                st->total_gpu_us / 1000.0,
+                st->total_gpu_us / (double)st->calls,
+                st->max_gpu_us,
+                st->total_cpu_us / 1000.0);
+    }
+}
+
+static void metal_perf_free(qw36_gpu_ctx *ctx)
+{
+    if (!ctx || !ctx->perf_stats) return;
+    for (NSString *k in ctx->perf_stats) {
+        metal_perf_stat *st =
+            (metal_perf_stat *)[ctx->perf_stats[k] pointerValue];
+        free(st);
+    }
+    ctx->perf_stats = nil;
+}
+
+static NSString *metal_pipeline_label(qw36_gpu_ctx *ctx,
+                                      id<MTLComputePipelineState> pipe)
+{
+    if (!ctx || !pipe) return @"compute";
+    NSString *label = ctx->pipeline_labels[[NSValue valueWithNonretainedObject:pipe]];
+    return label ? label : @"compute";
+}
+
+static void metal_commit_wait_profile(qw36_gpu_ctx *ctx, id<MTLCommandBuffer> cb,
+                                      int owns_cb, NSString *label,
+                                      double start_us)
+{
+    if (!owns_cb) return;
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (ctx && ctx->perf_enabled && label) {
+        double cpu_us = metal_perf_now_us() - start_us;
+        double gpu_us = 0.0;
+        if ([cb respondsToSelector:@selector(GPUStartTime)] &&
+            [cb respondsToSelector:@selector(GPUEndTime)]) {
+            CFTimeInterval gs = [cb GPUStartTime];
+            CFTimeInterval ge = [cb GPUEndTime];
+            if (ge > gs) gpu_us = (ge - gs) * 1000000.0;
+        }
+        metal_perf_record(ctx, label, cpu_us, gpu_us);
+    }
 }
 
 /* --------------------------------------------------------------------- */
@@ -485,6 +616,8 @@ static id<MTLComputePipelineState> metal_make_pipeline(qw36_gpu_ctx *ctx,
     NSError *ns_err = nil;
     id<MTLComputePipelineState> pipe =
         [ctx->device newComputePipelineStateWithFunction:fn error:&ns_err];
+    if (pipe && ctx->pipeline_labels)
+        ctx->pipeline_labels[[NSValue valueWithNonretainedObject:pipe]] = name;
     if (!pipe && err && err_cap) {
         snprintf(err, err_cap, "metal: pipeline %s: %s",
                  [name UTF8String],
@@ -514,6 +647,10 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     }
     ctx->mps_cache = [[NSMutableDictionary alloc] init];
     ctx->mps_matrix_cache = [[NSMutableDictionary alloc] init];
+    ctx->pipeline_labels = [[NSMutableDictionary alloc] init];
+    ctx->perf_enabled = getenv("QW36_METAL_PERF") != NULL;
+    if (ctx->perf_enabled)
+        ctx->perf_stats = [[NSMutableDictionary alloc] init];
 
     ctx->library = metal_load_library(ctx->device, err, err_cap);
     if (!ctx->library) {
@@ -617,6 +754,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
         ctx->batch_cb = nil;
     }
     ctx->batch_compute_encoder = nil;
+    metal_perf_print(ctx);
     metal_release_buf(ctx->dn_y_grouped_scratch);
     metal_release_buf(ctx->dn_beta_scratch);
     metal_release_buf(ctx->dn_g_scratch);
@@ -638,7 +776,9 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     metal_release_buf(ctx->moe_router_scratch);
     ctx->mps_cache = nil;
     ctx->mps_matrix_cache = nil;
+    ctx->pipeline_labels = nil;
     ctx->buf_pool  = nil;
+    metal_perf_free(ctx);
     ctx->attn_combine = nil;
     ctx->attn_prep_decode = nil;
     ctx->attn_score_combine_tg = nil;
@@ -675,6 +815,8 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
 static void metal_begin_batch(qw36_gpu_ctx *ctx)
 {
     if (!ctx) return;
+    if (ctx->perf_enabled) return;        /* per-op GPU profiling needs
+                                          * standalone command buffers. */
     if (ctx->batch_active) return;       /* already in a batch */
     ctx->batch_active = YES;
     ctx->batch_cb = [ctx->queue commandBuffer];
@@ -916,6 +1058,7 @@ static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
                               void (^bind)(id<MTLComputeCommandEncoder> enc))
 {
     if (!ctx || !pipe || n == 0) return;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
     id<MTLComputeCommandEncoder> enc =
@@ -928,7 +1071,9 @@ static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     metal_finish_compute_encoder(ctx, enc, owns_cb);
-    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              metal_pipeline_label(ctx, pipe),
+                              start_us);
 }
 
 static void metal_invalidate_matmul_xh(qw36_gpu_ctx *ctx);
@@ -1009,6 +1154,12 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                 if (tg_bytes < 256 * sizeof(float))
                     tg_bytes = 256 * sizeof(float);
             }
+            double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+            NSString *perf_label = ctx->perf_enabled
+                ? [NSString stringWithFormat:@"%@_%ux%u",
+                   metal_pipeline_label(ctx, qpipe),
+                   (unsigned)rows, (unsigned)cols]
+                : nil;
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
             id<MTLComputeCommandEncoder> enc =
@@ -1023,7 +1174,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             metal_finish_compute_encoder(ctx, enc, owns_cb);
-            if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+            metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
             return;
         }
     }
@@ -1070,6 +1221,11 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         }
         if (qmv_quad_f16gemv && rows <= qmv_quad_max_rows &&
             ctx->matmul_qmv_quad_f16 && w->mtl) {
+            double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+            NSString *perf_label = ctx->perf_enabled
+                ? [NSString stringWithFormat:@"qmv_quad_f16_%ux%u",
+                   (unsigned)rows, (unsigned)cols]
+                : nil;
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
             id<MTLComputeCommandEncoder> enc =
@@ -1087,7 +1243,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc dispatchThreadgroups:MTLSizeMake(1, (rows + 63u) / 64u, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             metal_finish_compute_encoder(ctx, enc, owns_cb);
-            if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+            metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
             return;
         }
         const int x_is_f16 = (x->dtype == QW36_DTYPE_F16);
@@ -1143,11 +1299,16 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                                                    sizeof(uint16_t), "h");
         MPSVector *xv = [[MPSVector alloc] initWithBuffer:xh->mtl descriptor:x_desc];
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:yh->mtl descriptor:y_desc];
+        double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+        NSString *perf_label = ctx->perf_enabled
+            ? [NSString stringWithFormat:@"mps_f16_gemv_%ux%u",
+               (unsigned)rows, (unsigned)cols]
+            : nil;
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         metal_flush_compute_encoder(ctx);
         [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
-        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
         if (!y_is_f16) {
             metal_dispatch_1d(ctx, ctx->f16_to_f32, rows, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:y->mtl  offset:0 atIndex:0];
@@ -1183,11 +1344,16 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                                                    sizeof(float), "f");
         MPSVector *xv = [[MPSVector alloc] initWithBuffer:x->mtl descriptor:x_desc];
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:y->mtl descriptor:y_desc];
+        double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+        NSString *perf_label = ctx->perf_enabled
+            ? [NSString stringWithFormat:@"mps_f32_gemv_%ux%u",
+               (unsigned)rows, (unsigned)cols]
+            : nil;
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         metal_flush_compute_encoder(ctx);
         [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
-        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
         return;
     }
 
@@ -1302,6 +1468,10 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         const int f16_kv =
             k_cache->dtype == QW36_DTYPE_F16 &&
             v_cache->dtype == QW36_DTYPE_F16;
+        double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+        NSString *perf_label = f16_kv
+            ? @"qw36_attn_decode_fused_f16kv_f32"
+            : @"qw36_attn_decode_fused_f32";
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         id<MTLComputeCommandEncoder> enc =
@@ -1351,7 +1521,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         metal_finish_compute_encoder(ctx, enc, owns_cb);
-        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
         return;
     }
 
@@ -1383,6 +1553,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
     if (tg_size <= 256 &&
         tg_size <= ctx->attn_score_combine_tg.maxTotalThreadsPerThreadgroup &&
         positions <= 4096) {
+        double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         id<MTLComputeCommandEncoder> enc =
@@ -1405,7 +1576,9 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         metal_finish_compute_encoder(ctx, enc, owns_cb);
-        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        metal_commit_wait_profile(ctx, cb, owns_cb,
+                                  @"qw36_attn_score_combine_tg_f32",
+                                  start_us);
         return;
     }
 
@@ -1553,6 +1726,7 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     });
 
     uint32_t T = 1;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
     id<MTLComputeCommandEncoder> enc =
@@ -1574,7 +1748,8 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     metal_finish_compute_encoder(ctx, enc, owns_cb);
-    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              @"qw36_gated_delta_step_f32", start_us);
 }
 
 static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
@@ -1614,6 +1789,7 @@ static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     const uint32_t channels = n_key * key_dim * 2 + n_value * val_dim;
     const uint32_t heads = n_key > n_value ? n_key : n_value;
     const uint32_t tg_size = 256;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
     id<MTLComputeCommandEncoder> enc =
@@ -1660,7 +1836,8 @@ static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     metal_finish_compute_encoder(ctx, enc, owns_cb);
-    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              @"dn_conv1d_prep+gated_delta", start_us);
 }
 
 static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
@@ -1726,6 +1903,7 @@ static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
     }
     metal_invalidate_matmul_xh(ctx);
     const uint32_t tg_size = 256;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
     id<MTLComputeCommandEncoder> enc =
@@ -1751,7 +1929,9 @@ static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
     [enc dispatchThreadgroups:MTLSizeMake(out_rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     metal_finish_compute_encoder(ctx, enc, owns_cb);
-    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              @"qw36_dn_gated_rmsnorm_matmul_f32",
+                              start_us);
 }
 
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x,
@@ -1862,6 +2042,7 @@ static void metal_residual_rmsnorm(qw36_gpu_ctx *ctx,
 {
     if (!ctx || !x || !y || !out || !w_buf || !hidden) return;
     metal_invalidate_matmul_xh(ctx);
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
     id<MTLComputeCommandEncoder> enc =
@@ -1890,7 +2071,8 @@ static void metal_residual_rmsnorm(qw36_gpu_ctx *ctx,
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
     metal_finish_compute_encoder(ctx, enc, owns_cb);
-    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              @"qw36_residual_rmsnorm_f32", start_us);
 }
 
 static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *embed,
