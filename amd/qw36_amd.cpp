@@ -23,6 +23,7 @@ extern "C" {
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <rocblas/rocblas.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +32,7 @@ extern "C" {
 struct qw36_gpu_ctx {
     int device;
     hipStream_t stream;
+    rocblas_handle blas;
 };
 
 struct qw36_gpu_buf {
@@ -62,12 +64,28 @@ static qw36_gpu_ctx *amd_init(char *err, size_t err_cap)
         std::free(ctx);
         return nullptr;
     }
+    rocblas_status bs = rocblas_create_handle(&ctx->blas);
+    if (bs != rocblas_status_success) {
+        if (err && err_cap) std::snprintf(err, err_cap, "rocblas_create_handle: %d", (int)bs);
+        hipStreamDestroy(ctx->stream);
+        std::free(ctx);
+        return nullptr;
+    }
+    bs = rocblas_set_stream(ctx->blas, ctx->stream);
+    if (bs != rocblas_status_success) {
+        if (err && err_cap) std::snprintf(err, err_cap, "rocblas_set_stream: %d", (int)bs);
+        rocblas_destroy_handle(ctx->blas);
+        hipStreamDestroy(ctx->stream);
+        std::free(ctx);
+        return nullptr;
+    }
     return ctx;
 }
 
 static void amd_destroy(qw36_gpu_ctx *ctx)
 {
     if (!ctx) return;
+    if (ctx->blas) rocblas_destroy_handle(ctx->blas);
     if (ctx->stream) hipStreamDestroy(ctx->stream);
     std::free(ctx);
 }
@@ -354,6 +372,25 @@ static void amd_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                        qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
     if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return;
+    if (ctx->blas && y->dtype == QW36_DTYPE_F32 &&
+        x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F32) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        rocblas_status bs = rocblas_sgemm(ctx->blas,
+                                          rocblas_operation_transpose,
+                                          rocblas_operation_none,
+                                          (int)rows, (int)batch, (int)cols,
+                                          &alpha,
+                                          (const float *)w->dptr, (int)cols,
+                                          (const float *)x->dptr, (int)cols,
+                                          &beta,
+                                          (float *)y->dptr, (int)rows);
+        if (bs == rocblas_status_success) {
+            amd_sync(ctx);
+            return;
+        }
+    }
+
     size_t n = (size_t)batch * rows;
     hipLaunchKernelGGL(qw36_matmul_kernel, dim3(amd_blocks(n)), dim3(256),
                        0, ctx->stream, (float *)y->dptr, x->dptr, w->dptr,

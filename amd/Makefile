@@ -6,6 +6,7 @@ HIPCC     ?= hipcc
 CXXFLAGS  ?= -O3 -std=c++17 -Wall -Wextra
 CFLAGS    ?= -O3 -std=c11   -Wall -Wextra
 INCLUDES  := -I$(COMMON)
+LDLIBS    ?= -lrocblas
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
@@ -24,7 +25,7 @@ all: $(OUT)
 $(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
 	$(HIPCC) $(CXXFLAGS) $(INCLUDES) -x hip $(BACKEND_SRC) \
 	    -x c $(COMMON_SRC) \
-	    -o $@
+	    $(LDLIBS) -o $@
 
 clean:
 	rm -f $(OUT)

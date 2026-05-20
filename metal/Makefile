@@ -6,7 +6,8 @@ COMMON    = $(ROOT)/common
 CC       ?= clang
 CFLAGS   ?= -O3 -std=c11 -Wall -Wextra -fobjc-arc
 INCLUDES := -I$(COMMON)
-FRAMEWORKS := -framework Foundation -framework Metal -framework MetalKit
+FRAMEWORKS := -framework Foundation -framework Metal -framework MetalKit \
+    -framework MetalPerformanceShaders
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \

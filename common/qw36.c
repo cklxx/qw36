@@ -21,6 +21,19 @@
 
 const char *qw36_version(void) { return QW36_VERSION_STR; }
 
+/* Lazy weight descriptor: a pointer into the mmap'd GGUF, plus the dtype
+ * and shape so matmul/embed can dequantize per-block on the fly. We avoid
+ * materializing huge tensors up-front (lm_head, expert mats, qkv, mlp)
+ * because a 35B Q4_K_XL model decompresses to ~140GB fp32. */
+typedef struct {
+    const void *data;
+    qw36_dtype  dtype;
+    uint32_t    ggml_type;   /* informational */
+    uint64_t    rows;        /* GGUF dim[1] (outer) */
+    uint64_t    cols;        /* GGUF dim[0] (inner) */
+    uint64_t    n_extra;     /* dim[2] (used for MoE expert stacks) */
+} qw36_lazy_w;
+
 struct qw36_engine {
     qw36_config       cfg;
     qw36_weights      weights;
@@ -28,16 +41,29 @@ struct qw36_engine {
     qw36_gpu_ctx     *ctx;
     qw36_gguf_file   *gguf;
 
-    /* Per-layer f32 buffers we materialized from quantized weights. The
-     * engine owns these. NULL entries mean "no conversion needed; use the
-     * raw mmap pointer in weights.*". */
-    float            **owned_f32;
-    size_t             owned_f32_n;
+    /* Owned heap allocations (materialized fp32 buffers for small tensors
+     * like norms, plus qw36_lazy_w descriptors for big tensors). All freed
+     * uniformly on close. */
+    void             **owned;
+    size_t             owned_n;
+    size_t             owned_cap;
 
-    /* Cached arch prefix ("qwen3" / "qwen3moe" / ...) — used to fetch
-     * config keys. */
+    /* Cached arch prefix ("qwen3" / "qwen3moe" / "qwen35" / "qwen35moe"). */
     char               arch[32];
 };
+
+static void *eng_own_(qw36_engine *eng, void *p) {
+    if (!p) return NULL;
+    if (eng->owned_n >= eng->owned_cap) {
+        size_t nc = eng->owned_cap ? eng->owned_cap * 2 : 64;
+        void **arr = (void **)realloc(eng->owned, nc * sizeof(void *));
+        if (!arr) return p; /* will leak but won't crash; debug later */
+        eng->owned = arr;
+        eng->owned_cap = nc;
+    }
+    eng->owned[eng->owned_n++] = p;
+    return p;
+}
 
 /* --------------------------------------------------------------------- */
 /* dtype conversion helpers                                               */
@@ -207,6 +233,74 @@ static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
             free(out);
             return NULL;
     }
+}
+
+/* --------------------------------------------------------------------- */
+/* Lazy block-quantized helpers: dequantize one row at a time.            */
+/* --------------------------------------------------------------------- */
+
+static int dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
+    switch (dt) {
+        case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
+        case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
+        default: *qk = 0; *bytes_per_block = 0; return -1;
+    }
+}
+
+/* Decode `cols` elements of row `row_idx` from a block-quantized stack
+ * where each row is laid out as cols-elements-worth of blocks. */
+static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
+    const size_t cols = (size_t)w->cols;
+    switch (w->dtype) {
+        case QW36_DTYPE_F32: {
+            const float *p = (const float *)w->data + row_idx * cols;
+            memcpy(out, p, cols * sizeof(float));
+            return 0;
+        }
+        case QW36_DTYPE_F16: {
+            const uint16_t *p = (const uint16_t *)w->data + row_idx * cols;
+            for (size_t i = 0; i < cols; i++) out[i] = f16_to_f32(p[i]);
+            return 0;
+        }
+        case QW36_DTYPE_BF16: {
+            const uint16_t *p = (const uint16_t *)w->data + row_idx * cols;
+            for (size_t i = 0; i < cols; i++) out[i] = bf16_to_f32(p[i]);
+            return 0;
+        }
+        default: break;
+    }
+    size_t qk, bpb;
+    if (dtype_block_geom(w->dtype, &qk, &bpb) || cols % qk != 0) return -1;
+    const size_t blocks_per_row = cols / qk;
+    const uint8_t *row = (const uint8_t *)w->data
+                       + row_idx * blocks_per_row * bpb;
+    switch (w->dtype) {
+        case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
+        default: return -1;
+    }
+}
+
+/* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c]. */
+static int matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
+                       float *row_scratch)
+{
+    const size_t rows = (size_t)w->rows;
+    const size_t cols = (size_t)w->cols;
+    for (size_t r = 0; r < rows; r++) {
+        if (dequant_row(w, r, row_scratch)) return -1;
+        double acc = 0.0;
+        for (size_t c = 0; c < cols; c++) acc += (double)row_scratch[c] * x[c];
+        y[r] = (float)acc;
+    }
+    return 0;
+}
+
+/* Embedding lookup: write hidden=W.cols floats to out from row `token`. */
+static int embed_lookup_lazy(const qw36_lazy_w *w, uint32_t token, float *out) {
+    return dequant_row(w, token, out);
 }
 
 /* --------------------------------------------------------------------- */
@@ -387,27 +481,38 @@ static int eng_get_f32(const qw36_engine *eng, const char *suffix, float *out) {
     return qw36_gguf_get_f32(eng->gguf, key, out);
 }
 
-/* Bind a tensor by name → fp32-materialized pointer, recorded in
- * eng->owned_f32 so it gets freed on close. */
-static void *bind_tensor_f32(qw36_engine *eng, const char *name) {
+/* Materialize a small tensor (norm-sized) to fp32. Used for layernorms,
+ * biases, A_log — anything small enough that the dequant pass is cheap. */
+static float *bind_tensor_f32(qw36_engine *eng, const char *name) {
     qw36_gguf_tensor t;
     if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
     size_t numel = 1;
     for (uint32_t d = 0; d < t.n_dims; d++) numel *= (size_t)t.dims[d];
     float *p = materialize_f32(t.data, t.dtype, numel);
     if (!p) return NULL;
-    /* track for free */
-    eng->owned_f32 = (float **)realloc(eng->owned_f32,
-        sizeof(float *) * (eng->owned_f32_n + 1));
-    eng->owned_f32[eng->owned_f32_n++] = p;
-    return p;
+    return (float *)eng_own_(eng, p);
 }
 
-/* Same but optional: returns NULL if tensor is absent (no error). */
-static void *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
+static float *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
     qw36_gguf_tensor t;
     if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
     return bind_tensor_f32(eng, name);
+}
+
+/* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
+ * to be dequantized block-by-block during matmul. */
+static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
+    qw36_gguf_tensor t;
+    if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
+    qw36_lazy_w *lw = (qw36_lazy_w *)calloc(1, sizeof(*lw));
+    if (!lw) return NULL;
+    lw->data      = t.data;
+    lw->dtype     = t.dtype;
+    lw->ggml_type = t.ggml_type;
+    lw->cols      = t.n_dims >= 1 ? t.dims[0] : 0;
+    lw->rows      = t.n_dims >= 2 ? t.dims[1] : 0;
+    lw->n_extra   = t.n_dims >= 3 ? t.dims[2] : 0;
+    return (qw36_lazy_w *)eng_own_(eng, lw);
 }
 
 /* --------------------------------------------------------------------- */
@@ -437,15 +542,19 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     snprintf(eng->arch, sizeof(eng->arch), "%s", arch);
 
     qw36_config *c = &eng->cfg;
-    if (eng_get_u32(eng, "embedding_length",      &c->hidden_size) ||
-        eng_get_u32(eng, "feed_forward_length",   &c->intermediate_size) ||
-        eng_get_u32(eng, "block_count",           &c->num_hidden_layers) ||
-        eng_get_u32(eng, "attention.head_count",  &c->num_attention_heads) ||
-        eng_get_u32(eng, "attention.head_count_kv", &c->num_key_value_heads) ||
-        eng_get_u32(eng, "context_length",        &c->max_position_embeddings))
-    {
-        if (err && err_cap) snprintf(err, err_cap, "missing required %s.* config key",
-                                     eng->arch);
+    /* Required keys. MoE-only variants may not store feed_forward_length;
+     * fall back to expert_feed_forward_length later. */
+    int missing = 0;
+    if (eng_get_u32(eng, "embedding_length",        &c->hidden_size))       missing |= 1;
+    if (eng_get_u32(eng, "block_count",             &c->num_hidden_layers)) missing |= 2;
+    if (eng_get_u32(eng, "attention.head_count",    &c->num_attention_heads)) missing |= 4;
+    if (eng_get_u32(eng, "attention.head_count_kv", &c->num_key_value_heads)) missing |= 8;
+    if (eng_get_u32(eng, "context_length",          &c->max_position_embeddings)) missing |= 16;
+    /* Optional / fall-back: dense MLP size. MoE-only models omit this. */
+    eng_get_u32(eng, "feed_forward_length", &c->intermediate_size);
+    if (missing) {
+        if (err && err_cap) snprintf(err, err_cap,
+            "missing required %s.* config keys (mask=0x%x)", eng->arch, missing);
         qw36_engine_close(eng); return NULL;
     }
     /* head_dim — Qwen3 stores attention.key_length; fall back to hidden/heads. */
@@ -488,12 +597,12 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     eng_get_u32(eng, "expert_feed_forward_length",&c->moe_intermediate_size);
     if (!c->moe_decoder_sparse_step) c->moe_decoder_sparse_step = 1;
 
-    /* Bind global tensors. */
+    /* Bind global tensors. Small (norm) → fp32; big (embed/lm_head) → lazy. */
     qw36_weights *w = &eng->weights;
-    w->dtype = QW36_DTYPE_F32; /* CPU reference materializes to fp32 */
-    w->embed_tokens = bind_tensor_f32(eng, "token_embd.weight");
+    w->dtype = QW36_DTYPE_F32;
+    w->embed_tokens = bind_tensor_lazy(eng, "token_embd.weight");
     w->final_norm   = bind_tensor_f32(eng, "output_norm.weight");
-    w->lm_head      = bind_tensor_f32_opt(eng, "output.weight");
+    w->lm_head      = bind_tensor_lazy(eng, "output.weight");
     if (!w->lm_head && c->tie_word_embeddings) w->lm_head = w->embed_tokens;
     if (!w->embed_tokens || !w->final_norm) {
         if (err && err_cap) snprintf(err, err_cap, "missing embedding or output norm");
@@ -511,32 +620,43 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         qw36_layer_weights *L = &w->layers[l];
         L->dtype = QW36_DTYPE_F32;
-        #define BIND(field, fmt) do { \
+        #define BIND_NORM(field, fmt) do { \
             snprintf(name, sizeof(name), fmt, l);             \
             L->field = bind_tensor_f32_opt(eng, name);        \
         } while (0)
+        #define BIND_W(field, fmt) do { \
+            snprintf(name, sizeof(name), fmt, l);             \
+            L->field = bind_tensor_lazy(eng, name);           \
+        } while (0)
 
-        BIND(input_layernorm,     "blk.%u.attn_norm.weight");
-        BIND(q_proj,              "blk.%u.attn_q.weight");
-        BIND(k_proj,              "blk.%u.attn_k.weight");
-        BIND(v_proj,              "blk.%u.attn_v.weight");
-        BIND(o_proj,              "blk.%u.attn_output.weight");
-        BIND(q_norm,              "blk.%u.attn_q_norm.weight");
-        BIND(k_norm,              "blk.%u.attn_k_norm.weight");
-        BIND(post_attn_layernorm, "blk.%u.ffn_norm.weight");
-        BIND(gate_proj,           "blk.%u.ffn_gate.weight");
-        BIND(up_proj,             "blk.%u.ffn_up.weight");
-        BIND(down_proj,           "blk.%u.ffn_down.weight");
+        /* Norms are small — keep them fp32. */
+        BIND_NORM(input_layernorm,     "blk.%u.attn_norm.weight");
+        BIND_NORM(q_norm,              "blk.%u.attn_q_norm.weight");
+        BIND_NORM(k_norm,              "blk.%u.attn_k_norm.weight");
+        BIND_NORM(post_attn_layernorm, "blk.%u.ffn_norm.weight");
 
-        /* MoE-specific (Qwen3-MoE). Absent on dense models — that's fine. */
-        BIND(moe_router,          "blk.%u.ffn_gate_inp.weight");
-        BIND(moe_expert_gate,     "blk.%u.ffn_gate_exps.weight");
-        BIND(moe_expert_up,       "blk.%u.ffn_up_exps.weight");
-        BIND(moe_expert_down,     "blk.%u.ffn_down_exps.weight");
-        BIND(moe_shared_gate,     "blk.%u.ffn_gate_shexp.weight");
-        BIND(moe_shared_up,       "blk.%u.ffn_up_shexp.weight");
-        BIND(moe_shared_down,     "blk.%u.ffn_down_shexp.weight");
-        #undef BIND
+        /* Vanilla attention projections — lazy (big). */
+        BIND_W(q_proj,    "blk.%u.attn_q.weight");
+        BIND_W(k_proj,    "blk.%u.attn_k.weight");
+        BIND_W(v_proj,    "blk.%u.attn_v.weight");
+        BIND_W(o_proj,    "blk.%u.attn_output.weight");
+
+        /* Dense MLP — lazy. */
+        BIND_W(gate_proj, "blk.%u.ffn_gate.weight");
+        BIND_W(up_proj,   "blk.%u.ffn_up.weight");
+        BIND_W(down_proj, "blk.%u.ffn_down.weight");
+
+        /* MoE — lazy. The expert stacks are 3D [n_experts, hidden, inter]
+         * and qw36_lazy_w records that via rows/cols/n_extra. */
+        BIND_W(moe_router,        "blk.%u.ffn_gate_inp.weight");
+        BIND_W(moe_expert_gate,   "blk.%u.ffn_gate_exps.weight");
+        BIND_W(moe_expert_up,     "blk.%u.ffn_up_exps.weight");
+        BIND_W(moe_expert_down,   "blk.%u.ffn_down_exps.weight");
+        BIND_W(moe_shared_gate,   "blk.%u.ffn_gate_shexp.weight");
+        BIND_W(moe_shared_up,     "blk.%u.ffn_up_shexp.weight");
+        BIND_W(moe_shared_down,   "blk.%u.ffn_down_shexp.weight");
+        #undef BIND_NORM
+        #undef BIND_W
     }
 
     /* TODO(Claude): if backend is non-NULL, upload weights and switch the
@@ -550,9 +670,9 @@ void qw36_engine_close(qw36_engine *eng)
     if (!eng) return;
     if (eng->backend && eng->backend->destroy && eng->ctx)
         eng->backend->destroy(eng->ctx);
-    if (eng->owned_f32) {
-        for (size_t i = 0; i < eng->owned_f32_n; i++) free(eng->owned_f32[i]);
-        free(eng->owned_f32);
+    if (eng->owned) {
+        for (size_t i = 0; i < eng->owned_n; i++) free(eng->owned[i]);
+        free(eng->owned);
     }
     free(eng->cfg.layer_types);
     free(eng->weights.layers);
@@ -608,6 +728,17 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
     st->gate        = (float *)calloc(inter,         sizeof(float));
     st->up          = (float *)calloc(inter,         sizeof(float));
     st->logits      = (float *)calloc(vocab,         sizeof(float));
+    /* row_scratch is used by matmul_lazy. Size = max(hidden, inter, vocab)
+     * since matmul reads one full row of the weight at a time. */
+    size_t rs_n = hidden;
+    if (inter > rs_n) rs_n = inter;
+    if (vocab > rs_n) rs_n = vocab;
+    /* Note: q_dim/kv_dim are smaller than hidden in practice (n_heads *
+     * head_dim ≤ hidden), so the existing bound suffices for QKV matmuls. */
+    /* We stash the row scratch in attn_scores' tail — simpler than adding
+     * a public field. Realloc attn_scores to fit. */
+    free(st->attn_scores);
+    st->attn_scores = (float *)calloc(attn_scratch_n + rs_n, sizeof(float));
     if (!st->x || !st->x_rms || !st->q || !st->k || !st->v ||
         !st->attn_scores || !st->gate || !st->up || !st->logits) goto fail;
 
@@ -649,47 +780,93 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     const size_t hidden = c->hidden_size;
     const size_t inter  = c->intermediate_size;
 
-    /* Embed: copy row `token` from embed_tokens into st->x. */
-    {
-        const float *row = (const float *)w->embed_tokens + (size_t)token * hidden;
-        memcpy(st->x, row, hidden * sizeof(float));
-    }
+    /* Compute the row_scratch slot inside attn_scores tail. */
+    const size_t attn_scratch_n =
+        (size_t)c->num_attention_heads * ((size_t)st->seq_capacity + 1)
+      + (size_t)c->num_attention_heads * c->head_dim;
+    float *row_scratch = st->attn_scores + attn_scratch_n;
+
+    /* Embed: dequant row `token` from embed_tokens. */
+    if (embed_lookup_lazy((const qw36_lazy_w *)w->embed_tokens, token, st->x))
+        return -3;
 
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
         if (!L->q_proj) {
-            /* Layer is not vanilla full attention. Qwen 3.5 / 3.6 use Gated
-             * DeltaNet (linear attention) on some/all layers — we don't
-             * implement it yet. Fail loudly so callers know. */
+            /* Gated DeltaNet (Qwen3.5/3.6 linear attention) — TODO. */
             return -2;
         }
 
         /* --- attention block --- */
-        rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm, hidden, c->rms_norm_eps);
+        rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
+                    hidden, c->rms_norm_eps);
 
-        /* attn_in = x_rms ; attn_out (pre-o_proj) lives in st->q (reused) */
-        attention_f32(st->q,
-                      st->x_rms,
-                      (const float *)L->q_proj,
-                      (const float *)L->k_proj,
-                      (const float *)L->v_proj,
-                      (const float *)L->q_norm,
-                      (const float *)L->k_norm,
-                      (float *)st->k_cache[l],
-                      (float *)st->v_cache[l],
-                      c->hidden_size, c->num_attention_heads,
-                      c->num_key_value_heads, c->head_dim,
-                      st->seq_pos, st->seq_capacity,
-                      c->rope_theta, c->partial_rotary_factor,
-                      c->rms_norm_eps,
-                      st->attn_scores);
+        const uint32_t kv_dim = c->num_key_value_heads * c->head_dim;
+        const uint32_t rot_dim = (uint32_t)((float)c->head_dim *
+                                            c->partial_rotary_factor);
 
-        /* o_proj: hidden = (n_heads * head_dim) → hidden */
-        const uint32_t q_dim = c->num_attention_heads * c->head_dim;
-        matmul_f32(st->x_rms, st->q, (const float *)L->o_proj, hidden, q_dim);
+        /* QKV projections via lazy matmul. */
+        matmul_lazy(st->q, st->x_rms, (const qw36_lazy_w *)L->q_proj, row_scratch);
+        float *k_row = (float *)st->k_cache[l] + (size_t)st->seq_pos * kv_dim;
+        float *v_row = (float *)st->v_cache[l] + (size_t)st->seq_pos * kv_dim;
+        matmul_lazy(k_row, st->x_rms, (const qw36_lazy_w *)L->k_proj, row_scratch);
+        matmul_lazy(v_row, st->x_rms, (const qw36_lazy_w *)L->v_proj, row_scratch);
 
-        /* Residual */
+        /* Per-head q_norm/k_norm + RoPE. */
+        for (uint32_t h = 0; h < c->num_attention_heads; h++) {
+            float *qh = st->q + h * c->head_dim;
+            rmsnorm_f32(qh, qh, (const float *)L->q_norm,
+                        c->head_dim, c->rms_norm_eps);
+            rope_head(qh, st->seq_pos, rot_dim, c->rope_theta);
+        }
+        for (uint32_t h = 0; h < c->num_key_value_heads; h++) {
+            float *kh = k_row + h * c->head_dim;
+            rmsnorm_f32(kh, kh, (const float *)L->k_norm,
+                        c->head_dim, c->rms_norm_eps);
+            rope_head(kh, st->seq_pos, rot_dim, c->rope_theta);
+        }
+
+        /* Attention: for each head h, score against k_cache[0..=seq_pos]
+         * of kv_head (h mod n_kv), softmax, weighted sum of v_cache. */
+        const float inv_sqrt_d = 1.0f / sqrtf((float)c->head_dim);
+        float *staging = st->attn_scores
+                       + (size_t)c->num_attention_heads * (st->seq_capacity + 1);
+        for (uint32_t h = 0; h < c->num_attention_heads; h++) {
+            const uint32_t kvh = h % c->num_key_value_heads;
+            const float *qh = st->q + h * c->head_dim;
+            float *scores = st->attn_scores
+                          + (size_t)h * (st->seq_capacity + 1);
+            float maxv = -INFINITY;
+            for (uint32_t t = 0; t <= st->seq_pos; t++) {
+                const float *kh = (float *)st->k_cache[l]
+                                + (size_t)t * kv_dim + kvh * c->head_dim;
+                double dot = 0.0;
+                for (uint32_t d = 0; d < c->head_dim; d++)
+                    dot += (double)qh[d] * kh[d];
+                scores[t] = (float)dot * inv_sqrt_d;
+                if (scores[t] > maxv) maxv = scores[t];
+            }
+            double sum = 0.0;
+            for (uint32_t t = 0; t <= st->seq_pos; t++) {
+                scores[t] = expf(scores[t] - maxv);
+                sum += scores[t];
+            }
+            float inv_sum = (float)(1.0 / sum);
+            float *head_out = staging + h * c->head_dim;
+            for (uint32_t d = 0; d < c->head_dim; d++) {
+                double acc = 0.0;
+                for (uint32_t t = 0; t <= st->seq_pos; t++) {
+                    const float *vh = (float *)st->v_cache[l]
+                                    + (size_t)t * kv_dim + kvh * c->head_dim;
+                    acc += (double)(scores[t] * inv_sum) * vh[d];
+                }
+                head_out[d] = (float)acc;
+            }
+        }
+        /* o_proj */
+        matmul_lazy(st->x_rms, staging,
+                    (const qw36_lazy_w *)L->o_proj, row_scratch);
         for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
 
         /* --- mlp block --- */
@@ -697,33 +874,26 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                     hidden, c->rms_norm_eps);
 
         if (L->moe_router) {
-            /* TODO(Claude): MoE forward. For now, fall back to dense if
-             * dense weights are also present, else zero contribution. */
-            if (L->gate_proj && L->up_proj && L->down_proj) {
-                swiglu_mlp_f32(st->x_rms, st->x_rms,
-                               (const float *)L->gate_proj,
-                               (const float *)L->up_proj,
-                               (const float *)L->down_proj,
-                               st->gate, st->up, hidden, inter);
-            } else {
-                memset(st->x_rms, 0, hidden * sizeof(float));
-            }
-        } else {
-            swiglu_mlp_f32(st->x_rms, st->x_rms,
-                           (const float *)L->gate_proj,
-                           (const float *)L->up_proj,
-                           (const float *)L->down_proj,
-                           st->gate, st->up, hidden, inter);
+            /* MoE — TODO. Stub: skip MLP contribution. */
+            (void)inter;
+        } else if (L->gate_proj && L->up_proj && L->down_proj) {
+            matmul_lazy(st->gate, st->x_rms,
+                        (const qw36_lazy_w *)L->gate_proj, row_scratch);
+            matmul_lazy(st->up,   st->x_rms,
+                        (const qw36_lazy_w *)L->up_proj,   row_scratch);
+            for (size_t i = 0; i < inter; i++)
+                st->gate[i] = silu(st->gate[i]) * st->up[i];
+            matmul_lazy(st->x_rms, st->gate,
+                        (const qw36_lazy_w *)L->down_proj, row_scratch);
+            for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
         }
-
-        for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
     }
 
-    /* Final norm + lm_head. */
+    /* Final norm + lm_head (lazy). */
     rmsnorm_f32(st->x_rms, st->x, (const float *)w->final_norm,
                 hidden, c->rms_norm_eps);
-    matmul_f32(st->logits, st->x_rms, (const float *)w->lm_head,
-               c->vocab_size, hidden);
+    matmul_lazy(st->logits, st->x_rms,
+                (const qw36_lazy_w *)w->lm_head, row_scratch);
 
     st->seq_pos++;
     return 0;

@@ -10,6 +10,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 
 #include "qw36.h"
 #include "qw36_gpu.h"
@@ -275,6 +276,33 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                          qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
     if (!y || !x || !w) return;
+    if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
+        x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F32) {
+        MPSMatrixDescriptor *w_desc =
+            [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                                  columns:cols
+                                                 rowBytes:(NSUInteger)cols * sizeof(float)
+                                                 dataType:MPSDataTypeFloat32];
+        MPSVectorDescriptor *x_desc =
+            [MPSVectorDescriptor vectorDescriptorWithLength:cols
+                                                   dataType:MPSDataTypeFloat32];
+        MPSVectorDescriptor *y_desc =
+            [MPSVectorDescriptor vectorDescriptorWithLength:rows
+                                                   dataType:MPSDataTypeFloat32];
+        MPSMatrix *wm = [[MPSMatrix alloc] initWithBuffer:w->mtl descriptor:w_desc];
+        MPSVector *xv = [[MPSVector alloc] initWithBuffer:x->mtl descriptor:x_desc];
+        MPSVector *yv = [[MPSVector alloc] initWithBuffer:y->mtl descriptor:y_desc];
+        MPSMatrixVectorMultiplication *gemv =
+            [[MPSMatrixVectorMultiplication alloc] initWithDevice:ctx->device
+                                                             rows:rows
+                                                          columns:cols];
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return;
+    }
+
     NSUInteger n = (NSUInteger)batch * (NSUInteger)rows;
     metal_dispatch_1d(ctx, ctx->matmul, n, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t x_dtype = (uint32_t)x->dtype;

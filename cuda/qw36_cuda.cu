@@ -14,6 +14,7 @@ extern "C" {
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,7 @@ extern "C" {
 struct qw36_gpu_ctx {
     int          device;
     cudaStream_t stream;
+    cublasHandle_t blas;
 };
 
 struct qw36_gpu_buf {
@@ -53,12 +55,28 @@ static qw36_gpu_ctx *cuda_init(char *err, size_t err_cap)
         std::free(ctx);
         return nullptr;
     }
+    cublasStatus_t bs = cublasCreate(&ctx->blas);
+    if (bs != CUBLAS_STATUS_SUCCESS) {
+        if (err && err_cap) std::snprintf(err, err_cap, "cublasCreate: %d", (int)bs);
+        cudaStreamDestroy(ctx->stream);
+        std::free(ctx);
+        return nullptr;
+    }
+    bs = cublasSetStream(ctx->blas, ctx->stream);
+    if (bs != CUBLAS_STATUS_SUCCESS) {
+        if (err && err_cap) std::snprintf(err, err_cap, "cublasSetStream: %d", (int)bs);
+        cublasDestroy(ctx->blas);
+        cudaStreamDestroy(ctx->stream);
+        std::free(ctx);
+        return nullptr;
+    }
     return ctx;
 }
 
 static void cuda_destroy(qw36_gpu_ctx *ctx)
 {
     if (!ctx) return;
+    if (ctx->blas) cublasDestroy(ctx->blas);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
     std::free(ctx);
 }
@@ -340,6 +358,24 @@ static void cuda_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                         qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
     if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return;
+    if (ctx->blas && y->dtype == QW36_DTYPE_F32 &&
+        x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F32) {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t bs = cublasSgemm(ctx->blas,
+                                        CUBLAS_OP_T, CUBLAS_OP_N,
+                                        (int)rows, (int)batch, (int)cols,
+                                        &alpha,
+                                        (const float *)w->dptr, (int)cols,
+                                        (const float *)x->dptr, (int)cols,
+                                        &beta,
+                                        (float *)y->dptr, (int)rows);
+        if (bs == CUBLAS_STATUS_SUCCESS) {
+            cuda_sync(ctx);
+            return;
+        }
+    }
+
     size_t n = (size_t)batch * rows;
     qw36_matmul_kernel<<<cuda_blocks(n), 256, 0, ctx->stream>>>(
         (float *)y->dptr, x->dptr, w->dptr, x->dtype, w->dtype, batch, rows, cols);

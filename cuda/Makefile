@@ -5,6 +5,7 @@ COMMON    = $(ROOT)/common
 NVCC     ?= nvcc
 NVCCFLAGS?= -O3 -std=c++17 -Xcompiler "-Wall -Wextra" -arch=native
 INCLUDES := -I$(COMMON)
+LDLIBS   ?= -lcublas
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
@@ -23,7 +24,7 @@ all: $(OUT)
 $(OUT): $(BACKEND_SRC) $(COMMON_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -x cu $(BACKEND_SRC) \
 	    -x c $(COMMON_SRC) \
-	    -o $@
+	    $(LDLIBS) -o $@
 
 clean:
 	rm -f $(OUT)
