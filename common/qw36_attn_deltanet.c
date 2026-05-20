@@ -275,6 +275,20 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
                           (qw36_gpu_buf *)st->dn_qkv_dev,
                           (const qw36_lazy_w *)L->dn_out);
+    /* Same fused residual_add + post-attn rmsnorm trick as the vanilla
+     * attention path. dn dispatch_dev doesn't carry a forward_ctx so we
+     * cannot set post_attn_rmsnorm_done from here; that flag is wired
+     * by the caller (qw36__attn_deltanet_forward) once this returns. */
+    if (be->residual_rmsnorm && L->post_attn_layernorm) {
+        if (qw36__residual_rmsnorm_dispatch_dev(
+                (qw36_gpu_buf *)st->x_dev,
+                (qw36_gpu_buf *)st->x_rms_dev,
+                (qw36_gpu_buf *)st->x_rms_dev,
+                (const float *)L->post_attn_layernorm,
+                c->hidden_size, c->rms_norm_eps) == 0) {
+            return rc ? -1 : 1; /* signal: post-attn rmsnorm folded in */
+        }
+    }
     rc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
                                     (qw36_gpu_buf *)st->x_rms_dev,
                                     c->hidden_size);
@@ -296,7 +310,9 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     if (fc->gpu_state) {
         int erc = qw36__ensure_x_dev(fc);
         if (erc) return erc;
-        if (qw36__deltanet_dispatch_dev(st, L, c, layer_idx) == 0) {
+        int drc = qw36__deltanet_dispatch_dev(st, L, c, layer_idx);
+        if (drc >= 0) {
+            if (drc == 1) fc->post_attn_rmsnorm_done = 1;
             *fc->x_dev_valid = 1;
             *fc->x_host_valid = 0;
             return 0;
