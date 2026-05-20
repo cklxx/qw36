@@ -2045,11 +2045,19 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             if (!st->conv_state_dev || !st->delta_state_dev) goto fail;
         }
 
+        const char *fp16_kv_env = getenv("QW36_METAL_FP16_WEIGHTS");
+        const int use_fp16_dev_kv =
+            be->name && strcmp(be->name, "metal") == 0 &&
+            fp16_kv_env && atoi(fp16_kv_env) != 0;
+        const qw36_dtype dev_kv_dtype =
+            use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
+        const size_t dev_kv_elem_bytes =
+            use_fp16_dev_kv ? sizeof(uint16_t) : sizeof(float);
         const size_t cache_bytes =
-            (size_t)seq_capacity * kv_dim * sizeof(float);
+            (size_t)seq_capacity * kv_dim * dev_kv_elem_bytes;
         for (size_t l = 0; l < L; l++) {
-            st->k_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
-            st->v_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
+            st->k_cache_dev[l] = be->alloc(ctx, cache_bytes, dev_kv_dtype);
+            st->v_cache_dev[l] = be->alloc(ctx, cache_bytes, dev_kv_dtype);
             if (!st->k_cache_dev[l] || !st->v_cache_dev[l]) goto fail;
             if (c->dn_num_value_heads) {
                 st->conv_state_dev[l] = be->alloc(ctx,

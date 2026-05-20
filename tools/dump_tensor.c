@@ -115,10 +115,84 @@ int main(int argc, char **argv) {
         dq_q4_K((const uint8_t *)t.data, big, big_n);
         memcpy(buf, big, N * sizeof(float));
         free(big);
+    } else if (t.dtype == QW36_DTYPE_Q6_K) {
+        size_t blocks_needed = (size_t)((N + QK_K - 1) / QK_K);
+        size_t big_n = blocks_needed * QK_K;
+        float *big = (float *)calloc(big_n, sizeof(float));
+        const uint8_t *blocks = (const uint8_t *)t.data;
+        for (size_t i = 0; i < blocks_needed; i++) {
+            const uint8_t *b = blocks + i * 210;
+            const uint8_t *ql = b;
+            const uint8_t *qh = b + 128;
+            const int8_t  *sc = (const int8_t *)(b + 192);
+            uint16_t dh; memcpy(&dh, b + 208, 2);
+            float d = f16_to_f32(dh);
+            float *out = big + i * QK_K;
+            for (int n2 = 0; n2 < QK_K; n2 += 128) {
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    int8_t q1 = (int8_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 = (int8_t)((ql[l+32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    out[l+0]  = d * (float)sc[is+0] * (float)q1;
+                    out[l+32] = d * (float)sc[is+2] * (float)q2;
+                    out[l+64] = d * (float)sc[is+4] * (float)q3;
+                    out[l+96] = d * (float)sc[is+6] * (float)q4;
+                }
+                out += 128; ql += 64; qh += 32; sc += 8;
+            }
+        }
+        memcpy(buf, big, N * sizeof(float));
+        free(big);
     } else {
-        fprintf(stderr, "dtype %d not implemented in this dump tool — "
-                "extend dq_q*K from common/qw36.c\n", t.dtype);
+        fprintf(stderr, "dtype %d not implemented in this dump tool\n", t.dtype);
         return 1;
+    }
+
+    /* Optional row offset for embedding-table style tensors. */
+    if (argc >= 5) {
+        int row = atoi(argv[4]);
+        size_t cols = t.n_dims >= 1 ? (size_t)t.dims[0] : 1;
+        if ((size_t)(row * cols + N) > numel) {
+            fprintf(stderr, "row %d × cols %zu + %d exceeds numel %zu\n",
+                    row, cols, N, numel);
+            return 1;
+        }
+        /* Redo dequant starting at this row. */
+        if (t.dtype == QW36_DTYPE_Q6_K) {
+            size_t row_offset_blocks = ((size_t)row * cols) / QK_K;
+            size_t in_block_offset = ((size_t)row * cols) % QK_K;
+            size_t blocks_needed = (size_t)((in_block_offset + N + QK_K - 1) / QK_K);
+            size_t big_n = blocks_needed * QK_K;
+            float *big = (float *)calloc(big_n, sizeof(float));
+            const uint8_t *blocks = (const uint8_t *)t.data + row_offset_blocks * 210;
+            for (size_t i = 0; i < blocks_needed; i++) {
+                const uint8_t *b = blocks + i * 210;
+                const uint8_t *ql = b, *qh = b + 128;
+                const int8_t  *sc = (const int8_t *)(b + 192);
+                uint16_t dh; memcpy(&dh, b + 208, 2);
+                float d = f16_to_f32(dh);
+                float *out = big + i * QK_K;
+                for (int n2 = 0; n2 < QK_K; n2 += 128) {
+                    for (int l = 0; l < 32; l++) {
+                        int is = l/16;
+                        int8_t q1 = (int8_t)((ql[l] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                        int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                        int8_t q3 = (int8_t)((ql[l] >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
+                        int8_t q4 = (int8_t)((ql[l+32] >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
+                        out[l+0]  = d*(float)sc[is+0]*(float)q1;
+                        out[l+32] = d*(float)sc[is+2]*(float)q2;
+                        out[l+64] = d*(float)sc[is+4]*(float)q3;
+                        out[l+96] = d*(float)sc[is+6]*(float)q4;
+                    }
+                    out += 128; ql += 64; qh += 32; sc += 8;
+                }
+            }
+            memcpy(buf, big + in_block_offset, N * sizeof(float));
+            free(big);
+            printf("(row %d offset)\n", row);
+        }
     }
 
     printf("first %d fp32:\n", N);

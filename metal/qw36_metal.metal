@@ -35,6 +35,18 @@ static inline float qw36_load_scalar(device const uchar *ptr, uint dtype, uint i
     return 0.0f;
 }
 
+static inline void qw36_store_scalar(device uchar *ptr, uint dtype, uint i, float v)
+{
+    if (dtype == QW36_DTYPE_F32) {
+        ((device float *)ptr)[i] = v;
+    } else if (dtype == QW36_DTYPE_F16) {
+        ((device half *)ptr)[i] = half(v);
+    } else if (dtype == QW36_DTYPE_BF16) {
+        uint bits = as_type<uint>(v);
+        ((device ushort *)ptr)[i] = ushort(bits >> 16);
+    }
+}
+
 /* ---------------------------------------------------------------- */
 /* RMSNorm: out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]            */
 /* ---------------------------------------------------------------- */
@@ -489,19 +501,21 @@ kernel void qw36_head_norm_rope_f32(
 /* KV cache append: cache[seq_pos] = current k/v.                    */
 /* ---------------------------------------------------------------- */
 kernel void qw36_kv_append_f32(
-    device float       *k_cache      [[buffer(0)]],
-    device float       *v_cache      [[buffer(1)]],
+    device uchar       *k_cache      [[buffer(0)]],
+    device uchar       *v_cache      [[buffer(1)]],
     device const float *k            [[buffer(2)]],
     device const float *v            [[buffer(3)]],
     constant uint      &seq_pos      [[buffer(4)]],
     constant uint      &seq_capacity [[buffer(5)]],
     constant uint      &kv_len       [[buffer(6)]],
+    constant uint      &k_cache_dtype [[buffer(7)]],
+    constant uint      &v_cache_dtype [[buffer(8)]],
     uint                tid          [[thread_position_in_grid]])
 {
     if (tid >= kv_len || seq_pos >= seq_capacity) return;
     uint off = seq_pos * kv_len + tid;
-    k_cache[off] = k[tid];
-    v_cache[off] = v[tid];
+    qw36_store_scalar(k_cache, k_cache_dtype, off, k[tid]);
+    qw36_store_scalar(v_cache, v_cache_dtype, off, v[tid]);
 }
 
 /* ---------------------------------------------------------------- */
@@ -510,12 +524,13 @@ kernel void qw36_kv_append_f32(
 kernel void qw36_attn_scores_f32(
     device float       *scores       [[buffer(0)]],
     device const float *q            [[buffer(1)]],
-    device const float *k_cache      [[buffer(2)]],
+    device const uchar *k_cache      [[buffer(2)]],
     constant uint      &n_heads      [[buffer(3)]],
     constant uint      &n_kv         [[buffer(4)]],
     constant uint      &head_dim     [[buffer(5)]],
     constant uint      &seq_pos      [[buffer(6)]],
     constant uint      &seq_capacity [[buffer(7)]],
+    constant uint      &k_cache_dtype [[buffer(8)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint count = seq_pos + 1;
@@ -526,9 +541,10 @@ kernel void qw36_attn_scores_f32(
     uint kv_h = h * n_kv / n_heads;
     uint kv_len = n_kv * head_dim;
     device const float *qh = q + h * head_dim;
-    device const float *kh = k_cache + pos * kv_len + kv_h * head_dim;
+    uint k_base = pos * kv_len + kv_h * head_dim;
     float acc = 0.0f;
-    for (uint d = 0; d < head_dim; ++d) acc += qh[d] * kh[d];
+    for (uint d = 0; d < head_dim; ++d)
+        acc += qh[d] * qw36_load_scalar(k_cache, k_cache_dtype, k_base + d);
     scores[gid] = acc / sqrt(float(head_dim));
 }
 
@@ -562,12 +578,13 @@ kernel void qw36_attn_softmax_f32(
 kernel void qw36_attn_combine_f32(
     device float       *y            [[buffer(0)]],
     device const float *scores       [[buffer(1)]],
-    device const float *v_cache      [[buffer(2)]],
+    device const uchar *v_cache      [[buffer(2)]],
     constant uint      &n_heads      [[buffer(3)]],
     constant uint      &n_kv         [[buffer(4)]],
     constant uint      &head_dim     [[buffer(5)]],
     constant uint      &seq_pos      [[buffer(6)]],
     constant uint      &seq_capacity [[buffer(7)]],
+    constant uint      &v_cache_dtype [[buffer(8)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint hidden = n_heads * head_dim;
@@ -581,7 +598,7 @@ kernel void qw36_attn_combine_f32(
     float acc = 0.0f;
     for (uint pos = 0; pos < count; ++pos) {
         uint off = pos * kv_len + kv_h * head_dim + d;
-        acc += score_row[pos] * v_cache[off];
+        acc += score_row[pos] * qw36_load_scalar(v_cache, v_cache_dtype, off);
     }
     y[gid] = acc;
 }
@@ -594,8 +611,8 @@ kernel void qw36_attn_prep_decode_f32(
     device float       *q            [[buffer(0)]],
     device float       *k            [[buffer(1)]],
     device const float *v            [[buffer(2)]],
-    device float       *k_cache      [[buffer(3)]],
-    device float       *v_cache      [[buffer(4)]],
+    device uchar       *k_cache      [[buffer(3)]],
+    device uchar       *v_cache      [[buffer(4)]],
     device const uchar *q_norm       [[buffer(5)]],
     device const uchar *k_norm       [[buffer(6)]],
     constant uint      &n_heads      [[buffer(7)]],
@@ -608,6 +625,8 @@ kernel void qw36_attn_prep_decode_f32(
     constant float     &eps          [[buffer(14)]],
     constant uint      &q_w_dtype    [[buffer(15)]],
     constant uint      &k_w_dtype    [[buffer(16)]],
+    constant uint      &k_cache_dtype [[buffer(17)]],
+    constant uint      &v_cache_dtype [[buffer(18)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint rot_dim = uint(float(head_dim) * partial);
@@ -660,26 +679,27 @@ kernel void qw36_attn_prep_decode_f32(
 
     if (seq_pos >= seq_capacity) return;
     uint kv_len = n_kv * head_dim;
-    device float *kc = k_cache + seq_pos * kv_len + kvh * head_dim;
-    device float *vc = v_cache + seq_pos * kv_len + kvh * head_dim;
+    uint cache_base = seq_pos * kv_len + kvh * head_dim;
     device const float *vh = v + kvh * head_dim;
     for (uint d = 0; d < head_dim; ++d) {
-        kc[d] = kh[d];
-        vc[d] = vh[d];
+        qw36_store_scalar(k_cache, k_cache_dtype, cache_base + d, kh[d]);
+        qw36_store_scalar(v_cache, v_cache_dtype, cache_base + d, vh[d]);
     }
 }
 
 kernel void qw36_attn_score_combine_tg_f32(
     device float       *y            [[buffer(0)]],
     device const float *q            [[buffer(1)]],
-    device const float *k_cache      [[buffer(2)]],
-    device const float *v_cache      [[buffer(3)]],
+    device const uchar *k_cache      [[buffer(2)]],
+    device const uchar *v_cache      [[buffer(3)]],
     constant uint      &n_heads      [[buffer(4)]],
     constant uint      &n_kv         [[buffer(5)]],
     constant uint      &head_dim     [[buffer(6)]],
     constant uint      &seq_pos      [[buffer(7)]],
     constant uint      &seq_capacity [[buffer(8)]],
     constant uint      &tg_size      [[buffer(9)]],
+    constant uint      &k_cache_dtype [[buffer(10)]],
+    constant uint      &v_cache_dtype [[buffer(11)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -696,8 +716,10 @@ kernel void qw36_attn_score_combine_tg_f32(
     float inv_sqrt_d = rsqrt(float(head_dim));
 
     for (uint t = 0; t < count; ++t) {
-        device const float *kh = k_cache + t * kv_len + kvh * head_dim;
-        partials[lane] = (lane < head_dim) ? qh[lane] * kh[lane] : 0.0f;
+        uint k_base = t * kv_len + kvh * head_dim;
+        partials[lane] = (lane < head_dim)
+            ? qh[lane] * qw36_load_scalar(k_cache, k_cache_dtype, k_base + lane)
+            : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
             if (lane < stride) partials[lane] += partials[lane + stride];
@@ -725,7 +747,7 @@ kernel void qw36_attn_score_combine_tg_f32(
         float acc = 0.0f;
         for (uint t = 0; t < count; ++t) {
             uint off = t * kv_len + kvh * head_dim + lane;
-            acc += scores[t] * v_cache[off];
+            acc += scores[t] * qw36_load_scalar(v_cache, v_cache_dtype, off);
         }
         y[h * head_dim + lane] = acc;
     }
@@ -736,8 +758,8 @@ kernel void qw36_attn_decode_fused_f32(
     device const float *q_raw        [[buffer(1)]],
     device const float *k_raw        [[buffer(2)]],
     device const float *v_raw        [[buffer(3)]],
-    device float       *k_cache      [[buffer(4)]],
-    device float       *v_cache      [[buffer(5)]],
+    device uchar       *k_cache      [[buffer(4)]],
+    device uchar       *v_cache      [[buffer(5)]],
     device const uchar *q_norm       [[buffer(6)]],
     device const uchar *k_norm       [[buffer(7)]],
     constant uint      &n_heads      [[buffer(8)]],
@@ -751,6 +773,8 @@ kernel void qw36_attn_decode_fused_f32(
     constant uint      &q_w_dtype    [[buffer(16)]],
     constant uint      &k_w_dtype    [[buffer(17)]],
     constant uint      &tg_size      [[buffer(18)]],
+    constant uint      &k_cache_dtype [[buffer(19)]],
+    constant uint      &v_cache_dtype [[buffer(20)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -818,8 +842,8 @@ kernel void qw36_attn_decode_fused_f32(
 
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
         uint off = seq_pos * kv_len + kvh * head_dim + lane;
-        k_cache[off] = kv;
-        v_cache[off] = v_raw[kvh * head_dim + lane];
+        qw36_store_scalar(k_cache, k_cache_dtype, off, kv);
+        qw36_store_scalar(v_cache, v_cache_dtype, off, v_raw[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -829,7 +853,8 @@ kernel void qw36_attn_decode_fused_f32(
         if (lane < head_dim) {
             kval = (t == seq_pos)
                 ? kv
-                : k_cache[t * kv_len + kvh * head_dim + lane];
+                : qw36_load_scalar(k_cache, k_cache_dtype,
+                                   t * kv_len + kvh * head_dim + lane);
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0) partials[simd_id] = dot;
@@ -858,7 +883,8 @@ kernel void qw36_attn_decode_fused_f32(
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
                 ? v_raw[kvh * head_dim + lane]
-                : v_cache[t * kv_len + kvh * head_dim + lane];
+                : qw36_load_scalar(v_cache, v_cache_dtype,
+                                   t * kv_len + kvh * head_dim + lane);
             acc += scores[t] * vv;
         }
         y[h * head_dim + lane] = acc;
