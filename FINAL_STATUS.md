@@ -1,0 +1,128 @@
+# qw36 — Final Status
+
+## TL;DR
+
+Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **82 tok/s
+sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal (vs llama.cpp's
+170 tok/s reference, ~48%). CPU baseline 1.7 tok/s. 36 commits over
+one session.
+
+## Decode throughput ladder (Metal, M-class GPU, Qwen3.5-0.8B-Q4_K_M)
+
+| commit  | tok/s decode (n=128) | what                              |
+|---------|---------------------:|-----------------------------------|
+| baseline CPU       | 1.7    | lazy quant + scalar matmul        |
+| 218fb50            | 11     | first GPU matmul (MPS gemv)       |
+| d24bbbd            | 55     | persistent GPU state buffers      |
+| 2cd9da4 + ce9343e  | 56     | bucket pool + fused gated_delta_step |
+| e286627 (fp16 opt-in) | 67  | fp16 weight materialize           |
+| codex task #30     | 75-81  | fused decode attention            |
+| **53511dd**        | **82** | **fp16 KV cache, sustained**     |
+| (llama.cpp ref)    | 170    | upstream baseline                 |
+| (agent-infer ref)  | ~200   | MLX with GPU-side Q4_K matmul    |
+
+`QW36_METAL_FP16_WEIGHTS=1` to opt in.
+
+## Coverage
+
+### What works
+- GGUF v3 loader (mmap, kv table, tensor table, alignment) — `common/qw36_gguf.c`
+- Dequant for F32 / F16 / BF16 / Q8_0 / Q2_K / Q3_K / Q4_K / Q5_K / Q6_K
+  with per-block layouts byte-equivalent to ggml-quants.c (verified
+  against a hand-rolled Python reference for Q6_K embeddings — see
+  `tools/dump_tensor.c` + commit 5afd192)
+- BBPE tokenizer with Qwen3 chat-template special token detection
+  (`<|im_start|>`, `<|im_end|>`, etc.)
+- mRoPE handling (off by default; section-based opt-in via
+  `QW36_USE_MROPE_SECTIONS=1`)
+- Per-layer hybrid attention dispatch (vanilla GQA vs Gated DeltaNet)
+- MoE forward (router + top-k experts + shared) on CPU and Metal
+- 3 GPU backends behind one frozen vtable (`common/qw36_gpu.h`):
+  Metal (end-to-end), CUDA (built off-host), AMD/HIP (built off-host)
+- GPU-resident state: x / x_rms / Q / KV cache (fp16) / scratch / logits
+  all live on device; only the final logits download per token
+- Fused Metal decode-attention kernel (q/k norm + RoPE + KV append +
+  score + softmax + combine in one MSL dispatch per vanilla layer)
+- Fused Gated DeltaNet kernel (transliterated from
+  `agent-infer/crates/mlx-sys/src/mlx_qwen35_model.cpp:203-275`)
+- Buffer pool, MPS-gemv pipeline-state cache, batched command buffer
+  per forward step
+
+### CLI / API
+- `qw36_cpu`, `qw36_metal`, `qw36_cuda`, `qw36_amd` binaries
+- `--info`, `--dump-tokens`, `--debug-top`, `--no-special`, `--interactive`
+- Env knobs: `QW36_METAL_FP16_WEIGHTS`, `QW36_DEBUG_LAYER`,
+  `QW36_SKIP_DN`, `QW36_SKIP_CONV1D`, `QW36_ROPE_NEOX`,
+  `QW36_USE_MROPE_SECTIONS`
+
+### Tests + ops
+- `make test`: precision_cpu_vs_metal (step-0 bit-equal, fp32) +
+  e2e_qwen35_smoke (informational; currently FAIL — see #31)
+- `qw36_dump_tensor` standalone cross-check tool
+- `.github/workflows/ci.yml`: 3-job matrix (linux-cpu / macos-metal /
+  cuda-build-check) on push + PR
+- `.github/workflows/release.yml`: builds linux-x86_64 + macos-arm64
+  artifacts with sha256 sidecars on `v*.*.*` tags
+- `tools/install.sh`: one-liner installer, detects host, prefers `gh
+  release download`, verifies sha256
+- MIT LICENSE, CHANGELOG.md (v0.1.0 entry), top-level README (300 lines)
+
+## Open items
+
+### #31 — output coherence (the elephant in the room)
+On the same Qwen3.5-0.8B-Q4_K_M.gguf:
+
+  - llama.cpp `Hello` → `Hello! How can I help you today?`  (170 tok/s)
+  - qw36       `Hello` → `($($($($($($($($`                  ( 82 tok/s)
+
+Both CPU and Metal in qw36 produce identical step-0 logits and agree
+on argmax for several steps. The forward math itself is therefore
+internally consistent but differs from the ggml reference somewhere.
+
+Confirmed *not* the bug source:
+- Q4_K/Q5_K/Q6_K dequant blocks (byte-equal to Python reference)
+- Embedding row addressing (byte-equal for token 9419 'Hello')
+- Tokenizer (same token count + IDs as llama.cpp for chat-wrapped prompt)
+- GQA mapping (`kvh = h * n_kv / n_heads`, matches agent-infer)
+- num_attention_heads derived from tensor shape (metadata is wrong)
+- mRoPE sections (disabled by default; agent-infer also ignores them)
+
+Remaining suspects (see `tests/correctness_diag.md`):
+- DN attn_qkv split ordering or post-conv1d activation order
+- ssm_norm weight broadcast across value heads
+- RoPE pair convention in the Metal head_norm_rope kernel
+- Inner accumulator ordering in fused decode attention
+
+To close: per-layer intermediate dump from llama.cpp (`--logits-all`
+isn't enough; need a custom build or use the Python HF reference) and
+a layer-by-layer numerical diff.
+
+### #30 — push to 200 tok/s
+Current 82 tok/s → target 200 needs:
+1. GPU-side Q4_K matmul (skip the fp16 dequant + upload step)
+2. bf16 compute path (MPS bf16 GEMV is faster than fp16 on M-series)
+3. Persistent MTLCommandBuffer reuse across steps (ring of 2-3 cbs)
+
+Each ~1.3-1.5×; combined plausibly 2-2.5×.
+
+### #25, #26, #27 — nice-to-have
+- cl100k pre-tokenize regex for exact HF tokenizer compatibility
+- CUDA/AMD compile + validate on a real GPU host
+- Golden-vector unit tests for each kernel
+
+## Build & run
+
+```bash
+make all                                       # cpu + whatever GPU toolchain present
+make test                                      # precision invariant + e2e smoke
+
+# Run
+./qw36_metal -m models/Qwen3.5-0.8B-Q4_K_M.gguf -p "Hello"
+
+# Bench fast path
+QW36_METAL_FP16_WEIGHTS=1 ./qw36_metal -m models/Qwen3.5-0.8B-Q4_K_M.gguf \
+    -p "Hi" -n 128
+
+# Diagnostic
+./qw36_dump_tensor models/Qwen3.5-0.8B-Q4_K_M.gguf token_embd.weight 8 9419
+```
