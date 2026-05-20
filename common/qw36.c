@@ -235,6 +235,10 @@ static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
     }
 }
 
+/* Forward declarations for helpers used by MoE / lazy ops before their
+ * full definitions further down. */
+static inline float silu(float x);
+
 /* --------------------------------------------------------------------- */
 /* Lazy block-quantized helpers: dequantize one row at a time.            */
 /* --------------------------------------------------------------------- */
@@ -294,6 +298,128 @@ static int matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
         double acc = 0.0;
         for (size_t c = 0; c < cols; c++) acc += (double)row_scratch[c] * x[c];
         y[r] = (float)acc;
+    }
+    return 0;
+}
+
+/* Same as matmul_lazy but operates on a single slice of a 3D stack
+ * [n_experts, rows, cols]. Used for MoE expert matmuls without copying. */
+static int matmul_lazy_slice(float *y, const float *x,
+                             const qw36_lazy_w *w, size_t slice_idx,
+                             float *row_scratch)
+{
+    const size_t rows = (size_t)w->rows;
+    const size_t cols = (size_t)w->cols;
+    /* Byte offset of slice s = s * rows * blocks_per_row * bytes_per_block. */
+    size_t row_bytes;
+    if (w->dtype == QW36_DTYPE_F32)      row_bytes = cols * 4;
+    else if (w->dtype == QW36_DTYPE_F16) row_bytes = cols * 2;
+    else if (w->dtype == QW36_DTYPE_BF16) row_bytes = cols * 2;
+    else {
+        size_t qk, bpb;
+        if (dtype_block_geom(w->dtype, &qk, &bpb) || cols % qk != 0) return -1;
+        row_bytes = (cols / qk) * bpb;
+    }
+    const uint8_t *slice_data = (const uint8_t *)w->data
+                              + slice_idx * rows * row_bytes;
+    qw36_lazy_w view = *w;
+    view.data = (const void *)slice_data;
+    return matmul_lazy(y, x, &view, row_scratch);
+}
+
+/* Top-k selection (small k, unsorted by index). On return out_idx/out_val
+ * hold the k largest values of `logits`, sorted descending by value. */
+static void top_k_select(const float *logits, uint32_t n, int k,
+                         uint32_t *out_idx, float *out_val)
+{
+    /* Initialise the heap with -inf. */
+    for (int i = 0; i < k; i++) { out_idx[i] = 0; out_val[i] = -INFINITY; }
+    for (uint32_t i = 0; i < n; i++) {
+        if (logits[i] <= out_val[k - 1]) continue;
+        /* Insertion sort: find position, shift. */
+        int j = k - 1;
+        while (j > 0 && logits[i] > out_val[j - 1]) {
+            out_val[j] = out_val[j - 1];
+            out_idx[j] = out_idx[j - 1];
+            j--;
+        }
+        out_val[j] = logits[i];
+        out_idx[j] = i;
+    }
+}
+
+/* Stable softmax over the first k entries of vals (in-place). */
+static void softmax_k(float *vals, int k) {
+    float mx = vals[0];
+    for (int i = 1; i < k; i++) if (vals[i] > mx) mx = vals[i];
+    double sum = 0.0;
+    for (int i = 0; i < k; i++) { vals[i] = expf(vals[i] - mx); sum += vals[i]; }
+    float inv = (float)(1.0 / sum);
+    for (int i = 0; i < k; i++) vals[i] *= inv;
+}
+
+/* MoE forward (per token):
+ *
+ *   r = router @ x                       [n_experts]
+ *   pick top_k experts by r
+ *   probs = softmax(r[top_k]); (optionally renormalized)
+ *   y = Σ_{e ∈ top_k} probs[e] * expert_e(x)
+ *     + shared_expert(x)                 (if shared weights present)
+ *
+ *   expert_e(x) = down_exps[e] @ (silu(gate_exps[e] @ x) * (up_exps[e] @ x))
+ *
+ * scratch needs: hidden + n_experts + 2*k + 2*moe_inter + hidden floats. */
+static int moe_forward_f32(float *y, const float *x,
+                           const qw36_lazy_w *router,
+                           const qw36_lazy_w *gate_exps,
+                           const qw36_lazy_w *up_exps,
+                           const qw36_lazy_w *down_exps,
+                           const qw36_lazy_w *shared_gate,
+                           const qw36_lazy_w *shared_up,
+                           const qw36_lazy_w *shared_down,
+                           uint32_t hidden, uint32_t moe_inter,
+                           uint32_t n_experts, int top_k,
+                           uint8_t norm_topk,
+                           float *scratch, float *row_scratch)
+{
+    float    *r_logits = scratch;                          /* n_experts */
+    float    *tk_vals  = r_logits + n_experts;             /* top_k    */
+    uint32_t *tk_idx   = (uint32_t *)(tk_vals + top_k);    /* top_k    */
+    float    *tmp_gate = (float *)(tk_idx + top_k);        /* moe_inter*/
+    float    *tmp_up   = tmp_gate + moe_inter;             /* moe_inter*/
+    float    *tmp_y    = tmp_up   + moe_inter;             /* hidden   */
+
+    /* 1. router */
+    if (matmul_lazy(r_logits, x, router, row_scratch)) return -1;
+
+    /* 2. top-k */
+    top_k_select(r_logits, n_experts, top_k, tk_idx, tk_vals);
+
+    /* 3. softmax (and optional renormalize — softmax_k already sums to 1) */
+    softmax_k(tk_vals, top_k);
+    (void)norm_topk; /* always renormalized — Qwen3 sets norm_topk_prob=true */
+
+    /* 4. accumulate top-k experts */
+    memset(y, 0, hidden * sizeof(float));
+    for (int t = 0; t < top_k; t++) {
+        const uint32_t e = tk_idx[t];
+        const float    p = tk_vals[t];
+        if (matmul_lazy_slice(tmp_gate, x, gate_exps, e, row_scratch)) return -1;
+        if (matmul_lazy_slice(tmp_up,   x, up_exps,   e, row_scratch)) return -1;
+        for (uint32_t i = 0; i < moe_inter; i++)
+            tmp_gate[i] = silu(tmp_gate[i]) * tmp_up[i];
+        if (matmul_lazy_slice(tmp_y, tmp_gate, down_exps, e, row_scratch)) return -1;
+        for (uint32_t i = 0; i < hidden; i++) y[i] += p * tmp_y[i];
+    }
+
+    /* 5. shared expert (Qwen3-MoE: always-on extra path) */
+    if (shared_gate && shared_up && shared_down) {
+        if (matmul_lazy(tmp_gate, x, shared_gate, row_scratch)) return -1;
+        if (matmul_lazy(tmp_up,   x, shared_up,   row_scratch)) return -1;
+        for (uint32_t i = 0; i < moe_inter; i++)
+            tmp_gate[i] = silu(tmp_gate[i]) * tmp_up[i];
+        if (matmul_lazy(tmp_y, tmp_gate, shared_down, row_scratch)) return -1;
+        for (uint32_t i = 0; i < hidden; i++) y[i] += tmp_y[i];
     }
     return 0;
 }
@@ -874,8 +1000,35 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                     hidden, c->rms_norm_eps);
 
         if (L->moe_router) {
-            /* MoE — TODO. Stub: skip MLP contribution. */
-            (void)inter;
+            /* MoE path. Expert intermediate may be smaller than dense
+             * intermediate; we use moe_intermediate_size from config. */
+            const uint32_t mi = c->moe_intermediate_size
+                              ? c->moe_intermediate_size
+                              : ((const qw36_lazy_w *)L->moe_expert_gate)->rows;
+            /* Scratch overlay: use part of attn_scores tail past row_scratch.
+             * We sized row_scratch for max(hidden, inter, vocab); for safety,
+             * append a fresh allocation here. */
+            const size_t need = (size_t)c->moe_num_experts
+                              + (size_t)c->moe_experts_per_tok * 2  /* val+idx */
+                              + (size_t)mi * 2
+                              + (size_t)hidden;
+            float *moe_scratch = (float *)alloca(need * sizeof(float));
+            if (moe_forward_f32(st->x_rms, st->x_rms,
+                                (const qw36_lazy_w *)L->moe_router,
+                                (const qw36_lazy_w *)L->moe_expert_gate,
+                                (const qw36_lazy_w *)L->moe_expert_up,
+                                (const qw36_lazy_w *)L->moe_expert_down,
+                                (const qw36_lazy_w *)L->moe_shared_gate,
+                                (const qw36_lazy_w *)L->moe_shared_up,
+                                (const qw36_lazy_w *)L->moe_shared_down,
+                                hidden, mi,
+                                c->moe_num_experts,
+                                (int)c->moe_experts_per_tok,
+                                c->moe_norm_topk_prob,
+                                moe_scratch, row_scratch) == 0)
+            {
+                for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+            }
         } else if (L->gate_proj && L->up_proj && L->down_proj) {
             matmul_lazy(st->gate, st->x_rms,
                         (const qw36_lazy_w *)L->gate_proj, row_scratch);

@@ -37,9 +37,173 @@ struct qw36_gpu_ctx {
 
 struct qw36_gpu_buf {
     id<MTLBuffer> mtl;
+    void         *host_copy;
     size_t        bytes;
     qw36_dtype    dtype;
 };
+
+/* --------------------------------------------------------------------- */
+/* Host-side dequantization for simple bring-up of lazy GGUF weights.     */
+/* --------------------------------------------------------------------- */
+
+#define QW36_QK_K   256
+#define QW36_QK8_0  32
+
+static int metal_dtype_is_host_dequant(qw36_dtype dtype)
+{
+    return dtype == QW36_DTYPE_Q4_K ||
+           dtype == QW36_DTYPE_Q6_K ||
+           dtype == QW36_DTYPE_Q8_0;
+}
+
+static float metal_f16_to_f32(uint16_t h)
+{
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign << 31;
+        } else {
+            int e = 1;
+            while (!(mant & 0x400u)) { mant <<= 1; e--; }
+            mant &= 0x3FFu;
+            f = (sign << 31) | ((uint32_t)(e + (127 - 15)) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    union { uint32_t u; float f; } u;
+    u.u = f;
+    return u.f;
+}
+
+static void metal_dq_q8_0(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK8_0;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 34;
+        uint16_t dh;
+        memcpy(&dh, b, sizeof(dh));
+        const float d = metal_f16_to_f32(dh);
+        const int8_t *qs = (const int8_t *)(b + 2);
+        for (int j = 0; j < QW36_QK8_0; j++) *out++ = d * (float)qs[j];
+    }
+}
+
+static void metal_q4_K_get_scale_min(int j, const uint8_t *q,
+                                     uint8_t *d, uint8_t *m)
+{
+    if (j < 4) {
+        *d = q[j]     & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void metal_dq_q4_K(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 144;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b,     sizeof(dh));
+        memcpy(&dmh, b + 2, sizeof(dmh));
+        const float d = metal_f16_to_f32(dh);
+        const float dmn = metal_f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qs = b + 16;
+        int is = 0;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            metal_q4_K_get_scale_min(is + 0, scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            metal_q4_K_get_scale_min(is + 1, scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (int l = 0; l < 32; l++) *out++ = d1 * (float)(qs[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) *out++ = d2 * (float)(qs[l] >> 4) - m2;
+            qs += 32;
+            is += 2;
+        }
+    }
+}
+
+static void metal_dq_q6_K(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 210;
+        const uint8_t *ql = b;
+        const uint8_t *qh = b + 128;
+        const int8_t *sc = (const int8_t *)(b + 128 + 64);
+        uint16_t dh;
+        memcpy(&dh, b + 128 + 64 + 16, sizeof(dh));
+        const float d = metal_f16_to_f32(dh);
+        for (int n_off = 0; n_off < QW36_QK_K; n_off += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[l +  0] = d * (float)sc[is + 0] * (float)q1;
+                out[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            out += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+static int metal_quant_geom(qw36_dtype dtype, size_t *qk, size_t *bytes_per_block)
+{
+    switch (dtype) {
+        case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
+        case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
+        default: *qk = 0; *bytes_per_block = 0; return -1;
+    }
+}
+
+static int metal_dequant_row(const qw36_gpu_buf *buf, size_t row_idx,
+                             size_t cols, float *out)
+{
+    if (!buf || !buf->host_copy) return -1;
+    size_t qk, bpb;
+    if (metal_quant_geom(buf->dtype, &qk, &bpb) || cols % qk != 0) return -1;
+    const size_t blocks_per_row = cols / qk;
+    const uint8_t *row = (const uint8_t *)buf->host_copy
+                       + row_idx * blocks_per_row * bpb;
+    switch (buf->dtype) {
+        case QW36_DTYPE_Q4_K: metal_dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q6_K: metal_dq_q6_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q8_0: metal_dq_q8_0(row, out, cols); return 0;
+        default: return -1;
+    }
+}
+
+static float *metal_dequant_matrix(const qw36_gpu_buf *buf,
+                                   uint32_t rows, uint32_t cols)
+{
+    float *out = (float *)malloc((size_t)rows * cols * sizeof(float));
+    if (!out) return NULL;
+    for (uint32_t r = 0; r < rows; r++) {
+        if (metal_dequant_row(buf, r, cols, out + (size_t)r * cols)) {
+            free(out);
+            return NULL;
+        }
+    }
+    return out;
+}
 
 /* --------------------------------------------------------------------- */
 /* Lifecycle                                                              */
@@ -198,6 +362,15 @@ static qw36_gpu_buf *metal_upload(qw36_gpu_ctx *ctx, const void *host,
     if (!buf->mtl) { free(buf); return NULL; }
     buf->bytes = bytes;
     buf->dtype = dtype;
+    if (metal_dtype_is_host_dequant(dtype) && bytes) {
+        buf->host_copy = malloc(bytes);
+        if (!buf->host_copy) {
+            buf->mtl = nil;
+            free(buf);
+            return NULL;
+        }
+        memcpy(buf->host_copy, host, bytes);
+    }
     return buf;
 }
 
@@ -228,6 +401,7 @@ static void metal_free(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf)
     (void)ctx;
     if (!buf) return;
     buf->mtl = nil;
+    free(buf->host_copy);
     free(buf);
 }
 
@@ -276,6 +450,19 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                          qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
     if (!y || !x || !w) return;
+    if (metal_dtype_is_host_dequant(w->dtype)) {
+        float *w_f32 = metal_dequant_matrix(w, rows, cols);
+        if (!w_f32) return;
+        qw36_gpu_buf *w_tmp = metal_upload(ctx, w_f32,
+                                           (size_t)rows * cols * sizeof(float),
+                                           QW36_DTYPE_F32);
+        free(w_f32);
+        if (!w_tmp) return;
+        metal_matmul(ctx, y, x, w_tmp, batch, rows, cols);
+        metal_free(ctx, w_tmp);
+        return;
+    }
+
     if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
         x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F32) {
         MPSMatrixDescriptor *w_desc =
@@ -452,6 +639,16 @@ static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_
                                    uint32_t token, uint32_t hidden)
 {
     if (!y || !embed) return;
+    if (metal_dtype_is_host_dequant(embed->dtype)) {
+        float *row = (float *)malloc((size_t)hidden * sizeof(float));
+        if (!row) return;
+        if (metal_dequant_row(embed, token, hidden, row) == 0)
+            memcpy([y->mtl contents], row, (size_t)hidden * sizeof(float));
+        free(row);
+        (void)ctx;
+        return;
+    }
+
     metal_dispatch_1d(ctx, ctx->embedding_lookup, hidden, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t embed_dtype = (uint32_t)embed->dtype;
         [enc setBuffer:y->mtl     offset:0 atIndex:0];

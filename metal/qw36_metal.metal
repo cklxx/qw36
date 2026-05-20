@@ -15,7 +15,7 @@ using namespace metal;
 
 constant uint QW36_DTYPE_F32  = 0;
 constant uint QW36_DTYPE_F16  = 1;
-constant uint QW36_DTYPE_BF16 = 2;
+constant uint QW36_DTYPE_BF16 = 30;
 
 static inline float qw36_bf16_to_f32(ushort v)
 {
