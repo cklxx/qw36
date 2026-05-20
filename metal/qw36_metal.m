@@ -969,22 +969,34 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         return;
     }
 
-    if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
-        x->dtype == QW36_DTYPE_F32 && w->dtype == QW36_DTYPE_F16) {
-        qw36_gpu_buf *xh = metal_scratch(ctx, &ctx->matmul_x_f16_scratch,
+    /* fp16 MPS GEMV. Weights are F16; x and y can independently be F32
+     * or F16. When state buffers move to fp16 (#46), x and y land as
+     * F16 here directly, eliminating both f32↔f16 conversion dispatches
+     * per matmul — that is the bulk of the to-200-tok/s gain. */
+    if (ctx && batch == 1 && w->dtype == QW36_DTYPE_F16 &&
+        (x->dtype == QW36_DTYPE_F32 || x->dtype == QW36_DTYPE_F16) &&
+        (y->dtype == QW36_DTYPE_F32 || y->dtype == QW36_DTYPE_F16))
+    {
+        const int x_is_f16 = (x->dtype == QW36_DTYPE_F16);
+        const int y_is_f16 = (y->dtype == QW36_DTYPE_F16);
+        qw36_gpu_buf *xh = x_is_f16 ? x : metal_scratch(ctx,
+            &ctx->matmul_x_f16_scratch,
             (size_t)cols * sizeof(uint16_t), QW36_DTYPE_F16);
-        qw36_gpu_buf *yh = metal_scratch(ctx, &ctx->matmul_y_f16_scratch,
+        qw36_gpu_buf *yh = y_is_f16 ? y : metal_scratch(ctx,
+            &ctx->matmul_y_f16_scratch,
             (size_t)rows * sizeof(uint16_t), QW36_DTYPE_F16);
         if (!xh || !yh) {
-            metal_zero_output(ctx, y, (size_t)rows * sizeof(float));
+            size_t y_elem = y_is_f16 ? sizeof(uint16_t) : sizeof(float);
+            metal_zero_output(ctx, y, (size_t)rows * y_elem);
             return;
         }
-        /* Skip the f32→f16 conversion when this matmul's x is the same
-         * buffer + cols that we converted on the last fp16 matmul (no
-         * intervening compute dispatch invalidated it). Saves 2-3
-         * dispatches per layer's q/k/v + gate/up triplets. */
-        if (ctx->matmul_xh_src != x->mtl ||
-            ctx->matmul_xh_cols != (NSUInteger)cols)
+        /* xh dedup: skip the f32→f16 conversion when this matmul's x is
+         * the same buffer + cols that we converted on the last fp16
+         * matmul (no intervening compute dispatch invalidated it).
+         * Only needed when x came in as F32. */
+        if (!x_is_f16 &&
+            (ctx->matmul_xh_src != x->mtl ||
+             ctx->matmul_xh_cols != (NSUInteger)cols))
         {
             metal_dispatch_1d(ctx, ctx->f32_to_f16, cols, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:xh->mtl offset:0 atIndex:0];
@@ -1018,11 +1030,13 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
         if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
-        metal_dispatch_1d(ctx, ctx->f16_to_f32, rows, ^(id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:y->mtl  offset:0 atIndex:0];
-            [enc setBuffer:yh->mtl offset:0 atIndex:1];
-            [enc setBytes:&rows length:sizeof(rows) atIndex:2];
-        });
+        if (!y_is_f16) {
+            metal_dispatch_1d(ctx, ctx->f16_to_f32, rows, ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:y->mtl  offset:0 atIndex:0];
+                [enc setBuffer:yh->mtl offset:0 atIndex:1];
+                [enc setBytes:&rows length:sizeof(rows) atIndex:2];
+            });
+        }
         return;
     }
 
