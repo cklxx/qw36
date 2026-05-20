@@ -877,6 +877,30 @@ static void metal_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
     });
 }
 
+static MPSMatrix *metal_cached_weight_matrix(qw36_gpu_ctx *ctx,
+                                             qw36_gpu_buf *w,
+                                             uint32_t rows,
+                                             uint32_t cols,
+                                             MPSDataType data_type,
+                                             NSUInteger elem_bytes,
+                                             const char *suffix)
+{
+    if (!ctx || !w || !w->mtl) return nil;
+    NSString *key = [NSString stringWithFormat:@"%p:%ux%u:%s",
+                     (__bridge void *)w->mtl,
+                     (unsigned)rows, (unsigned)cols, suffix];
+    MPSMatrix *wm = ctx->mps_matrix_cache[key];
+    if (wm) return wm;
+    MPSMatrixDescriptor *desc =
+        [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                              columns:cols
+                                             rowBytes:(NSUInteger)cols * elem_bytes
+                                             dataType:data_type];
+    wm = [[MPSMatrix alloc] initWithBuffer:w->mtl descriptor:desc];
+    ctx->mps_matrix_cache[key] = wm;
+    return wm;
+}
+
 static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                          qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
@@ -977,18 +1001,15 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                        initWithDevice:ctx->device rows:rows columns:cols];
             ctx->mps_cache[key] = gemv;
         }
-        MPSMatrixDescriptor *w_desc =
-            [MPSMatrixDescriptor matrixDescriptorWithRows:rows
-                                                  columns:cols
-                                                 rowBytes:(NSUInteger)cols * sizeof(uint16_t)
-                                                 dataType:MPSDataTypeFloat16];
         MPSVectorDescriptor *x_desc =
             [MPSVectorDescriptor vectorDescriptorWithLength:cols
                                                    dataType:MPSDataTypeFloat16];
         MPSVectorDescriptor *y_desc =
             [MPSVectorDescriptor vectorDescriptorWithLength:rows
                                                    dataType:MPSDataTypeFloat16];
-        MPSMatrix *wm = [[MPSMatrix alloc] initWithBuffer:w->mtl descriptor:w_desc];
+        MPSMatrix *wm = metal_cached_weight_matrix(ctx, w, rows, cols,
+                                                   MPSDataTypeFloat16,
+                                                   sizeof(uint16_t), "h");
         MPSVector *xv = [[MPSVector alloc] initWithBuffer:xh->mtl descriptor:x_desc];
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:yh->mtl descriptor:y_desc];
         int owns_cb = 0;
@@ -1017,18 +1038,15 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                        initWithDevice:ctx->device rows:rows columns:cols];
             ctx->mps_cache[key] = gemv;
         }
-        MPSMatrixDescriptor *w_desc =
-            [MPSMatrixDescriptor matrixDescriptorWithRows:rows
-                                                  columns:cols
-                                                 rowBytes:(NSUInteger)cols * sizeof(float)
-                                                 dataType:MPSDataTypeFloat32];
         MPSVectorDescriptor *x_desc =
             [MPSVectorDescriptor vectorDescriptorWithLength:cols
                                                    dataType:MPSDataTypeFloat32];
         MPSVectorDescriptor *y_desc =
             [MPSVectorDescriptor vectorDescriptorWithLength:rows
                                                    dataType:MPSDataTypeFloat32];
-        MPSMatrix *wm = [[MPSMatrix alloc] initWithBuffer:w->mtl descriptor:w_desc];
+        MPSMatrix *wm = metal_cached_weight_matrix(ctx, w, rows, cols,
+                                                   MPSDataTypeFloat32,
+                                                   sizeof(float), "f");
         MPSVector *xv = [[MPSVector alloc] initWithBuffer:x->mtl descriptor:x_desc];
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:y->mtl descriptor:y_desc];
         int owns_cb = 0;
