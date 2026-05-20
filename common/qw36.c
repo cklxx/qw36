@@ -867,32 +867,23 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             }
         }
 
-        /* x_dev (the residual stream) stays fp32 — Qwen3.5/3.6 has 24
-         * layers and a full-fp16 residual was visible as drift in greedy
-         * decode. The intermediates that feed every matmul move to fp16:
-         *   x_rms_dev = rmsnorm(x)  → input to q/k/v + gate/up
-         *   q_dev     = attn(x_rms) → input to o_proj
-         * matmul's fp16 fast path then skips both the f32→f16 input
-         * conversion and the f16→f32 output conversion on those edges. */
+        /* x_dev (the residual stream) stays fp32. The x_rms/q_dev edge
+         * buffers can be flipped to fp16 with QW36_METAL_FP16_EDGES=1 to
+         * reproduce/bisect #46. This remains opt-in because it currently
+         * changes step-0 logits when fed into MPS half GEMV. */
+        const char *fp16_edges_env = getenv("QW36_METAL_FP16_EDGES");
         const int use_fp16_matmul_edges =
             be->name && strcmp(be->name, "metal") == 0 &&
-            fp16_weights_env && atoi(fp16_weights_env) != 0;
+            fp16_weights_env && atoi(fp16_weights_env) != 0 &&
+            fp16_edges_env && atoi(fp16_edges_env) != 0;
         const qw36_dtype edge_dtype =
             use_fp16_matmul_edges ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
         const size_t edge_elem_bytes =
             use_fp16_matmul_edges ? sizeof(uint16_t) : sizeof(float);
         st->dev_x_dtype = QW36_DTYPE_F32;
-        /* #46 deferred: flipping x_rms_dev/q_dev to fp16 produces
-         * step-0 logit divergence we haven't root-caused (suspect MPS
-         * GEMV interaction with fp16 input read from a kernel-written
-         * buffer that was just rmsnormed). Kernels keep their dtype
-         * params so flipping back is one line, but until the diverge is
-         * understood the state must stay fp32 to preserve correctness. */
-        (void)edge_elem_bytes; (void)edge_dtype;
-        st->dev_x_dtype = QW36_DTYPE_F32;
         st->x_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
-        st->x_rms_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
-        st->q_dev = be->alloc(ctx, q_dim * sizeof(float), QW36_DTYPE_F32);
+        st->x_rms_dev = be->alloc(ctx, hidden * edge_elem_bytes, edge_dtype);
+        st->q_dev = be->alloc(ctx, q_dim * edge_elem_bytes, edge_dtype);
         st->k_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->v_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->attn_scores_dev = be->alloc(ctx,

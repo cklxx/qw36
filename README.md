@@ -128,6 +128,7 @@ Runtime and debug knobs are read at startup unless noted otherwise:
 |------------------------------|-------------------------------------------------------------------------------------------------|
 | `QW36_METAL_FP16_WEIGHTS=1`  | Metal only. Materialize large lazy weights as fp16 and dispatch MPS half GEMV. Typical Qwen3.5-0.8B-Q4_K_M decode improves from ~55 tok/s to ~83 tok/s. |
 | `QW36_METAL_FP16_KV=1`       | Metal only. Store the persistent KV cache as fp16. Long-context decode benefits because attention scans half the cache bytes. Enabled by default when fp16 weights are enabled unless explicitly set to `0`. |
+| `QW36_METAL_FP16_EDGES=1`    | Metal diagnostic. Store `x_rms_dev` and `q_dev` as fp16 when fp16 weights are enabled. Currently reproduces the #46 step-0 divergence, so it is off by default. |
 | `QW36_METAL_QUANT_GPU=1`     | Metal only. Use GPU-native quant matmul instead of host fp32/fp16 materialization. This saves roughly 1 GB RAM on the 0.8B model and currently runs around 40 tok/s, so it is an opt-in low-memory path. |
 | `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `||x||` and the first residual components before/after each block. Useful for bisecting the first divergent layer. |
 | `QW36_MAX_LAYERS=<n>`        | Stop forward after the first `n` layers. Used with layer traces for range bisection. |
