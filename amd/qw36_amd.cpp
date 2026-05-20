@@ -845,6 +845,76 @@ done:
     amd_free(ctx, gate);
 }
 
+/* Gated Delta Rule step — HIP fp32 port matching cuda_gdr_step.
+ * See cuda/qw36_cuda.cu for the algorithm reference. */
+__global__ static void qw36_gated_delta_step_kernel(
+    const float *q, const float *k, const float *v,
+    const float *g, const float *beta,
+    const float *state_in,
+    float *y, float *state_out,
+    int T, int Hk, int Hv, int Dk, int Dv)
+{
+    int n      = blockIdx.x;
+    int b_idx  = n / Hv;
+    int hv_idx = n % Hv;
+    int hk_idx = hv_idx / (Hv / Hk);
+    int dv_idx = threadIdx.x;
+    if (dv_idx >= Dv) return;
+
+    const float *q_ = q + (size_t)b_idx * T * Hk * Dk + hk_idx * Dk;
+    const float *k_ = k + (size_t)b_idx * T * Hk * Dk + hk_idx * Dk;
+    const float *v_ = v + (size_t)b_idx * T * Hv * Dv + hv_idx * Dv;
+    float       *y_ = y + (size_t)b_idx * T * Hv * Dv + hv_idx * Dv;
+    const float *g_    = g    + (size_t)b_idx * T * Hv;
+    const float *beta_ = beta + (size_t)b_idx * T * Hv;
+
+    float state[256];
+    const float *i_state = state_in + ((size_t)n * Dv + dv_idx) * Dk;
+    for (int j = 0; j < Dk; j++) state[j] = i_state[j];
+
+    for (int t = 0; t < T; t++) {
+        float g_val = g_[hv_idx];
+        float kv_mem = 0.0f;
+        for (int j = 0; j < Dk; j++) {
+            state[j] *= g_val;
+            kv_mem  += state[j] * k_[j];
+        }
+        float delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+        float out = 0.0f;
+        for (int j = 0; j < Dk; j++) {
+            state[j] += k_[j] * delta;
+            out     += state[j] * q_[j];
+        }
+        y_[dv_idx] = out;
+
+        q_    += Hk * Dk; k_    += Hk * Dk;
+        v_    += Hv * Dv; y_    += Hv * Dv;
+        g_    += Hv;      beta_ += Hv;
+    }
+
+    float *o_state = state_out + ((size_t)n * Dv + dv_idx) * Dk;
+    for (int j = 0; j < Dk; j++) o_state[j] = state[j];
+}
+
+static void amd_gdr_step(qw36_gpu_ctx *ctx,
+                         qw36_gpu_buf *y, qw36_gpu_buf *state_out,
+                         qw36_gpu_buf *q, qw36_gpu_buf *k, qw36_gpu_buf *v,
+                         qw36_gpu_buf *g, qw36_gpu_buf *beta,
+                         qw36_gpu_buf *state_in,
+                         uint32_t T, uint32_t Hk, uint32_t Hv,
+                         uint32_t Dk, uint32_t Dv)
+{
+    if (!ctx || !y || !state_out || !q || !k || !v || !g || !beta || !state_in) return;
+    qw36_gated_delta_step_kernel<<<(int)Hv, (int)Dv, 0, ctx->stream>>>(
+        (const float *)q->dptr, (const float *)k->dptr, (const float *)v->dptr,
+        (const float *)g->dptr, (const float *)beta->dptr,
+        (const float *)state_in->dptr,
+        (float *)y->dptr, (float *)state_out->dptr,
+        (int)T, (int)Hk, (int)Hv, (int)Dk, (int)Dv);
+    hipStreamSynchronize(ctx->stream);
+}
+
 static void amd_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf *y, uint32_t n)
 {
     if (!ctx || !x || !y || n == 0) return;

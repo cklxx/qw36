@@ -225,6 +225,80 @@ kernel void qw36_dn_gated_rmsnorm_f32(
     y[gid] = gate * x[gid] * scale * w[d];
 }
 
+kernel void qw36_compute_g_beta_norm_qk(
+    device float       *q_out     [[buffer(0)]],
+    device float       *k_out     [[buffer(1)]],
+    device float       *v_out     [[buffer(2)]],
+    device float       *g_out     [[buffer(3)]],
+    device float       *beta_out  [[buffer(4)]],
+    device const float *qkv       [[buffer(5)]],
+    device const float *alpha_raw [[buffer(6)]],
+    device const float *beta_raw  [[buffer(7)]],
+    device const float *dt_bias   [[buffer(8)]],
+    device const float *a_log     [[buffer(9)]],
+    constant uint      &Hk        [[buffer(10)]],
+    constant uint      &Hv        [[buffer(11)]],
+    constant uint      &Dk        [[buffer(12)]],
+    constant uint      &Dv        [[buffer(13)]],
+    uint                gid       [[thread_position_in_grid]])
+{
+    uint q_total = Hk * Dk;
+    uint v_total = Hv * Dv;
+    uint group = (Hk == 0) ? 1 : (Hv / Hk);
+    if (group == 0) group = 1;
+
+    if (gid < q_total) {
+        uint h = gid / Dk;
+        uint d = gid - h * Dk;
+        device const float *qh = qkv + h * Dk;
+        device const float *kh = qkv + q_total + h * Dk;
+        float qss = 0.0f;
+        float kss = 0.0f;
+        for (uint i = 0; i < Dk; ++i) {
+            float qv = qh[i];
+            float kv = kh[i];
+            qss += qv * qv;
+            kss += kv * kv;
+        }
+        q_out[gid] = qh[d] * rsqrt(qss + 1.0e-12f) / sqrt(float(Dk));
+        k_out[gid] = kh[d] * rsqrt(kss + 1.0e-12f);
+    }
+
+    if (gid < v_total) {
+        uint raw_v = gid / Dv;
+        uint d = gid - raw_v * Dv;
+        uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+        v_out[grouped_v * Dv + d] = qkv[q_total * 2 + raw_v * Dv + d];
+    }
+
+    if (gid < Hv) {
+        uint raw_v = gid;
+        uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+        float av = alpha_raw[raw_v] + dt_bias[raw_v];
+        float softplus = av > 20.0f ? av : log(1.0f + exp(av));
+        g_out[grouped_v] = exp(-exp(a_log[raw_v]) * softplus);
+        beta_out[grouped_v] = 1.0f / (1.0f + exp(-beta_raw[raw_v]));
+    }
+}
+
+kernel void qw36_dn_reorder_grouped_y_to_raw_f32(
+    device float       *y_raw     [[buffer(0)]],
+    device const float *y_grouped [[buffer(1)]],
+    constant uint      &Hk        [[buffer(2)]],
+    constant uint      &Hv        [[buffer(3)]],
+    constant uint      &Dv        [[buffer(4)]],
+    uint                gid       [[thread_position_in_grid]])
+{
+    uint total = Hv * Dv;
+    if (gid >= total) return;
+    uint raw_v = gid / Dv;
+    uint d = gid - raw_v * Dv;
+    uint group = (Hk == 0) ? 1 : (Hv / Hk);
+    if (group == 0) group = 1;
+    uint grouped_v = (Hv % Hk == 0) ? ((raw_v % Hk) * group + raw_v / Hk) : raw_v;
+    y_raw[gid] = y_grouped[grouped_v * Dv + d];
+}
+
 /* ---------------------------------------------------------------- */
 /* Residual add                                                      */
 /* ---------------------------------------------------------------- */

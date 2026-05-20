@@ -27,7 +27,9 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> matmul;
     id<MTLComputePipelineState> silu_mul;
     id<MTLComputePipelineState> dn_conv1d_silu;
+    id<MTLComputePipelineState> dn_prep_gdr;
     id<MTLComputePipelineState> dn_gated_delta;
+    id<MTLComputePipelineState> dn_reorder_gdr_y;
     id<MTLComputePipelineState> dn_gated_rmsnorm;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> embedding_lookup;
@@ -461,7 +463,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->matmul           = metal_make_pipeline(ctx, @"qw36_matmul_f32", err, err_cap);
     ctx->silu_mul         = metal_make_pipeline(ctx, @"qw36_silu_mul_f32", err, err_cap);
     ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
-    ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_dn_gated_delta_f32", err, err_cap);
+    ctx->dn_prep_gdr      = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk", err, err_cap);
+    ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_gated_delta_step_f32", err, err_cap);
+    ctx->dn_reorder_gdr_y = metal_make_pipeline(ctx, @"qw36_dn_reorder_grouped_y_to_raw_f32", err, err_cap);
     ctx->dn_gated_rmsnorm = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f32", err, err_cap);
     ctx->residual_add     = metal_make_pipeline(ctx, @"qw36_residual_add_f32", err, err_cap);
     ctx->embedding_lookup = metal_make_pipeline(ctx, @"qw36_embedding_lookup_f32", err, err_cap);
@@ -473,6 +477,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->silu_mul ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
+        !ctx->dn_prep_gdr || !ctx->dn_reorder_gdr_y ||
         !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine) {
@@ -484,7 +489,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->embedding_lookup = nil;
         ctx->residual_add = nil;
         ctx->dn_gated_rmsnorm = nil;
+        ctx->dn_reorder_gdr_y = nil;
         ctx->dn_gated_delta = nil;
+        ctx->dn_prep_gdr = nil;
         ctx->dn_conv1d_silu = nil;
         ctx->silu_mul = nil;
         ctx->matmul = nil;
@@ -516,7 +523,9 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->embedding_lookup = nil;
     ctx->residual_add = nil;
     ctx->dn_gated_rmsnorm = nil;
+    ctx->dn_reorder_gdr_y = nil;
     ctx->dn_gated_delta = nil;
+    ctx->dn_prep_gdr = nil;
     ctx->dn_conv1d_silu = nil;
     ctx->silu_mul = nil;
     ctx->matmul = nil;
