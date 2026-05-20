@@ -200,7 +200,7 @@ QW36_METAL_FP16_WEIGHTS=1 ./qw36_metal -m models/Qwen3.5-0.8B-Q4_K_M.gguf \
 ./qw36_dump_tensor models/Qwen3.5-0.8B-Q4_K_M.gguf token_embd.weight 8 9419
 ```
 
-## 2026-05-20 push to 200 tok/s — in progress
+## 2026-05-20 push to 200 tok/s — session 1 closed at 85 tok/s
 
 #31 root cause: **Qwen3.5 vanilla attention has Q-gate** (q_proj output =
 2*n_heads*head_dim; attn_out *= sigmoid(gate) before o_proj). Detected
@@ -247,3 +247,95 @@ Each step is independently committable; ordered by est ROI / hour:
 
 Combined estimate: 85 + 7 + 25 + 5 + 30 ≈ 150 tok/s. Hitting 200 needs
 all of those plus removing some per-dispatch overhead.
+
+## 2026-05-20 session closeout
+
+Final state: **85 tok/s sustained** on `QW36_METAL_FP16_WEIGHTS=1`, correct
+output (Hello + 古诗 + chat-templated prompts all pass; precision and
+golden tests green).
+
+### Wins this session
+- **#31 correctness root-caused + fixed**: Qwen3.5/3.6 vanilla attention
+  has a Q-gate (q_proj output = `2 * n_heads * head_dim`, attn_out is
+  multiplied by `sigmoid(q_gate)` before o_proj). Confirmed against
+  `attn_output_gate: true` in Qwen3.5-0.8B config. CPU + Metal both
+  produce `《秋夜》` 七言绝句 on the Chinese poem prompt.
+- **Metal fused decode attention writes gate-corrected fp16/fp32 y** via
+  `qw36_store_scalar(y, y_dtype, ...)` (commit 14b1a06 + 2fec86f).
+- **GGUF-native quant matmul kernels** (Q4_K/Q5_K/Q6_K/Q8_0) ported from
+  agent-infer with sub-block scale caching (commits e28726d + 564eee4).
+  Currently opt-in at 50 tok/s; needs sub-block parallel + float4 loads
+  before it beats MPS fp16 gemv.
+- **fp16 matmul edges plumbing**: matmul fp16 path handles all 4 in/out
+  dtype combos; rmsnorm / residual_add / silu_mul / embed_lookup /
+  fused decode attention all dtype-aware via load/store_scalar
+  (commits 678900d / a79d8b9 / 684b730 / 73ec828 / 2fd2531 / 2fec86f).
+- **MPS weight matrix wrappers cached** (codex b63285b) — keeps the
+  MPSMatrix objects across decode steps.
+- **f32→f16 input conversion deduped** within q/k/v + gate/up triplets
+  (commits 9d06231 + 720ac5d).
+- **Architecture split #36** (codex eb68b0f): qw36.c 2408 → 1193 lines.
+  qw36_dequant.c + qw36_ops.c + qw36_attn_*.c + qw36_moe.c each own
+  their part of the forward.
+- **Fused gate_up MLP matmul** (codex 29cb7ca): single MPS gemv writes
+  both gate and up into one buffer, halves MLP matmul dispatches.
+- **Tools**: tools/mlx_dump_intermediates.py + tools/diff_layers.py
+  (layer-by-layer fp32 cross-check against MLX reference), kernel
+  golden test, fp16 root-cause doc.
+
+### What we tried but parked: fp16 residual state (#46/#48)
+- Switching x_rms_dev or q_dev from fp32 to fp16 produces step-0 logit
+  divergence under `QW36_METAL_FP16_WEIGHTS=1` (top-1 'Hello' →
+  ',' becomes 'uela').
+- Bisected with a custom Metal fp16 GEMV (commit ec1fbab) — reproduces
+  the same divergence, so it is **not** an MPS fp16 ABI issue. It is
+  fp16 precision drift at attention output (q_dev): the fused decode
+  kernel computes acc in fp32 then stores fp16, and the cumulative
+  loss across 6 vanilla layers × 1 fp16 store per layer is enough to
+  flip the top-1 logit in a 152k-vocab argmax.
+- agent-infer ducks this with bf16 storage + `compiled_precise_*`
+  functions that upcast to fp32 inside fused operators. We do upcast
+  inside the fused attn kernel, but the *store boundary* is still fp16
+  and feeds the next op directly.
+- **Fix path** (next session): keep q_dev fp32; only flip x_rms_dev to
+  fp16 (verified correct — same logit). Need to diagnose why
+  x_rms_dev fp16 was *slower* than fp32 baseline despite saving the
+  f32→f16 input conversion per matmul.
+
+### What we learned reading agent-infer
+- They use **bfloat16** end-to-end on the residual stream and KV cache,
+  not fp16. bf16's 8-bit exponent matches fp32's range and avoids
+  saturation, while bf16's 7-bit mantissa is *less* precise than
+  fp16's 10-bit. So bf16 wins on stability, not raw precision.
+- Compiled precise functions (`precise_sigmoid_mul`, `precise_swiglu`)
+  upcast to fp32 inside, output bf16 — the upcast is what preserves
+  correctness across 24 layers.
+- `verify_quantized_matmul_cpp` is their decode-mode quant matmul
+  kernel; for batch=1 it routes through MLX's standard quantised
+  matmul (also a custom kernel, not MPS gemv).
+- They concatenate `gate_proj + up_proj` at load to skip one matmul
+  per layer (#47 — we did this).
+
+### Path to 200 tok/s (open follow-up)
+Ordered by expected ROI / hour, summing to ~130-150 tok/s realistically:
+
+1. **#48 fp16 attn store fix** — keep q_dev fp32, x_rms_dev fp16 with
+   the right code path. Diagnose the slowdown first; should land
+   +10-15 tok/s.
+2. **bf16 state buffers + bf16 weight materialise** — switch
+   `lazy_materialize_f16` to a bf16 variant; matmul fp16 fast path
+   already accepts dtype via load/store_scalar. Expect +5 tok/s and
+   the multi-layer drift goes away.
+3. **#39 quant kernel optimisation** — float4 loads + multi-row TG so
+   the per-row dequant+gemv beats MPS fp16 gemv. Unlocks `QW36_METAL_QUANT_GPU=1`
+   as the default fast path (saves ~1 GB ram).
+4. **Custom fp16/bf16 GEMV that beats MPS** + persistent compute
+   encoder across rmsnorm / matmul / residual_add. Eliminates the
+   per-call MPS encoder bring-up — about 0.5ms / token.
+5. **agent-infer-style verify_quantized_matmul** port — for prefill
+   only at first; decode benefit smaller.
+
+Realistic horizon: 150 tok/s with another 1-2 dedicated sessions.
+200 tok/s parity with MLX is a multi-week project (MLX's lazy graph
+compiler does a lot we cannot reproduce without writing a kernel
+compiler ourselves).
