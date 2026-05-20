@@ -165,6 +165,37 @@ static int cuda_quant_geom(qw36_dtype dtype, size_t *qk, size_t *bytes_per_block
     }
 }
 
+static size_t cuda_dtype_bytes(qw36_dtype dtype)
+{
+    switch (dtype) {
+        case QW36_DTYPE_F32:  return 4;
+        case QW36_DTYPE_F16:  return 2;
+        case QW36_DTYPE_BF16: return 2;
+        default: return 0;
+    }
+}
+
+static uint32_t cuda_matrix_rows_from_bytes(const qw36_gpu_buf *buf, uint32_t cols)
+{
+    if (!buf || cols == 0) return 0;
+
+    size_t row_bytes = 0;
+    if (cuda_dtype_is_host_dequant(buf->dtype)) {
+        size_t qk, bpb;
+        if (cuda_quant_geom(buf->dtype, &qk, &bpb) || cols % qk != 0)
+            return 0;
+        row_bytes = ((size_t)cols / qk) * bpb;
+    } else {
+        const size_t elem_bytes = cuda_dtype_bytes(buf->dtype);
+        if (elem_bytes == 0) return 0;
+        row_bytes = (size_t)cols * elem_bytes;
+    }
+
+    if (row_bytes == 0 || buf->bytes % row_bytes != 0) return 0;
+    const size_t rows = buf->bytes / row_bytes;
+    return rows <= UINT32_MAX ? (uint32_t)rows : 0;
+}
+
 static int cuda_dequant_row(const qw36_gpu_buf *buf, size_t row_idx,
                             size_t cols, float *out)
 {
@@ -583,9 +614,16 @@ static void cuda_attention(qw36_gpu_ctx *ctx,
         !k_cache || !v_cache || n_heads == 0 || n_kv == 0 || head_dim == 0)
         return;
 
+    const uint32_t q_rows = cuda_matrix_rows_from_bytes(wq, hidden);
+    if (q_rows && q_rows % head_dim == 0) {
+        const uint32_t inferred_heads = q_rows / head_dim;
+        if (inferred_heads) n_heads = inferred_heads;
+    }
+
     uint32_t q_len = n_heads * head_dim;
     uint32_t kv_len = n_kv * head_dim;
     uint32_t positions = seq_pos + 1;
+    if (y->bytes < (size_t)q_len * sizeof(float)) return;
     qw36_gpu_buf *q = cuda_alloc(ctx, (size_t)q_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *k = cuda_alloc(ctx, (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *v = cuda_alloc(ctx, (size_t)kv_len * sizeof(float), QW36_DTYPE_F32);
