@@ -84,6 +84,62 @@ other agent picks up from there.
 | 2026-05-20 | Codex  | metal     | -        | init/destroy, host↔device, rmsnorm, matmul, embedding, residual, silu·mul, head_norm_rope, kv_append, attn_scores/softmax/combine kernels — all smoke-tested. |
 | 2026-05-20 | Codex  | cuda      | -        | init/destroy, memory ops, mirror of metal kernels (qw36_rmsnorm_kernel, qw36_matmul_kernel, qw36_head_norm_rope_kernel, etc). Not compiled on this Apple machine. |
 | 2026-05-20 | Codex  | amd       | -        | Same set as cuda, HIP variant. |
+| 2026-05-20 | Claude | engine    | 218fb50  | matmul→backend (10x speedup, Metal hits 11 tok/s). |
+| 2026-05-20 | Claude | engine    | a7e691c  | tokenizer special-token detection (`<|im_start|>`). |
+| 2026-05-20 | Claude | engine    | c479cad  | Q5_K dequant (DN was reading zeros silently). |
+| 2026-05-20 | Claude | engine    | 727bb10  | mRoPE per-axis sections from `qwen35.rope.dimension_sections`. |
+| 2026-05-20 | Codex  | engine    | d24bbbd  | persistent GPU state (task #28): residual / rms / Q/K/V / KV cache / MLP scratch / logits live on device. DN/MoE still bridge through host. |
+
+## Reference: agent-infer Metal kernel for Gated Delta Rule
+
+For task #22, agent-infer's exact Metal kernel for the per-step gated
+delta rule lives at:
+
+  `../agent-infer/crates/mlx-sys/src/mlx_qwen35_model.cpp:203-275`
+
+It's a `fast::metal_kernel("gated_delta_step", ...)` call. Key facts:
+
+- **State layout**: `[B, Hv, Dv, Dk]` (Dk innermost). Different from our
+  CPU code's `[Hv, Dk, Dv]` — adapt when porting to GPU.
+- **Threadgroup**: x=32 (simd lanes split Dk), y=Dv, z=B*Hv.
+- **Per-thread state**: `Dk/32` floats; uses `simd_sum` for cross-lane
+  reductions on kv_mem and the output dot product.
+- **bf16 in / fp32 state / bf16 out**.
+- **GQA**: `hk_idx = hv_idx / (Hv/Hk)` (group, not modulo).
+
+QK norm scaling (`mlx_qwen35_model.cpp:395`):
+```
+q = fast::rms_norm(q_raw, std::nullopt, 1e-6f) * (1/sqrt(d))²
+k = fast::rms_norm(k_raw, std::nullopt, 1e-6f) * (1/sqrt(d))
+```
+Equivalent to: L2-normalize then `q *= 1/sqrt(d)` (attention temperature).
+
+`compute_g_beta` (`mlx_qwen35_model.cpp:377`):
+```
+ab = a_raw + dt_bias
+softplus = ab if ab > 20 else log1p(exp(ab))
+g = exp(neg_exp_a * softplus)         # neg_exp_a = -exp(a_log), precomputed
+beta = sigmoid(b_raw)
+```
+
+## Path to 85 tok/s
+
+Current state on M-class GPU, Qwen3.5-0.8B-Q4_K_M:
+- CPU build:   ~1.7 tok/s
+- Metal build: ~12 tok/s (after #28 GPU-resident state)
+- Target:      85+ tok/s (agent-infer)
+
+Remaining bottleneck: DN (18/24 layers) and MoE still bridge through host
+in qw36_forward, forcing many GPU→CPU→GPU sync points per token.
+
+Open work:
+1. **task #22**: port gated_delta_step to Metal (kernel source available
+   above) so the DN block stays on GPU.
+2. **task #23**: same for MoE expert dispatch.
+3. Wire `backend->begin_batch` / `end_batch` around the whole forward
+   once no host bridges remain — single MTLCommandBuffer per token.
+4. **task #21**: rmsnorm / residual_add / swiglu / attention all via
+   `_dev` variants exclusively (some already done in d24bbbd).
 
 ## Known blocker for Qwen 3.6 end-to-end
 
