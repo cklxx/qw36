@@ -28,6 +28,9 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> f32_to_f16;
     id<MTLComputePipelineState> f16_to_f32;
     id<MTLComputePipelineState> silu_mul;
+    id<MTLComputePipelineState> moe_route;
+    id<MTLComputePipelineState> moe_gate_up;
+    id<MTLComputePipelineState> moe_down_combine;
     id<MTLComputePipelineState> dn_conv1d_silu;
     id<MTLComputePipelineState> dn_prep_gdr;
     id<MTLComputePipelineState> dn_gated_delta;
@@ -60,6 +63,11 @@ struct qw36_gpu_ctx {
 
     qw36_gpu_buf *matmul_x_f16_scratch;
     qw36_gpu_buf *matmul_y_f16_scratch;
+    qw36_gpu_buf *moe_router_scratch;
+    qw36_gpu_buf *moe_probs_scratch;
+    qw36_gpu_buf *moe_idx_scratch;
+    qw36_gpu_buf *moe_act_scratch;
+    qw36_gpu_buf *moe_shared_scratch;
     qw36_gpu_buf *attn_q_scratch;
     qw36_gpu_buf *attn_k_scratch;
     qw36_gpu_buf *attn_v_scratch;
@@ -492,6 +500,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->f32_to_f16       = metal_make_pipeline(ctx, @"qw36_f32_to_f16_f32", err, err_cap);
     ctx->f16_to_f32       = metal_make_pipeline(ctx, @"qw36_f16_to_f32_f32", err, err_cap);
     ctx->silu_mul         = metal_make_pipeline(ctx, @"qw36_silu_mul_f32", err, err_cap);
+    ctx->moe_route        = metal_make_pipeline(ctx, @"qw36_moe_route_f32", err, err_cap);
+    ctx->moe_gate_up      = metal_make_pipeline(ctx, @"qw36_moe_gate_up_f32", err, err_cap);
+    ctx->moe_down_combine = metal_make_pipeline(ctx, @"qw36_moe_down_combine_f32", err, err_cap);
     ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
     ctx->dn_prep_gdr      = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk", err, err_cap);
     ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_gated_delta_step_f32", err, err_cap);
@@ -509,6 +520,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
         !ctx->f16_to_f32 || !ctx->silu_mul ||
+        !ctx->moe_route || !ctx->moe_gate_up || !ctx->moe_down_combine ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
         !ctx->dn_prep_gdr || !ctx->dn_reorder_gdr_y ||
         !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
@@ -529,6 +541,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->dn_gated_delta = nil;
         ctx->dn_prep_gdr = nil;
         ctx->dn_conv1d_silu = nil;
+        ctx->moe_down_combine = nil;
+        ctx->moe_gate_up = nil;
+        ctx->moe_route = nil;
         ctx->silu_mul = nil;
         ctx->f16_to_f32 = nil;
         ctx->f32_to_f16 = nil;
@@ -566,6 +581,11 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     metal_release_buf(ctx->attn_q_scratch);
     metal_release_buf(ctx->matmul_y_f16_scratch);
     metal_release_buf(ctx->matmul_x_f16_scratch);
+    metal_release_buf(ctx->moe_shared_scratch);
+    metal_release_buf(ctx->moe_act_scratch);
+    metal_release_buf(ctx->moe_idx_scratch);
+    metal_release_buf(ctx->moe_probs_scratch);
+    metal_release_buf(ctx->moe_router_scratch);
     ctx->mps_cache = nil;
     ctx->buf_pool  = nil;
     ctx->attn_combine = nil;
@@ -582,6 +602,9 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->dn_gated_delta = nil;
     ctx->dn_prep_gdr = nil;
     ctx->dn_conv1d_silu = nil;
+    ctx->moe_down_combine = nil;
+    ctx->moe_gate_up = nil;
+    ctx->moe_route = nil;
     ctx->silu_mul = nil;
     ctx->f16_to_f32 = nil;
     ctx->f32_to_f16 = nil;
@@ -1184,6 +1207,86 @@ static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     });
 }
 
+static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x,
+                               qw36_gpu_buf *y, uint32_t n);
+
+static void metal_moe_forward(qw36_gpu_ctx *ctx,
+                              qw36_gpu_buf *y, qw36_gpu_buf *x,
+                              qw36_gpu_buf *router,
+                              qw36_gpu_buf *expert_gate,
+                              qw36_gpu_buf *expert_up,
+                              qw36_gpu_buf *expert_down,
+                              qw36_gpu_buf *shared_gate,
+                              qw36_gpu_buf *shared_up,
+                              qw36_gpu_buf *shared_down,
+                              uint32_t hidden, uint32_t inter,
+                              uint32_t num_experts, uint32_t experts_per_tok,
+                              uint8_t norm_topk)
+{
+    (void)norm_topk;
+    if (!ctx || !y || !x || !router || !expert_gate || !expert_up ||
+        !expert_down || !hidden || !inter || !num_experts || !experts_per_tok)
+        return;
+    if (experts_per_tok > num_experts) experts_per_tok = num_experts;
+
+    qw36_gpu_buf *r = metal_scratch(ctx, &ctx->moe_router_scratch,
+        (size_t)num_experts * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *p = metal_scratch(ctx, &ctx->moe_probs_scratch,
+        (size_t)experts_per_tok * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *idx = metal_scratch(ctx, &ctx->moe_idx_scratch,
+        (size_t)experts_per_tok * sizeof(uint32_t), QW36_DTYPE_F32);
+    qw36_gpu_buf *act = metal_scratch(ctx, &ctx->moe_act_scratch,
+        (size_t)experts_per_tok * inter * sizeof(float), QW36_DTYPE_F32);
+    if (!r || !p || !idx || !act) return;
+
+    metal_matmul(ctx, r, x, router, 1, num_experts, hidden);
+    metal_dispatch_1d(ctx, ctx->moe_route, 1, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:r->mtl   offset:0 atIndex:0];
+        [enc setBuffer:p->mtl   offset:0 atIndex:1];
+        [enc setBuffer:idx->mtl offset:0 atIndex:2];
+        [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
+        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
+    });
+
+    NSUInteger act_n = (NSUInteger)experts_per_tok * inter;
+    metal_dispatch_1d(ctx, ctx->moe_gate_up, act_n, ^(id<MTLComputeCommandEncoder> enc) {
+        uint32_t gate_dtype = (uint32_t)expert_gate->dtype;
+        uint32_t up_dtype = (uint32_t)expert_up->dtype;
+        [enc setBuffer:act->mtl         offset:0 atIndex:0];
+        [enc setBuffer:x->mtl           offset:0 atIndex:1];
+        [enc setBuffer:expert_gate->mtl offset:0 atIndex:2];
+        [enc setBuffer:expert_up->mtl   offset:0 atIndex:3];
+        [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+        [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+        [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+        [enc setBytes:&gate_dtype length:sizeof(gate_dtype) atIndex:8];
+        [enc setBytes:&up_dtype length:sizeof(up_dtype) atIndex:9];
+    });
+
+    metal_dispatch_1d(ctx, ctx->moe_down_combine, hidden, ^(id<MTLComputeCommandEncoder> enc) {
+        uint32_t down_dtype = (uint32_t)expert_down->dtype;
+        [enc setBuffer:y->mtl           offset:0 atIndex:0];
+        [enc setBuffer:act->mtl         offset:0 atIndex:1];
+        [enc setBuffer:expert_down->mtl offset:0 atIndex:2];
+        [enc setBuffer:p->mtl           offset:0 atIndex:3];
+        [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+        [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+        [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+        [enc setBytes:&down_dtype length:sizeof(down_dtype) atIndex:8];
+    });
+
+    if (shared_gate && shared_up && shared_down) {
+        qw36_gpu_buf *shared = metal_scratch(ctx, &ctx->moe_shared_scratch,
+            (size_t)hidden * sizeof(float), QW36_DTYPE_F32);
+        if (!shared) return;
+        metal_swiglu(ctx, shared, x, shared_gate, shared_up, shared_down,
+                     hidden, inter);
+        metal_residual_add(ctx, y, shared, hidden);
+    }
+}
+
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf *y, uint32_t n)
 {
     if (!x || !y) return;
@@ -1243,7 +1346,7 @@ static qw36_gpu_backend g_metal_backend = {
     .dn_conv1d_silu    = metal_dn_conv1d_silu,
     .dn_gated_delta    = metal_dn_gated_delta,
     .dn_gated_rmsnorm  = metal_dn_gated_rmsnorm,
-    .moe_forward       = NULL,
+    .moe_forward       = metal_moe_forward,
     .residual_add      = metal_residual_add,
     .embedding_lookup  = metal_embedding_lookup,
 };

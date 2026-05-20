@@ -2555,6 +2555,46 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                 QW36_FORWARD_RETURN(-9);
             }
         }
+        if (gpu_state && !mlp_gpu_done && L->moe_router &&
+            L->moe_expert_gate && L->moe_expert_up && L->moe_expert_down &&
+            eng->backend && eng->backend->rmsnorm &&
+            eng->backend->moe_forward && eng->backend->residual_add) {
+            const qw36_lazy_w *router = (const qw36_lazy_w *)L->moe_router;
+            const qw36_lazy_w *eg = (const qw36_lazy_w *)L->moe_expert_gate;
+            const qw36_lazy_w *eu = (const qw36_lazy_w *)L->moe_expert_up;
+            const qw36_lazy_w *ed = (const qw36_lazy_w *)L->moe_expert_down;
+            const qw36_lazy_w *sg = (const qw36_lazy_w *)L->moe_shared_gate;
+            const qw36_lazy_w *su = (const qw36_lazy_w *)L->moe_shared_up;
+            const qw36_lazy_w *sd = (const qw36_lazy_w *)L->moe_shared_down;
+            const uint32_t mi = c->moe_intermediate_size
+                              ? c->moe_intermediate_size
+                              : (uint32_t)eg->rows;
+            if (router->gpu_buf && eg->gpu_buf && eu->gpu_buf && ed->gpu_buf &&
+                (!sg || (sg->gpu_buf && su && su->gpu_buf && sd && sd->gpu_buf))) {
+                ENSURE_X_DEV();
+                int grc = 0;
+                grc |= rmsnorm_dispatch_dev(X_RMS_DEV, X_DEV,
+                                            (const float *)L->post_attn_layernorm,
+                                            hidden, c->rms_norm_eps);
+                if (grc == 0) {
+                    eng->backend->moe_forward(eng->ctx, X_RMS_DEV, X_RMS_DEV,
+                        router->gpu_buf, eg->gpu_buf, eu->gpu_buf, ed->gpu_buf,
+                        sg ? sg->gpu_buf : NULL,
+                        su ? su->gpu_buf : NULL,
+                        sd ? sd->gpu_buf : NULL,
+                        (uint32_t)hidden, mi, c->moe_num_experts,
+                        c->moe_experts_per_tok, c->moe_norm_topk_prob);
+                    grc |= residual_add_dispatch_dev(X_DEV, X_RMS_DEV, hidden);
+                }
+                if (grc == 0) {
+                    x_dev_valid = 1;
+                    x_host_valid = 0;
+                    mlp_gpu_done = 1;
+                } else {
+                    QW36_FORWARD_RETURN(-10);
+                }
+            }
+        }
 
         if (!mlp_gpu_done) {
             ENSURE_X_HOST();

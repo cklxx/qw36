@@ -119,6 +119,99 @@ kernel void qw36_silu_mul_f32(
     gate_io[tid] = (g / (1.0f + exp(-g))) * up[tid];
 }
 
+kernel void qw36_moe_route_f32(
+    device const float *router_logits [[buffer(0)]],
+    device float       *top_probs     [[buffer(1)]],
+    device uint        *top_idx       [[buffer(2)]],
+    constant uint      &num_experts   [[buffer(3)]],
+    constant uint      &top_k         [[buffer(4)]],
+    uint                tid           [[thread_position_in_grid]])
+{
+    if (tid != 0 || top_k == 0) return;
+    for (uint k = 0; k < top_k; ++k) {
+        float best = -INFINITY;
+        uint best_i = 0;
+        for (uint e = 0; e < num_experts; ++e) {
+            float v = router_logits[e];
+            bool used = false;
+            for (uint j = 0; j < k; ++j) used = used || (top_idx[j] == e);
+            if (!used && v > best) {
+                best = v;
+                best_i = e;
+            }
+        }
+        top_idx[k] = best_i;
+        top_probs[k] = best;
+    }
+
+    float maxv = top_probs[0];
+    for (uint k = 1; k < top_k; ++k) maxv = max(maxv, top_probs[k]);
+    float sum = 0.0f;
+    for (uint k = 0; k < top_k; ++k) {
+        float p = exp(top_probs[k] - maxv);
+        top_probs[k] = p;
+        sum += p;
+    }
+    float inv_sum = 1.0f / sum;
+    for (uint k = 0; k < top_k; ++k) top_probs[k] *= inv_sum;
+}
+
+kernel void qw36_moe_gate_up_f32(
+    device float       *act          [[buffer(0)]],
+    device const float *x            [[buffer(1)]],
+    device const uchar *expert_gate  [[buffer(2)]],
+    device const uchar *expert_up    [[buffer(3)]],
+    device const uint  *top_idx      [[buffer(4)]],
+    constant uint      &hidden       [[buffer(5)]],
+    constant uint      &inter        [[buffer(6)]],
+    constant uint      &top_k        [[buffer(7)]],
+    constant uint      &gate_dtype   [[buffer(8)]],
+    constant uint      &up_dtype     [[buffer(9)]],
+    uint                gid          [[thread_position_in_grid]])
+{
+    uint total = top_k * inter;
+    if (gid >= total) return;
+    uint t = gid / inter;
+    uint i = gid - t * inter;
+    uint e = top_idx[t];
+    ulong base = (ulong)e * (ulong)inter * (ulong)hidden + (ulong)i * (ulong)hidden;
+
+    float g = 0.0f;
+    float u = 0.0f;
+    for (uint c = 0; c < hidden; ++c) {
+        float xv = x[c];
+        g += xv * qw36_load_scalar(expert_gate, gate_dtype, uint(base + c));
+        u += xv * qw36_load_scalar(expert_up, up_dtype, uint(base + c));
+    }
+    act[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
+kernel void qw36_moe_down_combine_f32(
+    device float       *y             [[buffer(0)]],
+    device const float *act           [[buffer(1)]],
+    device const uchar *expert_down   [[buffer(2)]],
+    device const float *top_probs     [[buffer(3)]],
+    device const uint  *top_idx       [[buffer(4)]],
+    constant uint      &hidden        [[buffer(5)]],
+    constant uint      &inter         [[buffer(6)]],
+    constant uint      &top_k         [[buffer(7)]],
+    constant uint      &down_dtype    [[buffer(8)]],
+    uint                d             [[thread_position_in_grid]])
+{
+    if (d >= hidden) return;
+    float out = 0.0f;
+    for (uint t = 0; t < top_k; ++t) {
+        uint e = top_idx[t];
+        ulong base = (ulong)e * (ulong)hidden * (ulong)inter + (ulong)d * (ulong)inter;
+        device const float *a = act + (ulong)t * inter;
+        float acc = 0.0f;
+        for (uint i = 0; i < inter; ++i)
+            acc += a[i] * qw36_load_scalar(expert_down, down_dtype, uint(base + i));
+        out += top_probs[t] * acc;
+    }
+    y[d] = out;
+}
+
 /* ---------------------------------------------------------------- */
 /* DeltaNet decode helpers. State layout follows common/qw36.c:      */
 /* conv_state [kernel-1, channels], delta_state [Hv, Dk, Dv].        */
