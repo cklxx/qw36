@@ -27,13 +27,19 @@ extern "C" {
 /* Config                                                                 */
 /* --------------------------------------------------------------------- */
 
+/* Storage dtype. Numeric values intentionally mirror GGML_TYPE_* so the
+ * GGUF loader can pass ggml_type through unchanged when there's a 1:1
+ * mapping. QW36_DTYPE_UNSUPPORTED is the sentinel for "we know about it
+ * but can't load it yet". */
 typedef enum {
-    QW36_DTYPE_F32 = 0,
-    QW36_DTYPE_F16 = 1,
-    QW36_DTYPE_BF16 = 2,
-    QW36_DTYPE_Q8_0 = 8,
+    QW36_DTYPE_F32  = 0,
+    QW36_DTYPE_F16  = 1,
+    QW36_DTYPE_BF16 = 30,
     QW36_DTYPE_Q4_K = 12,
-    QW36_DTYPE_Q2_K = 10
+    QW36_DTYPE_Q6_K = 14,
+    QW36_DTYPE_Q8_0 = 8,
+    QW36_DTYPE_Q2_K = 10,
+    QW36_DTYPE_UNSUPPORTED = 0xFF
 } qw36_dtype;
 
 /* Per-layer attention flavor. Linear-attention layers (Gated DeltaNet) are

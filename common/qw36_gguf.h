@@ -21,6 +21,7 @@ typedef struct qw36_gguf_file qw36_gguf_file;
 typedef struct {
     const char *name;
     qw36_dtype  dtype;
+    uint32_t    ggml_type;  /* raw GGML_TYPE_* — useful for diagnostics */
     uint32_t    n_dims;
     uint64_t    dims[4];
     const void *data;     /* mmap-backed; lifetime = file */
@@ -39,6 +40,11 @@ int qw36_gguf_get_str(const qw36_gguf_file *f, const char *key,
 /* Tensor lookup. Returned struct points into the file (no copy). */
 int qw36_gguf_get_tensor(const qw36_gguf_file *f, const char *name,
                          qw36_gguf_tensor *out);
+
+/* Enumeration. Returns total tensor count; fill (*out) at index i. */
+size_t qw36_gguf_tensor_count(const qw36_gguf_file *f);
+int    qw36_gguf_get_tensor_by_index(const qw36_gguf_file *f, size_t i,
+                                     qw36_gguf_tensor *out);
 
 #ifdef __cplusplus
 }

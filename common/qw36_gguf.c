@@ -288,7 +288,7 @@ static size_t tensor_bytes(uint32_t ggml_type, uint64_t numel) {
     }
 }
 
-/* Map ggml type → qw36 dtype enum. Unknown ⇒ F32 (caller should check). */
+/* Map ggml type → qw36 dtype enum. Unknown ⇒ QW36_DTYPE_UNSUPPORTED. */
 static qw36_dtype ggml_to_qw36(uint32_t t) {
     switch (t) {
         case GGML_TYPE_F32:  return QW36_DTYPE_F32;
@@ -296,8 +296,9 @@ static qw36_dtype ggml_to_qw36(uint32_t t) {
         case GGML_TYPE_BF16: return QW36_DTYPE_BF16;
         case GGML_TYPE_Q8_0: return QW36_DTYPE_Q8_0;
         case GGML_TYPE_Q4_K: return QW36_DTYPE_Q4_K;
+        case GGML_TYPE_Q6_K: return QW36_DTYPE_Q6_K;
         case GGML_TYPE_Q2_K: return QW36_DTYPE_Q2_K;
-        default:             return QW36_DTYPE_F32;
+        default:             return QW36_DTYPE_UNSUPPORTED;
     }
 }
 
@@ -369,6 +370,7 @@ qw36_gguf_file *qw36_gguf_open(const char *path, char *err, size_t err_cap)
 
     for (uint64_t i = 0; i < n_kv && !c.overflow; i++) {
         f->kvs[i].key = rd_string(&c);
+        if (!f->kvs[i].key) { c.overflow = 1; break; }
         if (read_value(&c, &f->kvs[i])) break;
         /* Pick up alignment override if present. */
         if (f->kvs[i].key && !strcmp(f->kvs[i].key, "general.alignment") &&
@@ -413,7 +415,9 @@ qw36_gguf_file *qw36_gguf_open(const char *path, char *err, size_t err_cap)
         const uint8_t *p = f->data_start + t->offset;
         if (t->bytes && p + t->bytes > f->map + f->map_len) {
             if (err && err_cap) snprintf(err, err_cap,
-                "tensor '%s' out of bounds", t->name ? t->name : "(null)");
+                "tensor '%s' out of bounds (offset=%llu bytes=%zu)",
+                t->name ? t->name : "(null)",
+                (unsigned long long)t->offset, t->bytes);
             file_destroy(f); return NULL;
         }
         t->data = (const void *)p;
@@ -475,18 +479,37 @@ int qw36_gguf_get_str(const qw36_gguf_file *f, const char *key, const char **out
     return 0;
 }
 
+size_t qw36_gguf_tensor_count(const qw36_gguf_file *f) {
+    return f ? f->n_tensors : 0;
+}
+
+int qw36_gguf_get_tensor_by_index(const qw36_gguf_file *f, size_t i,
+                                  qw36_gguf_tensor *out) {
+    if (!f || i >= f->n_tensors) return -1;
+    const gguf_tensor_info *t = &f->tensors[i];
+    out->name      = t->name;
+    out->dtype     = ggml_to_qw36(t->ggml_type);
+    out->ggml_type = t->ggml_type;
+    out->n_dims    = t->n_dims;
+    memcpy(out->dims, t->dims, sizeof(out->dims));
+    out->data      = t->data;
+    out->nbytes    = t->bytes;
+    return 0;
+}
+
 int qw36_gguf_get_tensor(const qw36_gguf_file *f, const char *name,
                          qw36_gguf_tensor *out)
 {
     for (size_t i = 0; i < f->n_tensors; i++) {
         const gguf_tensor_info *t = &f->tensors[i];
         if (t->name && !strcmp(t->name, name)) {
-            out->name   = t->name;
-            out->dtype  = ggml_to_qw36(t->ggml_type);
-            out->n_dims = t->n_dims;
+            out->name      = t->name;
+            out->dtype     = ggml_to_qw36(t->ggml_type);
+            out->ggml_type = t->ggml_type;
+            out->n_dims    = t->n_dims;
             memcpy(out->dims, t->dims, sizeof(out->dims));
-            out->data   = t->data;
-            out->nbytes = t->bytes;
+            out->data      = t->data;
+            out->nbytes    = t->bytes;
             return 0;
         }
     }

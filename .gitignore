@@ -2,6 +2,9 @@ qw36_cpu
 qw36_amd
 qw36_metal
 qw36_cuda
+qw36_cpu_dbg
+qw36_cpu_asan
+*.dSYM/
 *.o
 *.air
 *.metallib

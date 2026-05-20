@@ -147,6 +147,22 @@ int main(int argc, char **argv) {
     if (!tok) { fprintf(stderr, "qw36: tokenizer: %s\n", err); qw36_engine_close(eng); return 4; }
 
     if (a.info_only) {
+        /* Layer-type detection: vanilla Qwen3 uses blk.X.attn_q.weight per
+         * layer; Qwen3.5/3.6 uses fused attn_qkv + ssm_* (Gated DeltaNet). */
+        const struct qw36_gguf_file *gf = qw36_engine_gguf(eng);
+        int n_layers = (int)qw36_engine_config(eng)->num_hidden_layers;
+        int has_q = 0, has_fused = 0, has_ssm = 0;
+        for (int l = 0; l < n_layers; l++) {
+            char buf[128]; qw36_gguf_tensor t;
+            snprintf(buf, sizeof(buf), "blk.%d.attn_q.weight", l);
+            if (qw36_gguf_get_tensor(gf, buf, &t) == 0) has_q++;
+            snprintf(buf, sizeof(buf), "blk.%d.attn_qkv.weight", l);
+            if (qw36_gguf_get_tensor(gf, buf, &t) == 0) has_fused++;
+            snprintf(buf, sizeof(buf), "blk.%d.ssm_conv1d.weight", l);
+            if (qw36_gguf_get_tensor(gf, buf, &t) == 0) has_ssm++;
+        }
+        fprintf(stderr, "qw36 layer survey: vanilla_q=%d/%d  fused_qkv=%d/%d  ssm=%d/%d\n",
+                has_q, n_layers, has_fused, n_layers, has_ssm, n_layers);
         print_info(eng, tok);
         qw36_tokenizer_free(tok);
         qw36_engine_close(eng);

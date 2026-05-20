@@ -81,6 +81,100 @@ static float load_elem_f32(const void *data, qw36_dtype dt, size_t i) {
     }
 }
 
+/* --------------------------------------------------------------------- */
+/* GGML-style quantized block dequantizers (Q8_0 / Q4_K / Q6_K).          */
+/*                                                                        */
+/* Block layouts mirror llama.cpp's ggml-quants.h. Numeric output matches */
+/* dequantize_row_* in ggml-quants.c so loaded weights are bit-equivalent */
+/* to a fresh load through the upstream library.                         */
+/* --------------------------------------------------------------------- */
+
+#define QW36_QK_K   256
+#define QW36_QK8_0  32
+
+static void dq_q8_0(const uint8_t *blocks, float *out, size_t n) {
+    /* block: fp16 d (2B) + int8 qs[32] (32B) = 34B per 32 elements. */
+    const size_t nb = n / QW36_QK8_0;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 34;
+        uint16_t dh; memcpy(&dh, b, 2);
+        float d = f16_to_f32(dh);
+        const int8_t *qs = (const int8_t *)(b + 2);
+        for (int j = 0; j < QW36_QK8_0; j++) *out++ = d * (float)qs[j];
+    }
+}
+
+/* Q4_K: 144 bytes/block. Layout:
+ *   fp16 d, fp16 dmin, u8 scales[12], u8 qs[128]
+ * Per 64-element chunk a sub-scale and sub-min are unpacked from scales[]. */
+static void q4_K_get_scale_min(int j, const uint8_t *q,
+                               uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j]     & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void dq_q4_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 144;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b,     2);
+        memcpy(&dmh, b + 2, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qs     = b + 16;
+        int is = 0;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            q4_K_get_scale_min(is + 0, scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            q4_K_get_scale_min(is + 1, scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (int l = 0; l < 32; l++) *out++ = d1 * (float)(qs[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) *out++ = d2 * (float)(qs[l] >>  4) - m2;
+            qs += 32; is += 2;
+        }
+    }
+}
+
+/* Q6_K: 210 bytes/block. Layout:
+ *   u8 ql[128]  — lower 4 bits per quant
+ *   u8 qh[64]   — upper 2 bits per quant
+ *   i8 scales[16]
+ *   fp16 d      — super-block scale
+ */
+static void dq_q6_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 210;
+        const uint8_t *ql = b;
+        const uint8_t *qh = b + 128;
+        const int8_t  *sc = (const int8_t *)(b + 128 + 64);
+        uint16_t dh; memcpy(&dh, b + 128 + 64 + 16, 2);
+        const float d = f16_to_f32(dh);
+        for (int n_off = 0; n_off < QW36_QK_K; n_off += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[l +  0] = d * (float)sc[is + 0] * (float)q1;
+                out[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            out += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
 /* Materialize an entire tensor to a freshly malloc'd fp32 buffer. Caller
  * frees. Returns NULL on unsupported dtype / oom. */
 static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
@@ -100,6 +194,15 @@ static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
             for (size_t i = 0; i < n; i++) out[i] = bf16_to_f32(p[i]);
             return out;
         }
+        case QW36_DTYPE_Q8_0:
+            dq_q8_0((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q4_K:
+            dq_q4_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q6_K:
+            dq_q6_K((const uint8_t *)data, out, n);
+            return out;
         default:
             free(out);
             return NULL;
@@ -555,6 +658,12 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
+        if (!L->q_proj) {
+            /* Layer is not vanilla full attention. Qwen 3.5 / 3.6 use Gated
+             * DeltaNet (linear attention) on some/all layers — we don't
+             * implement it yet. Fail loudly so callers know. */
+            return -2;
+        }
 
         /* --- attention block --- */
         rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm, hidden, c->rms_norm_eps);

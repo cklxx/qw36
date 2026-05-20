@@ -79,4 +79,29 @@ other agent picks up from there.
 
 | Date       | Agent  | Backend | Commit  | Notes |
 |------------|--------|---------|---------|-------|
-| 2026-05-20 | Claude | scaffold | (init) | All stubs in place. |
+| 2026-05-20 | Claude | scaffold  | (init)   | All stubs in place. |
+| 2026-05-20 | Claude | cpu       | -        | Full GGUF v3 loader + Q4_K/Q6_K/Q8_0 dequant + BBPE tokenizer + vanilla GQA forward + CLI; `qw36_cpu --info` works on Qwen3.5-0.8B-Q4_K_M. |
+| 2026-05-20 | Codex  | metal     | -        | init/destroy, host↔device, rmsnorm, matmul, embedding, residual, silu·mul, head_norm_rope, kv_append, attn_scores/softmax/combine kernels — all smoke-tested. |
+| 2026-05-20 | Codex  | cuda      | -        | init/destroy, memory ops, mirror of metal kernels (qw36_rmsnorm_kernel, qw36_matmul_kernel, qw36_head_norm_rope_kernel, etc). Not compiled on this Apple machine. |
+| 2026-05-20 | Codex  | amd       | -        | Same set as cuda, HIP variant. |
+
+## Known blocker for Qwen 3.6 end-to-end
+
+Qwen 3.5 / 3.6 models use a **hybrid architecture**: some layers are
+vanilla GQA (`blk.X.attn_q.weight` etc.), others are **Gated DeltaNet**
+(`blk.X.attn_qkv.weight` fused + `blk.X.ssm_*` tensors).
+
+For Qwen3.5-0.8B specifically: 6/24 layers vanilla GQA, 18/24 DeltaNet.
+
+The runtime currently supports vanilla GQA layers only. The DeltaNet path
+needs:
+- Per-layer attention-kind detection in `qw36_engine_open` (track in
+  `qw36_config.layer_types`).
+- New tensor name BINDs for the SSM tensors (`ssm_conv1d`, `ssm_alpha`,
+  `ssm_beta`, `ssm_a`, `ssm_dt.bias`, `ssm_norm`, `ssm_out`,
+  `attn_qkv`, `attn_gate`).
+- A `delta_net_decode_f32` reference op (~200 lines): short-conv state
+  buffer + per-head recurrent state update + gated RMSNorm output.
+- Backend vtable extension: `delta_net_decode(ctx, ...)`.
+
+Until that lands, the CPU forward returns -2 on a DeltaNet layer.
