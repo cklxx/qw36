@@ -666,8 +666,28 @@ static void metal_end_batch(qw36_gpu_ctx *ctx)
         id<MTLCommandBuffer> cb = ctx->batch_cb;
         ctx->batch_cb = nil;          /* clear *before* commit so re-entrant
                                        * ops within end_batch don't reuse it */
-        [cb commit];
-        [cb waitUntilCompleted];
+        /* Per-step timing (QW36_METAL_TIMING=1):
+         *   commit ≈ 0.01ms (CPU encoding), gpu ≈ 11.9ms (waitUntilCompleted).
+         * We are 100% GPU-bound; CPU dispatch overhead is negligible. To
+         * reach 200 tok/s we need to actually reduce GPU work (kernel
+         * fusion or faster GEMV), not lower dispatch overhead. */
+        if (getenv("QW36_METAL_TIMING") != NULL) {
+            static int hits = 0;
+            static double t_encode = 0, t_gpu = 0;
+            double t1 = CFAbsoluteTimeGetCurrent();
+            [cb commit];
+            double t2 = CFAbsoluteTimeGetCurrent();
+            [cb waitUntilCompleted];
+            double t3 = CFAbsoluteTimeGetCurrent();
+            t_encode += (t2 - t1); t_gpu += (t3 - t2);
+            if (++hits == 12 || hits == 64 || hits == 256) {
+                fprintf(stderr, "[timing] hits=%d  commit=%.2fms gpu=%.2fms per-step\n",
+                    hits, 1000.0*t_encode/hits, 1000.0*t_gpu/hits);
+            }
+        } else {
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
     }
 }
 
