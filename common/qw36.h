@@ -204,6 +204,14 @@ typedef struct {
     void *gate_dev;
     void *up_dev;
     void *logits_dev;
+    void **conv_state_dev;
+    void **delta_state_dev;
+    void *dn_qkv_dev;
+    void *dn_qkv_act_dev;
+    void *dn_z_dev;
+    void *dn_alpha_dev;
+    void *dn_beta_dev;
+    void *dn_gout_dev;
 } qw36_state;
 
 /* --------------------------------------------------------------------- */

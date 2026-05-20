@@ -102,6 +102,130 @@ kernel void qw36_silu_mul_f32(
 }
 
 /* ---------------------------------------------------------------- */
+/* DeltaNet decode helpers. State layout follows common/qw36.c:      */
+/* conv_state [kernel-1, channels], delta_state [Hv, Dk, Dv].        */
+/* ---------------------------------------------------------------- */
+kernel void qw36_dn_conv1d_silu_f32(
+    device float       *y           [[buffer(0)]],
+    device const float *x           [[buffer(1)]],
+    device const float *conv_w      [[buffer(2)]],
+    device float       *conv_state  [[buffer(3)]],
+    constant uint      &channels    [[buffer(4)]],
+    constant uint      &kernel_size [[buffer(5)]],
+    uint                c           [[thread_position_in_grid]])
+{
+    if (c >= channels) return;
+    if (kernel_size == 0) {
+        float v = x[c];
+        y[c] = v / (1.0f + exp(-v));
+        return;
+    }
+
+    device const float *wt = conv_w + c * kernel_size;
+    float acc = 0.0f;
+    if (kernel_size > 1) {
+        for (uint t = 0; t + 1 < kernel_size; ++t)
+            acc += wt[t] * conv_state[t * channels + c];
+    }
+    acc += wt[kernel_size - 1] * x[c];
+    y[c] = acc / (1.0f + exp(-acc));
+
+    if (kernel_size > 1) {
+        for (uint t = 0; t + 2 < kernel_size; ++t)
+            conv_state[t * channels + c] = conv_state[(t + 1) * channels + c];
+        conv_state[(kernel_size - 2) * channels + c] = x[c];
+    }
+}
+
+kernel void qw36_dn_gated_delta_f32(
+    device float       *y          [[buffer(0)]],
+    device const float *qkv        [[buffer(1)]],
+    device const float *beta_raw   [[buffer(2)]],
+    device const float *alpha_raw  [[buffer(3)]],
+    device const float *dt_bias    [[buffer(4)]],
+    device const float *a_log      [[buffer(5)]],
+    device float       *state      [[buffer(6)]],
+    constant uint      &n_key      [[buffer(7)]],
+    constant uint      &n_value    [[buffer(8)]],
+    constant uint      &key_dim    [[buffer(9)]],
+    constant uint      &val_dim    [[buffer(10)]],
+    uint                gid        [[thread_position_in_grid]])
+{
+    uint total = n_value * val_dim;
+    if (gid >= total || n_key == 0 || key_dim == 0 || val_dim == 0) return;
+
+    uint v = gid / val_dim;
+    uint d = gid - v * val_dim;
+    uint kh = v % n_key;
+    uint q_dim_total = n_key * key_dim;
+    uint k_dim_total = q_dim_total;
+
+    float qss = 0.0f;
+    float kss = 0.0f;
+    device const float *q_head = qkv + kh * key_dim;
+    device const float *k_head = qkv + q_dim_total + kh * key_dim;
+    for (uint j = 0; j < key_dim; ++j) {
+        float qv = q_head[j];
+        float kv = k_head[j];
+        qss += qv * qv;
+        kss += kv * kv;
+    }
+    float q_scale = rsqrt(qss + 1.0e-12f) / sqrt(float(key_dim));
+    float k_scale = rsqrt(kss + 1.0e-12f);
+
+    float av = alpha_raw[v] + dt_bias[v];
+    float softplus = av > 20.0f ? av : log(1.0f + exp(av));
+    float exp_g = exp(-exp(a_log[v]) * softplus);
+    float beta = 1.0f / (1.0f + exp(-beta_raw[v]));
+
+    device float *S = state + (v * key_dim * val_dim);
+    float kv_mem = 0.0f;
+    for (uint j = 0; j < key_dim; ++j) {
+        float kj = k_head[j] * k_scale;
+        uint off = j * val_dim + d;
+        float s = S[off] * exp_g;
+        S[off] = s;
+        kv_mem += s * kj;
+    }
+
+    device const float *vin = qkv + q_dim_total + k_dim_total + v * val_dim;
+    float delta = (vin[d] - kv_mem) * beta;
+    float out = 0.0f;
+    for (uint j = 0; j < key_dim; ++j) {
+        float kj = k_head[j] * k_scale;
+        float qj = q_head[j] * q_scale;
+        uint off = j * val_dim + d;
+        float s = S[off] + delta * kj;
+        S[off] = s;
+        out += s * qj;
+    }
+    y[gid] = out;
+}
+
+kernel void qw36_dn_gated_rmsnorm_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const float *z        [[buffer(2)]],
+    device const float *w        [[buffer(3)]],
+    constant uint      &n_value  [[buffer(4)]],
+    constant uint      &val_dim  [[buffer(5)]],
+    constant float     &eps      [[buffer(6)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    uint total = n_value * val_dim;
+    if (gid >= total || val_dim == 0) return;
+    uint v = gid / val_dim;
+    uint d = gid - v * val_dim;
+    device const float *xh = x + v * val_dim;
+    float ss = 0.0f;
+    for (uint i = 0; i < val_dim; ++i) ss += xh[i] * xh[i];
+    float scale = rsqrt(ss / float(val_dim) + eps);
+    float zg = z[gid];
+    float gate = zg / (1.0f + exp(-zg));
+    y[gid] = gate * x[gid] * scale * w[d];
+}
+
+/* ---------------------------------------------------------------- */
 /* Residual add                                                      */
 /* ---------------------------------------------------------------- */
 kernel void qw36_residual_add_f32(
@@ -275,3 +399,100 @@ kernel void qw36_attn_combine_f32(
 /* Attention is split across q/k/v matmul, head_norm_rope, kv_append, */
 /* attn_scores, attn_softmax, and attn_combine.                       */
 /* ---------------------------------------------------------------- */
+
+/* =============================================================================
+ * Gated Delta Rule step — transliterated from agent-infer's
+ *   ../agent-infer/crates/mlx-sys/src/mlx_qwen35_model.cpp:203-275
+ *   (fast::metal_kernel("gated_delta_step", ...))
+ * Adapted to fp32 buffers and runtime-shape constants.
+ *
+ * Inputs:
+ *   q         [B, T, Hk, Dk]
+ *   k         [B, T, Hk, Dk]
+ *   v         [B, T, Hv, Dv]
+ *   g         [B, T, Hv]
+ *   beta      [B, T, Hv]
+ *   state_in  [B, Hv, Dv, Dk]
+ * Outputs:
+ *   y         [B, T, Hv, Dv]
+ *   state_out [B, Hv, Dv, Dk]
+ *
+ * Threadgroup layout:
+ *   grid.x = 32 (one simdgroup along Dk; each lane handles n_per_t entries)
+ *   grid.y = Dv
+ *   grid.z = B * Hv
+ *   threadgroup = (32, 1, 1)
+ * ============================================================================= */
+kernel void qw36_gated_delta_step_f32(
+    device const float *q          [[buffer(0)]],
+    device const float *k          [[buffer(1)]],
+    device const float *v          [[buffer(2)]],
+    device const float *g          [[buffer(3)]],
+    device const float *beta       [[buffer(4)]],
+    device const float *state_in   [[buffer(5)]],
+    device       float *y          [[buffer(6)]],
+    device       float *state_out  [[buffer(7)]],
+    constant uint &T   [[buffer(8)]],
+    constant uint &Hk  [[buffer(9)]],
+    constant uint &Hv  [[buffer(10)]],
+    constant uint &Dk  [[buffer(11)]],
+    constant uint &Dv  [[buffer(12)]],
+    uint3 tpig  [[thread_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]],
+    uint  tsim  [[thread_index_in_simdgroup]])
+{
+    uint n      = tpig.z;
+    uint b_idx  = n / Hv;
+    uint hv_idx = n % Hv;
+    uint hk_idx = hv_idx / (Hv / Hk);
+    uint n_per_t = Dk / 32u;
+
+    device const float *q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    device const float *k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+    device const float *v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    device       float *y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;
+
+    uint dk_idx = tpitg.x;
+    uint dv_idx = tpig.y;
+
+    device const float *g_    = g    + b_idx * T * Hv;
+    device const float *beta_ = beta + b_idx * T * Hv;
+
+    device const float *i_state = state_in  + (n * Dv + dv_idx) * Dk;
+    device       float *o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+    float state[8];      /* Dk <= 256 → n_per_t <= 8 */
+    for (uint i = 0; i < n_per_t; ++i)
+        state[i] = i_state[n_per_t * dk_idx + i];
+
+    for (uint t = 0; t < T; ++t) {
+        float g_val = g_[hv_idx];
+        float kv_mem = 0.0f;
+        for (uint i = 0; i < n_per_t; ++i) {
+            uint s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * g_val;
+            kv_mem  += state[i] * k_[s_idx];
+        }
+        kv_mem = simd_sum(kv_mem);
+
+        float delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+        float out = 0.0f;
+        for (uint i = 0; i < n_per_t; ++i) {
+            uint s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + k_[s_idx] * delta;
+            out     += state[i] * q_[s_idx];
+        }
+        out = simd_sum(out);
+        if (tsim == 0) y_[dv_idx] = out;
+
+        q_    += Hk * Dk;
+        k_    += Hk * Dk;
+        v_    += Hv * Dv;
+        y_    += Hv * Dv;
+        g_    += Hv;
+        beta_ += Hv;
+    }
+    for (uint i = 0; i < n_per_t; ++i)
+        o_state[n_per_t * dk_idx + i] = state[i];
+}

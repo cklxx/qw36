@@ -1309,6 +1309,101 @@ static int attention_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
     return 0;
 }
 
+static int deltanet_dispatch_dev(qw36_state *st,
+                                 const qw36_layer_weights *L,
+                                 const qw36_config *c,
+                                 uint32_t layer_idx)
+{
+    qw36_engine *eng = qw36_active_engine;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!st || !L || !c ||
+        !st->x_dev || !st->x_rms_dev || !st->dn_qkv_dev ||
+        !st->dn_qkv_act_dev || !st->dn_z_dev || !st->dn_alpha_dev ||
+        !st->dn_beta_dev || !st->dn_gout_dev ||
+        !st->conv_state_dev || !st->delta_state_dev ||
+        !st->conv_state_dev[layer_idx] || !st->delta_state_dev[layer_idx] ||
+        !L->dn_qkv || !L->dn_gate || !L->dn_alpha || !L->dn_beta ||
+        !L->dn_conv1d || !L->dn_dt_bias || !L->dn_a_log ||
+        !L->dn_norm || !L->dn_out ||
+        !active_backend(&be, &ctx) ||
+        !be->matmul || !be->rmsnorm || !be->residual_add ||
+        !be->dn_conv1d_silu || !be->dn_gated_delta ||
+        !be->dn_gated_rmsnorm)
+        return -1;
+
+    static int skip_conv = -1, skip_dn = -1;
+    if (skip_conv < 0) {
+        const char *e = getenv("QW36_SKIP_CONV1D");
+        skip_conv = e && atoi(e) ? 1 : 0;
+    }
+    if (skip_dn < 0) {
+        const char *e = getenv("QW36_SKIP_DN");
+        skip_dn = e && atoi(e) ? 1 : 0;
+    }
+    if (skip_conv || skip_dn) return -1;
+
+    const uint32_t n_v = c->dn_num_value_heads;
+    const uint32_t n_k = c->dn_num_key_heads;
+    const uint32_t kd = c->dn_key_head_dim;
+    const uint32_t vd = c->dn_value_head_dim;
+    if (!n_v || !n_k || !kd || !vd) return -1;
+    const uint32_t qkv_dim = n_k * kd * 2 + n_v * vd;
+    qw36_gpu_buf *conv_w = gpu_cached_upload(eng, L->dn_conv1d,
+        (size_t)qkv_dim * c->dn_conv_kernel_size * sizeof(float),
+        QW36_DTYPE_F32);
+    qw36_gpu_buf *dt_bias = gpu_cached_upload(eng, L->dn_dt_bias,
+        (size_t)n_v * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *a_log = gpu_cached_upload(eng, L->dn_a_log,
+        (size_t)n_v * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *dn_norm = gpu_cached_upload(eng, L->dn_norm,
+        (size_t)vd * sizeof(float), QW36_DTYPE_F32);
+    if (!conv_w || !dt_bias || !a_log || !dn_norm) return -1;
+
+    int rc = 0;
+    rc |= rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
+                               (qw36_gpu_buf *)st->x_dev,
+                               (const float *)L->input_layernorm,
+                               c->hidden_size, c->rms_norm_eps);
+    rc |= matmul_lazy_dev((qw36_gpu_buf *)st->dn_qkv_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_qkv);
+    rc |= matmul_lazy_dev((qw36_gpu_buf *)st->dn_z_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_gate);
+    rc |= matmul_lazy_dev((qw36_gpu_buf *)st->dn_alpha_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_alpha);
+    rc |= matmul_lazy_dev((qw36_gpu_buf *)st->dn_beta_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_beta);
+    if (rc) return -1;
+
+    be->dn_conv1d_silu(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                       (qw36_gpu_buf *)st->dn_qkv_dev,
+                       conv_w,
+                       (qw36_gpu_buf *)st->conv_state_dev[layer_idx],
+                       qkv_dim, c->dn_conv_kernel_size);
+    be->dn_gated_delta(ctx, (qw36_gpu_buf *)st->dn_gout_dev,
+                       (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                       (qw36_gpu_buf *)st->dn_beta_dev,
+                       (qw36_gpu_buf *)st->dn_alpha_dev,
+                       dt_bias, a_log,
+                       (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
+                       n_k, n_v, kd, vd);
+    be->dn_gated_rmsnorm(ctx, (qw36_gpu_buf *)st->dn_qkv_dev,
+                         (qw36_gpu_buf *)st->dn_gout_dev,
+                         (qw36_gpu_buf *)st->dn_z_dev,
+                         dn_norm, n_v, vd, c->rms_norm_eps);
+    rc |= matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
+                          (qw36_gpu_buf *)st->dn_qkv_dev,
+                          (const qw36_lazy_w *)L->dn_out);
+    rc |= residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                    (qw36_gpu_buf *)st->x_rms_dev,
+                                    c->hidden_size);
+    return rc ? -1 : 0;
+}
+
 /* --------------------------------------------------------------------- */
 /* GGUF → config + weights binding                                        */
 /* --------------------------------------------------------------------- */
@@ -1782,6 +1877,21 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
     const size_t inter    = c->intermediate_size ? c->intermediate_size : 1;
     const size_t vocab    = c->vocab_size;
     const size_t L        = c->num_hidden_layers;
+    const size_t dn_qkv_dim = c->dn_num_value_heads
+        ? (size_t)c->dn_num_key_heads * c->dn_key_head_dim * 2
+        + (size_t)c->dn_num_value_heads * c->dn_value_head_dim
+        : 0;
+    const size_t dn_v_dim = c->dn_num_value_heads
+        ? (size_t)c->dn_num_value_heads * c->dn_value_head_dim
+        : 0;
+    const size_t dn_conv_window = (c->dn_num_value_heads &&
+                                   c->dn_conv_kernel_size)
+        ? (size_t)c->dn_conv_kernel_size - 1
+        : 0;
+    const size_t dn_s_elems = c->dn_num_value_heads
+        ? (size_t)c->dn_num_value_heads * c->dn_key_head_dim
+          * c->dn_value_head_dim
+        : 0;
 
     st->k_cache = (void **)calloc(L, sizeof(void *));
     st->v_cache = (void **)calloc(L, sizeof(void *));
@@ -1796,20 +1906,14 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
      * key/val dims read from config. Zero for layers without DeltaNet —
      * we allocate symmetrically across L for simplicity. */
     if (c->dn_num_value_heads) {
-        const size_t qkv_dim = (size_t)c->dn_num_key_heads   * c->dn_key_head_dim
-                             + (size_t)c->dn_num_key_heads   * c->dn_key_head_dim
-                             + (size_t)c->dn_num_value_heads * c->dn_value_head_dim;
-        const size_t conv_window = c->dn_conv_kernel_size
-                                 ? (size_t)c->dn_conv_kernel_size - 1 : 0;
-        const size_t s_elems = (size_t)c->dn_num_value_heads
-                             * c->dn_key_head_dim * c->dn_value_head_dim;
         st->conv_state  = (float **)calloc(L, sizeof(float *));
         st->delta_state = (float **)calloc(L, sizeof(float *));
         if (!st->conv_state || !st->delta_state) goto fail;
         for (size_t l = 0; l < L; l++) {
-            st->conv_state[l]  = (float *)calloc(conv_window * qkv_dim, sizeof(float));
-            st->delta_state[l] = (float *)calloc(s_elems, sizeof(float));
-            if ((conv_window && !st->conv_state[l]) || !st->delta_state[l])
+            st->conv_state[l] =
+                (float *)calloc(dn_conv_window * dn_qkv_dim, sizeof(float));
+            st->delta_state[l] = (float *)calloc(dn_s_elems, sizeof(float));
+            if ((dn_conv_window && !st->conv_state[l]) || !st->delta_state[l])
                 goto fail;
         }
     }
@@ -1850,6 +1954,11 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         st->k_cache_dev = (void **)calloc(L, sizeof(void *));
         st->v_cache_dev = (void **)calloc(L, sizeof(void *));
         if (!st->k_cache_dev || !st->v_cache_dev) goto fail;
+        if (c->dn_num_value_heads) {
+            st->conv_state_dev = (void **)calloc(L, sizeof(void *));
+            st->delta_state_dev = (void **)calloc(L, sizeof(void *));
+            if (!st->conv_state_dev || !st->delta_state_dev) goto fail;
+        }
 
         const size_t cache_bytes =
             (size_t)seq_capacity * kv_dim * sizeof(float);
@@ -1857,6 +1966,21 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             st->k_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
             st->v_cache_dev[l] = be->alloc(ctx, cache_bytes, QW36_DTYPE_F32);
             if (!st->k_cache_dev[l] || !st->v_cache_dev[l]) goto fail;
+            if (c->dn_num_value_heads) {
+                st->conv_state_dev[l] = be->alloc(ctx,
+                    dn_conv_window * dn_qkv_dim * sizeof(float), QW36_DTYPE_F32);
+                st->delta_state_dev[l] = be->alloc(ctx,
+                    dn_s_elems * sizeof(float), QW36_DTYPE_F32);
+                if (!st->conv_state_dev[l] || !st->delta_state_dev[l])
+                    goto fail;
+                if (be->copy_from_host) {
+                    be->copy_from_host(ctx, (qw36_gpu_buf *)st->conv_state_dev[l],
+                        st->conv_state[l],
+                        dn_conv_window * dn_qkv_dim * sizeof(float));
+                    be->copy_from_host(ctx, (qw36_gpu_buf *)st->delta_state_dev[l],
+                        st->delta_state[l], dn_s_elems * sizeof(float));
+                }
+            }
         }
 
         st->x_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
@@ -1869,9 +1993,27 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         st->gate_dev = be->alloc(ctx, inter * sizeof(float), QW36_DTYPE_F32);
         st->up_dev = be->alloc(ctx, inter * sizeof(float), QW36_DTYPE_F32);
         st->logits_dev = be->alloc(ctx, vocab * sizeof(float), QW36_DTYPE_F32);
+        if (c->dn_num_value_heads) {
+            st->dn_qkv_dev = be->alloc(ctx, dn_qkv_dim * sizeof(float),
+                                       QW36_DTYPE_F32);
+            st->dn_qkv_act_dev = be->alloc(ctx, dn_qkv_dim * sizeof(float),
+                                           QW36_DTYPE_F32);
+            st->dn_z_dev = be->alloc(ctx, dn_v_dim * sizeof(float),
+                                     QW36_DTYPE_F32);
+            st->dn_alpha_dev = be->alloc(ctx,
+                (size_t)c->dn_num_value_heads * sizeof(float), QW36_DTYPE_F32);
+            st->dn_beta_dev = be->alloc(ctx,
+                (size_t)c->dn_num_value_heads * sizeof(float), QW36_DTYPE_F32);
+            st->dn_gout_dev = be->alloc(ctx, dn_v_dim * sizeof(float),
+                                        QW36_DTYPE_F32);
+        }
         if (!st->x_dev || !st->x_rms_dev || !st->q_dev ||
             !st->k_dev || !st->v_dev || !st->attn_scores_dev ||
             !st->gate_dev || !st->up_dev || !st->logits_dev)
+            goto fail;
+        if (c->dn_num_value_heads &&
+            (!st->dn_qkv_dev || !st->dn_qkv_act_dev || !st->dn_z_dev ||
+             !st->dn_alpha_dev || !st->dn_beta_dev || !st->dn_gout_dev))
             goto fail;
     }
 
@@ -1897,6 +2039,14 @@ void qw36_state_free(qw36_state *st)
             for (uint32_t l = 0; l < st->num_layers; l++)
                 be->free(ctx, (qw36_gpu_buf *)st->v_cache_dev[l]);
         }
+        if (st->conv_state_dev) {
+            for (uint32_t l = 0; l < st->num_layers; l++)
+                be->free(ctx, (qw36_gpu_buf *)st->conv_state_dev[l]);
+        }
+        if (st->delta_state_dev) {
+            for (uint32_t l = 0; l < st->num_layers; l++)
+                be->free(ctx, (qw36_gpu_buf *)st->delta_state_dev[l]);
+        }
         be->free(ctx, (qw36_gpu_buf *)st->x_dev);
         be->free(ctx, (qw36_gpu_buf *)st->x_rms_dev);
         be->free(ctx, (qw36_gpu_buf *)st->q_dev);
@@ -1906,9 +2056,17 @@ void qw36_state_free(qw36_state *st)
         be->free(ctx, (qw36_gpu_buf *)st->gate_dev);
         be->free(ctx, (qw36_gpu_buf *)st->up_dev);
         be->free(ctx, (qw36_gpu_buf *)st->logits_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_qkv_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_z_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_alpha_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_beta_dev);
+        be->free(ctx, (qw36_gpu_buf *)st->dn_gout_dev);
     }
     free(st->k_cache_dev);
     free(st->v_cache_dev);
+    free(st->conv_state_dev);
+    free(st->delta_state_dev);
     if (st->k_cache) {
         for (uint32_t l = 0; l < st->num_layers; l++) free(st->k_cache[l]);
         free(st->k_cache);
@@ -2032,6 +2190,14 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 
         if (!L->q_proj && L->dn_qkv) {
             /* === Gated DeltaNet branch === */
+            if (gpu_state) {
+                ENSURE_X_DEV();
+                if (deltanet_dispatch_dev(st, L, c, l) == 0) {
+                    x_dev_valid = 1;
+                    x_host_valid = 0;
+                    goto mlp_block;
+                }
+            }
             ENSURE_X_HOST();
             const uint32_t n_v   = c->dn_num_value_heads;
             const uint32_t n_k   = c->dn_num_key_heads;

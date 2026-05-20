@@ -93,6 +93,29 @@ typedef struct qw36_gpu_backend {
                        qw36_gpu_buf *w_down,
                        uint32_t hidden, uint32_t intermediate);
 
+    /* Qwen3.5/3.6 Gated DeltaNet decode pieces. These are optional because
+     * non-hybrid models do not need them and CUDA/AMD may lag Metal. */
+    void (*dn_conv1d_silu)(qw36_gpu_ctx *ctx,
+                           qw36_gpu_buf *y, qw36_gpu_buf *x,
+                           qw36_gpu_buf *conv_w, qw36_gpu_buf *conv_state,
+                           uint32_t channels, uint32_t kernel_size);
+
+    void (*dn_gated_delta)(qw36_gpu_ctx *ctx,
+                           qw36_gpu_buf *y, qw36_gpu_buf *qkv,
+                           qw36_gpu_buf *beta_raw,
+                           qw36_gpu_buf *alpha_raw,
+                           qw36_gpu_buf *dt_bias,
+                           qw36_gpu_buf *a_log,
+                           qw36_gpu_buf *state,
+                           uint32_t n_key, uint32_t n_value,
+                           uint32_t key_dim, uint32_t val_dim);
+
+    void (*dn_gated_rmsnorm)(qw36_gpu_ctx *ctx,
+                             qw36_gpu_buf *y, qw36_gpu_buf *x,
+                             qw36_gpu_buf *z, qw36_gpu_buf *weight,
+                             uint32_t n_value, uint32_t val_dim,
+                             float eps);
+
     /* MoE forward (optional — set to NULL on dense-only builds). */
     void (*moe_forward)(qw36_gpu_ctx *ctx,
                         qw36_gpu_buf *y, qw36_gpu_buf *x,

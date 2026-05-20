@@ -26,6 +26,9 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> rmsnorm;
     id<MTLComputePipelineState> matmul;
     id<MTLComputePipelineState> silu_mul;
+    id<MTLComputePipelineState> dn_conv1d_silu;
+    id<MTLComputePipelineState> dn_gated_delta;
+    id<MTLComputePipelineState> dn_gated_rmsnorm;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> embedding_lookup;
     id<MTLComputePipelineState> head_norm_rope;
@@ -457,6 +460,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->rmsnorm          = metal_make_pipeline(ctx, @"qw36_rmsnorm_f32", err, err_cap);
     ctx->matmul           = metal_make_pipeline(ctx, @"qw36_matmul_f32", err, err_cap);
     ctx->silu_mul         = metal_make_pipeline(ctx, @"qw36_silu_mul_f32", err, err_cap);
+    ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
+    ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_dn_gated_delta_f32", err, err_cap);
+    ctx->dn_gated_rmsnorm = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f32", err, err_cap);
     ctx->residual_add     = metal_make_pipeline(ctx, @"qw36_residual_add_f32", err, err_cap);
     ctx->embedding_lookup = metal_make_pipeline(ctx, @"qw36_embedding_lookup_f32", err, err_cap);
     ctx->head_norm_rope   = metal_make_pipeline(ctx, @"qw36_head_norm_rope_f32", err, err_cap);
@@ -465,7 +471,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_softmax     = metal_make_pipeline(ctx, @"qw36_attn_softmax_f32", err, err_cap);
     ctx->attn_combine     = metal_make_pipeline(ctx, @"qw36_attn_combine_f32", err, err_cap);
 
-    if (!ctx->rmsnorm || !ctx->matmul || !ctx->silu_mul || !ctx->residual_add ||
+    if (!ctx->rmsnorm || !ctx->matmul || !ctx->silu_mul ||
+        !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
+        !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine) {
         ctx->attn_combine = nil;
@@ -475,6 +483,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->head_norm_rope = nil;
         ctx->embedding_lookup = nil;
         ctx->residual_add = nil;
+        ctx->dn_gated_rmsnorm = nil;
+        ctx->dn_gated_delta = nil;
+        ctx->dn_conv1d_silu = nil;
         ctx->silu_mul = nil;
         ctx->matmul = nil;
         ctx->rmsnorm = nil;
@@ -504,6 +515,9 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->head_norm_rope = nil;
     ctx->embedding_lookup = nil;
     ctx->residual_add = nil;
+    ctx->dn_gated_rmsnorm = nil;
+    ctx->dn_gated_delta = nil;
+    ctx->dn_conv1d_silu = nil;
     ctx->silu_mul = nil;
     ctx->matmul = nil;
     ctx->rmsnorm = nil;
@@ -877,6 +891,66 @@ done:
     metal_free(ctx, gate);
 }
 
+static void metal_dn_conv1d_silu(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
+                                 qw36_gpu_buf *conv_w, qw36_gpu_buf *conv_state,
+                                 uint32_t channels, uint32_t kernel_size)
+{
+    if (!ctx || !y || !x || !conv_w || !conv_state) return;
+    metal_dispatch_1d(ctx, ctx->dn_conv1d_silu, channels, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:y->mtl          offset:0 atIndex:0];
+        [enc setBuffer:x->mtl          offset:0 atIndex:1];
+        [enc setBuffer:conv_w->mtl     offset:0 atIndex:2];
+        [enc setBuffer:conv_state->mtl offset:0 atIndex:3];
+        [enc setBytes:&channels    length:sizeof(channels)    atIndex:4];
+        [enc setBytes:&kernel_size length:sizeof(kernel_size) atIndex:5];
+    });
+}
+
+static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
+                                 qw36_gpu_buf *qkv, qw36_gpu_buf *beta_raw,
+                                 qw36_gpu_buf *alpha_raw, qw36_gpu_buf *dt_bias,
+                                 qw36_gpu_buf *a_log, qw36_gpu_buf *state,
+                                 uint32_t n_key, uint32_t n_value,
+                                 uint32_t key_dim, uint32_t val_dim)
+{
+    if (!ctx || !y || !qkv || !beta_raw || !alpha_raw || !dt_bias ||
+        !a_log || !state)
+        return;
+    NSUInteger n = (NSUInteger)n_value * (NSUInteger)val_dim;
+    metal_dispatch_1d(ctx, ctx->dn_gated_delta, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:y->mtl         offset:0 atIndex:0];
+        [enc setBuffer:qkv->mtl       offset:0 atIndex:1];
+        [enc setBuffer:beta_raw->mtl  offset:0 atIndex:2];
+        [enc setBuffer:alpha_raw->mtl offset:0 atIndex:3];
+        [enc setBuffer:dt_bias->mtl   offset:0 atIndex:4];
+        [enc setBuffer:a_log->mtl     offset:0 atIndex:5];
+        [enc setBuffer:state->mtl     offset:0 atIndex:6];
+        [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:7];
+        [enc setBytes:&n_value  length:sizeof(n_value)  atIndex:8];
+        [enc setBytes:&key_dim  length:sizeof(key_dim)  atIndex:9];
+        [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:10];
+    });
+}
+
+static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
+                                   qw36_gpu_buf *x, qw36_gpu_buf *z,
+                                   qw36_gpu_buf *weight,
+                                   uint32_t n_value, uint32_t val_dim,
+                                   float eps)
+{
+    if (!ctx || !y || !x || !z || !weight) return;
+    NSUInteger n = (NSUInteger)n_value * (NSUInteger)val_dim;
+    metal_dispatch_1d(ctx, ctx->dn_gated_rmsnorm, n, ^(id<MTLComputeCommandEncoder> enc) {
+        [enc setBuffer:y->mtl      offset:0 atIndex:0];
+        [enc setBuffer:x->mtl      offset:0 atIndex:1];
+        [enc setBuffer:z->mtl      offset:0 atIndex:2];
+        [enc setBuffer:weight->mtl offset:0 atIndex:3];
+        [enc setBytes:&n_value length:sizeof(n_value) atIndex:4];
+        [enc setBytes:&val_dim length:sizeof(val_dim) atIndex:5];
+        [enc setBytes:&eps     length:sizeof(eps)     atIndex:6];
+    });
+}
+
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf *y, uint32_t n)
 {
     if (!x || !y) return;
@@ -933,6 +1007,9 @@ static qw36_gpu_backend g_metal_backend = {
     .matmul            = metal_matmul,
     .attention         = metal_attention,
     .swiglu_mlp        = metal_swiglu,
+    .dn_conv1d_silu    = metal_dn_conv1d_silu,
+    .dn_gated_delta    = metal_dn_gated_delta,
+    .dn_gated_rmsnorm  = metal_dn_gated_rmsnorm,
     .moe_forward       = NULL,
     .residual_add      = metal_residual_add,
     .embedding_lookup  = metal_embedding_lookup,
