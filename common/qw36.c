@@ -821,9 +821,14 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         const size_t edge_elem_bytes =
             use_fp16_matmul_edges ? sizeof(uint16_t) : sizeof(float);
         st->dev_x_dtype = QW36_DTYPE_F32;
+        /* Phase 1: state buffers stay fp32 — the fp16-edge plumbing for
+         * x_rms_dev/q_dev shipped a step-0 logit divergence we haven't
+         * tracked down (see #46). Kernels still support dtype params so
+         * the switch is a one-line change once the diverge is fixed. */
+        (void)edge_elem_bytes; (void)edge_dtype;
         st->x_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
-        st->x_rms_dev = be->alloc(ctx, hidden * edge_elem_bytes, edge_dtype);
-        st->q_dev = be->alloc(ctx, q_dim * edge_elem_bytes, edge_dtype);
+        st->x_rms_dev = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
+        st->q_dev = be->alloc(ctx, q_dim * sizeof(float), QW36_DTYPE_F32);
         st->k_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->v_dev = be->alloc(ctx, kv_dim * sizeof(float), QW36_DTYPE_F32);
         st->attn_scores_dev = be->alloc(ctx,
