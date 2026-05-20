@@ -571,9 +571,10 @@ __global__ static void qw36_head_norm_rope_kernel(float *x, const void *w,
     uint32_t rot_dim = (uint32_t)((float)head_dim * partial);
     if (rot_dim > head_dim) rot_dim = head_dim;
     rot_dim &= ~1u;
-    for (uint32_t pair = 0; pair < rot_dim / 2; ++pair) {
-        uint32_t d0 = 2 * pair;
-        uint32_t d1 = d0 + 1;
+    uint32_t half_dim = rot_dim / 2;
+    for (uint32_t pair = 0; pair < half_dim; ++pair) {
+        uint32_t d0 = pair;
+        uint32_t d1 = pair + half_dim;
         float x0 = xh[d0] * scale * qw36_load_scalar(w, w_dtype, d0);
         float x1 = xh[d1] * scale * qw36_load_scalar(w, w_dtype, d1);
         float inv_freq = 1.0f / powf(theta, (2.0f * (float)pair) / (float)rot_dim);

@@ -1044,11 +1044,12 @@ static int attention_dispatch(float *y, const float *x,
         return 0;
 
     const size_t hidden = c->hidden_size;
+    const size_t q_len = (size_t)c->num_attention_heads * c->head_dim;
     const size_t kv_dim = (size_t)c->num_key_value_heads * c->head_dim;
     const size_t cache_bytes = (size_t)seq_capacity * kv_dim * sizeof(float);
 
     qw36_gpu_buf *xb = be->upload(ctx, x, hidden * sizeof(float), QW36_DTYPE_F32);
-    qw36_gpu_buf *yb = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *yb = be->alloc(ctx, q_len * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *qnb = be->upload(ctx, L->q_norm,
                                    (size_t)c->head_dim * sizeof(float),
                                    QW36_DTYPE_F32);
@@ -1064,7 +1065,7 @@ static int attention_dispatch(float *y, const float *x,
                       c->num_key_value_heads, c->head_dim,
                       seq_pos, seq_capacity,
                       c->rope_theta, c->partial_rotary_factor);
-        be->download(ctx, yb, y, hidden * sizeof(float));
+        be->download(ctx, yb, y, q_len * sizeof(float));
         be->download(ctx, kb, k_cache, cache_bytes);
         be->download(ctx, vb, v_cache, cache_bytes);
         be->free(ctx, xb);

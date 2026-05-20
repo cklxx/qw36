@@ -153,9 +153,10 @@ kernel void qw36_head_norm_rope_f32(
     if (rot_dim > head_dim) rot_dim = head_dim;
     rot_dim &= ~1u;
 
-    for (uint pair = 0; pair < rot_dim / 2; ++pair) {
-        uint d0 = 2 * pair;
-        uint d1 = d0 + 1;
+    uint half_dim = rot_dim / 2;
+    for (uint pair = 0; pair < half_dim; ++pair) {
+        uint d0 = pair;
+        uint d1 = pair + half_dim;
         float x0 = xh[d0] * scale * qw36_load_scalar(w, w_dtype, d0);
         float x1 = xh[d1] * scale * qw36_load_scalar(w, w_dtype, d1);
         float inv_freq = 1.0f / pow(theta, (2.0f * float(pair)) / float(rot_dim));
