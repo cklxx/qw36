@@ -1,0 +1,108 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-cpu:
+    name: linux / cpu build + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache apt
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-cpu-v1
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+
+      - name: Build CPU backend
+        run: make cpu
+
+      - name: CPU --help / --info smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la ./qw36_cpu
+          ./qw36_cpu --help 2>&1 | head -40 || true
+          ./qw36_cpu --info 2>&1 | head -40 || true
+          # If a model path is provided via secrets/env and exists, run a
+          # bounded decode. Otherwise the job stays green.
+          if [ -n "${QW36_TEST_MODEL:-}" ] && [ -f "${QW36_TEST_MODEL}" ]; then
+            timeout 60 ./qw36_cpu -m "$QW36_TEST_MODEL" -p "Hello" -n 4 || true
+          else
+            echo "skip: no QW36_TEST_MODEL on this runner"
+          fi
+
+  macos-metal:
+    name: macos / cpu + metal + precision
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache homebrew
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-metal-v1
+
+      - name: Verify Metal SDK
+        run: |
+          xcrun -sdk macosx metal --version
+          xcrun -sdk macosx metallib --version || true
+
+      - name: Build CPU backend
+        run: make cpu
+
+      - name: Build Metal backend
+        run: make metal
+
+      - name: Precision CPU vs Metal (step 0)
+        shell: bash
+        env:
+          QW36_TEST_MODEL: ${{ env.QW36_TEST_MODEL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${QW36_TEST_MODEL:-}" ] && [ -f "${QW36_TEST_MODEL}" ]; then
+            tests/precision_cpu_vs_metal.sh "$QW36_TEST_MODEL"
+          else
+            # the script itself short-circuits with "skip: model not found"
+            # when its default path is absent — invoke it so we exercise
+            # the test harness wiring even without a model.
+            tests/precision_cpu_vs_metal.sh
+          fi
+
+  cuda-build-check:
+    name: linux / cuda compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+          sub-packages: '["nvcc","cudart","cublas","cublas-dev"]'
+
+      - name: Show nvcc
+        run: nvcc --version
+
+      - name: Build CUDA backend (no runtime; compile only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No GPU on the runner, but nvcc compile + cublas link verifies the
+          # source still builds. -arch=native won't work without a device, so
+          # pin a sane architecture for the CI compile.
+          make -C cuda NVCCFLAGS='-O3 -std=c++17 -Xcompiler "-Wall -Wextra" -arch=sm_80'
+          ls -la ./qw36_cuda

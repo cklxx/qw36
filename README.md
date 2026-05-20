@@ -1,64 +1,300 @@
 # qw36
 
-Pure-C inference framework for Qwen 3.6. Three backends, three binaries:
+Pure-C inference framework for the Qwen 3.6 / 3.5 family. Single-`.c` engine
+per backend, no GGUF-runner abstraction, no C++ on the host. Three GPU
+backends (Metal, CUDA, AMD HIP) sit behind one frozen vtable
+(`common/qw36_gpu.h`); a CPU reference forward in `common/qw36.c` is the
+source of truth.
 
-| Backend | Folder    | Binary       | Toolchain     |
-|---------|-----------|--------------|---------------|
-| AMD     | `amd/`    | `qw36_amd`   | hipcc / ROCm  |
-| Metal   | `metal/`  | `qw36_metal` | clang + Metal |
-| CUDA    | `cuda/`   | `qw36_cuda`  | nvcc          |
+The model architecture is the Qwen 3.5/3.6 **hybrid**: per-layer flavor
+between vanilla **Grouped-Query Attention** (Q-/K-norm + partial mRoPE) and
+**Gated DeltaNet** (fused QKV, depthwise conv1d, recurrent rank-1 state),
+SwiGLU MLP, optional Top-K **MoE** with shared expert, tied or untied
+`lm_head`.
 
-Inspired by [antirez/ds4](https://github.com/antirez/ds4) (single-`.c` engine
-per backend, no GGUF-runner abstraction) and the Rust reference
-implementation in `../agent-infer/crates/qwen35-spec` (model arithmetic).
+Current decode throughput on `Qwen3.5-0.8B-Q4_K_M.gguf` (Apple M-class GPU):
+
+| build                                  | decode tok/s |
+|----------------------------------------|--------------|
+| CPU reference (`qw36_cpu`)             |  1.7         |
+| Metal, fp32 weights                    | 55           |
+| Metal, `QW36_METAL_FP16_WEIGHTS=1`     | **81**       |
+| llama.cpp reference, same model        | 170          |
+
+The full perf ladder lives in [`DIVISION_OF_WORK.md`](DIVISION_OF_WORK.md).
+**Output is not yet coherent** on this model — see [Known
+limitations](#known-limitations) and
+[`tests/correctness_diag.md`](tests/correctness_diag.md).
+
+---
+
+## Quick start
+
+```bash
+git clone <this-repo> qw36
+cd qw36
+
+# Build a CPU build (always works) and whichever GPU toolchains exist.
+make cpu        # → ./qw36_cpu
+make metal      # → ./qw36_metal      (macOS, Apple Silicon)
+make cuda       # → ./qw36_cuda       (needs nvcc)
+make amd        # → ./qw36_amd        (needs hipcc / ROCm)
+make all        # builds CPU plus whatever toolchains are present
+
+# Fetch a Qwen3 GGUF (script picks Qwen3.5-0.8B-Q4_K_M by default).
+./tools/download_model.sh
+
+# Run it.
+./qw36_metal -m models/Qwen3.5-0.8B-Q4_K_M.gguf -p "Hello"
+```
+
+`--info` is the cheapest sanity check — it prints the parsed config and
+per-layer attention flavor survey without allocating KV cache:
+
+```bash
+./qw36_cpu -m models/Qwen3.5-0.8B-Q4_K_M.gguf --info
+```
+
+---
+
+## Supported tensor formats
+
+The GGUF loader (`common/qw36_gguf.c`) and dequantizer (`common/qw36.c`)
+cover the K-quants and legacy floats below. Quantized blocks are read into
+fp32 on demand (`matmul_lazy`) or pre-materialized when a GPU backend is
+attached.
+
+| dtype  | enum (`qw36_dtype`) | block size (bytes / 256-elem super-block) |
+|--------|---------------------|-------------------------------------------|
+| F32    | `QW36_DTYPE_F32`    | 4 bytes / element                          |
+| F16    | `QW36_DTYPE_F16`    | 2 bytes / element                          |
+| BF16   | `QW36_DTYPE_BF16`   | 2 bytes / element                          |
+| Q8_0   | `QW36_DTYPE_Q8_0`   | 34 bytes / 32-elem block                   |
+| Q2_K   | `QW36_DTYPE_Q2_K`   | `QK_K/16 + QK_K/4 + 2 + 2` = 84 / 256      |
+| Q3_K   | `QW36_DTYPE_Q3_K`   | `QK_K/8 + QK_K/4 + 12 + 2`  = 110 / 256    |
+| Q4_K   | `QW36_DTYPE_Q4_K`   | `2 + 2 + 12 + QK_K/2`       = 144 / 256    |
+| Q5_K   | `QW36_DTYPE_Q5_K`   | `2 + 2 + 12 + QK_K/8 + QK_K/2` = 176 / 256 |
+| Q6_K   | `QW36_DTYPE_Q6_K`   | `QK_K/2 + QK_K/4 + QK_K/16 + 2` = 210 / 256 |
+
+`QK_K = 256`. Block layouts are byte-equivalent to `ggml-quants.c`; the
+CPU `dequant_*` helpers were diffed against ggml block layouts (commits
+c479cad, 2df5298, ce9343e).
+
+---
+
+## Backends
+
+| backend | binary       | toolchain        | status                                                  |
+|---------|--------------|------------------|---------------------------------------------------------|
+| CPU     | `qw36_cpu`   | clang/gcc        | Reference forward. Slow (1.7 tok/s) but algorithmic-truth. |
+| Metal   | `qw36_metal` | `xcrun metal` + clang | End-to-end on Apple Silicon. fp32 and `QW36_METAL_FP16_WEIGHTS=1` fast paths. Fused decode kernels for q/k norm + RoPE + KV-append and attention score/softmax/combine. Metal MoE wired but not validated. |
+| CUDA    | `qw36_cuda`  | `nvcc`           | Kernel set mirrors Metal (rmsnorm, matmul, head_norm_rope, kv_append, attn). **Not compiled on this Apple host** — code reviewed against the Metal source but unverified. |
+| AMD HIP | `qw36_amd`   | `hipcc` / ROCm   | HIP port of the CUDA kernels. Same caveat — **not compiled on this Apple host**. |
+
+The CPU build links `cpu/qw36_cpu_stub.c`, whose `qw36_backend_create()`
+returns `NULL` so the CLI falls through to the reference forward path in
+`common/qw36.c`.
+
+---
+
+## CLI flags
+
+All four binaries share `common/qw36_cli.c`. Flags:
+
+| flag                   | description                                                                   |
+|------------------------|-------------------------------------------------------------------------------|
+| `-m <path>`            | Path to a GGUF model file. **Required.**                                       |
+| `-p <prompt>`          | Prompt text. Chat-wrapped with `<|im_start|>user … <|im_end|>` unless `--no-special`. |
+| `-n <int>`             | Max new tokens to generate. Default 128.                                       |
+| `-t <float>`           | Sampling temperature. `<= 0` means argmax. Default 0.                          |
+| `--top-p <float>`      | Nucleus sampling threshold. `0` or `1` disables. Default 1.                    |
+| `--top-k <int>`        | Top-K sampling. `0` disables. Default 0.                                       |
+| `--seed <u64>`         | RNG seed for stochastic sampling. Default 42.                                  |
+| `--seq <int>`          | KV cache capacity (tokens). Default 2048.                                      |
+| `--interactive`        | REPL mode (parsed but minimal — single-turn for now).                          |
+| `--no-special`         | Skip the Qwen3 chat template; feed the raw prompt unwrapped.                   |
+| `--debug-top <K>`      | Before each sampling step, dump the top-K logits and decoded token strings.    |
+| `--dump-tokens`        | Tokenize the (chat-wrapped) prompt, print ids + decoded surface forms, exit.   |
+| `--info`               | Print parsed config, tokenizer specials, per-layer attention flavor survey; exit. |
+| `-h`, `--help`         | Usage.                                                                         |
+
+---
+
+## Environment variables
+
+Debug knobs, all read at startup or per-step in `common/qw36.c`:
+
+| var                          | effect                                                                                          |
+|------------------------------|-------------------------------------------------------------------------------------------------|
+| `QW36_METAL_FP16_WEIGHTS=1`  | Metal only. Materialize large lazy weights as fp16 and dispatch MPS half GEMV. ~55 → 81 tok/s on 0.8B-Q4_K_M. Introduces ~1e-3 numerical drift relative to fp32 — off by default so `tests/precision_cpu_vs_metal.sh` stays bit-equal. |
+| `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `‖x‖` and first three components of the residual stream before/after each block. Useful for diffing against a reference run. |
+| `QW36_SKIP_DN=1`             | Zero out the Gated DeltaNet block's contribution to the residual stream. Used to isolate whether DN layers are the source of incoherent output (they contribute nonsense — see `correctness_diag.md` — but vanilla GQA layers also misbehave). |
+| `QW36_SKIP_CONV1D=1`         | Skip the depthwise short-conv inside DN; pass QKV through `silu` only. Distinguishes conv-state ordering bugs from recurrent-state bugs. |
+| `QW36_ROPE_NEOX=1`           | Switch between RoPE pair conventions: `(x[2i], x[2i+1])` (interleaved, default) and `(x[i], x[i+d/2])` (NEOX half-rotation). Documented in `tests/correctness_diag.md`; wiring may still be partial — grep `qw36.c` before relying on it. |
+
+---
+
+## Architecture
+
+### Engine
+
+`qw36_engine_open()` (in `common/qw36.c`) mmaps the GGUF file, parses the
+v3 metadata, derives `qw36_config` (correcting model-metadata bugs — e.g.
+`num_attention_heads` is recovered from `attn_q.weight` shape, not the
+declared field, which is wrong in the 0.8B GGUF), detects per-layer
+attention flavor by checking for `blk.X.attn_q.weight` (vanilla) vs
+`blk.X.attn_qkv.weight` + `blk.X.ssm_conv1d.weight` (DeltaNet), and binds
+every tensor to either a host pointer (small tensors: norms, biases) or a
+**`qw36_lazy_w`** descriptor.
+
+### `qw36_lazy_w`
+
+A lazy weight descriptor records `{ data_ptr, ggml_type, rows, cols }` and,
+optionally, a materialized `gpu_buf`. On a CPU-only run, `matmul_lazy`
+dequantizes one row at a time into a small fp32 scratch and accumulates
+the dot product. With a GPU backend attached, large lazy weights (embed,
+lm_head, every projection inside each layer's hot path) are
+**pre-materialized** at engine-open time — either fp32 or fp16 depending
+on `QW36_METAL_FP16_WEIGHTS` — and the descriptor's `gpu_buf` is set so
+the matmul vtable dispatches straight to MPS / cuBLAS / rocBLAS GEMV
+without re-uploading per step.
+
+### Backend vtable
+
+`common/qw36_gpu.h` defines a single struct of function pointers. Every
+backend exports exactly one symbol, `qw36_backend_create()`, returning a
+pointer to its statically-initialized vtable. The hot path:
+
+- `init` / `destroy` — pick the default device, allocate command queue / stream.
+- `upload` / `download` / `copy_from_host` / `alloc` / `free` — buffer mgmt.
+- `begin_batch` / `end_batch` — optional. Lets a backend hold one command
+  buffer across all ops in a forward step and commit once at the end
+  (Metal uses this; CPU fallback is no-op).
+- `rmsnorm`, `matmul`, `residual_add`, `embedding_lookup`,
+  `swiglu_mlp`, `attention` — the basic kernel set.
+- `dn_conv1d_silu`, `dn_gated_delta`, `dn_gated_rmsnorm` — Gated DeltaNet
+  decode (optional; CUDA/AMD may lag Metal).
+- `moe_forward` — Top-K MoE with shared expert (optional; dense-only
+  backends set to NULL).
+
+### Persistent GPU state
+
+`qw36_state` carries two parallel sets of buffers: host scratch
+(`st->x`, `st->q`, `st->k`, `st->logits`, …) and device buffers
+(`st->x_dev`, `st->q_dev`, `st->logits_dev`, plus per-layer
+`st->k_cache_dev[L]`, `st->v_cache_dev[L]`, `st->conv_state_dev[L]`,
+`st->delta_state_dev[L]`). After task #28 (commit `d24bbbd`), the entire
+residual stream, KV cache, MLP scratch, and logits live on the device
+across decode steps — the host scratch is touched only on debug-trace
+paths, sampling, and the gated_delta_decode host fallback. This is what
+unlocked the 11 → 55 tok/s jump on Metal.
+
+### Gated DeltaNet path
+
+`gated_delta_decode()` in `common/qw36.c` is the host reference for the
+DN block: per-head rank-1 state `S ∈ [n_v_heads, key_dim, val_dim]`
+updated as `S ← g * S + β * (k ⊗ v)` with `g = exp(neg_exp_a * softplus(a + dt_bias))`
+and `β = sigmoid(b)`, then `y = S · q` followed by gated RMSNorm and
+output projection. The Metal backend has a fused `dn_conv1d_silu` +
+`dn_gated_delta` + `dn_gated_rmsnorm` path, modeled on agent-infer's
+`gated_delta_step` kernel (state layout `[B, Hv, Dv, Dk]`, threadgroup
+x=32 simd lanes along Dk, simd-sum reductions for the kv_mem and output
+dot product). CUDA / AMD currently fall back to host for DN.
+
+---
+
+## Reference implementations
+
+We cross-reference two:
+
+- **[agent-infer](../agent-infer)** — Rust + MLX reference for Qwen 3.5
+  semantics. Source of the exact kernel layout we ported to Metal for
+  the Gated DeltaNet step. Notable files:
+  - `crates/qwen35-spec/src/lib.rs` — model arithmetic, `rope_inv_freq`,
+    QK normalization, compute_g_beta.
+  - `crates/mlx-sys/src/mlx_qwen35_model.cpp:203-275` — the
+    `gated_delta_step` Metal kernel.
+- **[llama.cpp](https://github.com/ggerganov/llama.cpp)** — the
+  ground-truth for GGUF tensor layout, K-quant block packing, and decode
+  output. The 170 tok/s number in the hero table is `llama-cli` on the
+  same `Qwen3.5-0.8B-Q4_K_M.gguf` on the same host.
+
+---
+
+## Testing
+
+```bash
+make test
+```
+
+Runs, in order:
+
+- `tests/precision_cpu_vs_metal.sh` — single-step fp32 forward on CPU
+  and Metal, asserts bit-equal logits at step 0. **Currently green.**
+- `tests/e2e_qwen35_smoke.sh ./qw36_cpu` — end-to-end generation, looks
+  for a non-degenerate top-1 token. Informational only — currently
+  regressed (see below).
+- `tests/e2e_qwen35_smoke.sh ./qw36_metal` — same, on Metal. Same caveat.
+
+The open correctness investigation lives at
+**[`tests/correctness_diag.md`](tests/correctness_diag.md)**. It tracks
+what's been ruled out (tokenizer, dequant, GQA mapping, mRoPE sections,
+CPU↔Metal divergence — all fine) and the remaining hypotheses (weight
+access pattern, RoPE pair convention, QK-norm formula, conv1d state
+ordering). That doc is the source of truth for the output-coherence bug.
+
+---
+
+## Known limitations
+
+1. **Output is not yet coherent** on `Qwen3.5-0.8B-Q4_K_M.gguf` (task
+   #31). CPU and Metal produce the same degenerate token distribution
+   (top-1 is `{$`, `:$`, ` $` regardless of prompt) while llama.cpp on
+   the same file is fluent. The bug is somewhere in the shared forward
+   path, not the GPU port. See `tests/correctness_diag.md`.
+2. **GPU MoE is built but unvalidated.** `metal/qw36_metal.m` implements
+   `moe_forward` (route + top-K, expert gate/up, down+combine), but no
+   MoE GGUF is on disk locally so we have no numeric reference. CUDA/AMD
+   MoE not yet implemented.
+3. **35B-A3B does not fit.** Eager weight materialization at engine-open
+   would need ~140 GB fp32 / ~70 GB fp16. A streaming / lazy-quantized
+   matmul path that keeps weights in Q4_K on the device and dequantizes
+   per row inside the kernel is the prereq (task TBD).
+4. **Hybrid layer coverage.** Vanilla GQA layers work end-to-end. Gated
+   DeltaNet layers run on Metal but contribute to the incoherent
+   output; setting `QW36_SKIP_DN=1` removes DN but the remaining vanilla
+   layers are still off — both paths need debugging in lockstep.
+5. **Decode rate degrades with context.** 81 tok/s at n=16 falls to 74
+   at n=128 because attention score/softmax/combine are three separate
+   Metal dispatches per layer; fusing into one MSL kernel is task #30.
+6. **`QW36_ROPE_NEOX=1`** is documented in `correctness_diag.md` but
+   not yet wired into the RoPE call sites — treat as a planned knob.
+
+---
 
 ## Layout
 
 ```
 qw36/
-├── common/         shared C code (engine, loader, tokenizer, CLI)
-│   ├── qw36.h           model config, weights, state, public API
-│   ├── qw36.c           CPU reference forward pass, RMSNorm, RoPE, sampling
-│   ├── qw36_gpu.h       backend vtable — what every backend must implement
-│   ├── qw36_gguf.[ch]   GGUF v3 file loader
-│   ├── qw36_tokenizer.[ch] BPE tokenizer
-│   └── qw36_cli.c       main(), arg parsing, REPL
-├── amd/            HIP backend (qw36_amd.cpp + Makefile)
-├── metal/          Metal backend (qw36_metal.m + qw36_metal.metal + Makefile)
-├── cuda/           CUDA backend (qw36_cuda.cu + Makefile)
-├── tools/          model download / GGUF inspection
-└── tests/          golden vectors, unit harness
+├── common/                 shared host C
+│   ├── qw36.h              public API: config, weights, state, sampler
+│   ├── qw36.c              CPU reference forward, dequant, lazy_w, gated_delta_decode
+│   ├── qw36_gpu.h          backend vtable (frozen)
+│   ├── qw36_gguf.[ch]      GGUF v3 mmap loader
+│   ├── qw36_tokenizer.[ch] BBPE tokenizer + special-token vocab
+│   └── qw36_cli.c          main(), arg parsing, prompt wrapping, generation loop
+├── cpu/                    NULL backend → CPU reference path
+├── metal/                  Metal: qw36_metal.m + qw36_metal.metal (+ .metallib)
+├── cuda/                   CUDA: qw36_cuda.cu
+├── amd/                    HIP:  qw36_amd.cpp
+├── tools/
+│   ├── download_model.sh   pull a Qwen3 GGUF from HF
+│   └── dump_tensor.c       (planned) dequant + print first N elems for diffing
+├── tests/
+│   ├── precision_cpu_vs_metal.sh
+│   ├── e2e_qwen35_smoke.sh
+│   └── correctness_diag.md ← open issue tracker
+├── DIVISION_OF_WORK.md     who-owns-what + perf ladder
+├── Makefile                top-level dispatch
+└── README.md               this file
 ```
-
-## Build
-
-```bash
-make amd      # builds qw36_amd   (requires hipcc)
-make metal    # builds qw36_metal (macOS, Apple Silicon)
-make cuda     # builds qw36_cuda  (requires CUDA toolkit)
-make all      # whichever toolchains are present
-```
-
-## Run
-
-```bash
-./qw36_metal -m models/qwen3.6-4b.gguf -p "Hello, world"
-```
-
-## Model
-
-Qwen 3.6 — dense and MoE variants. Architecture:
-
-- Pre-norm transformer, RMSNorm (eps = 1e-6).
-- Grouped-Query Attention with Q-norm and K-norm.
-- Rotary position embedding (partial rotary).
-- SwiGLU MLP; MoE layers use Top-K routing with optional shared expert.
-- Tied or untied `lm_head`.
-
-See `common/qw36.h` for the exact config struct and tensor-name contract.
-
-## Division of work
-
-See `DIVISION_OF_WORK.md`. Short version: Claude owns the host-side C (loader,
-tokenizer, CPU reference, CLI, build). Codex owns GPU kernels (HIP, Metal
-shaders, CUDA).

@@ -45,6 +45,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> attn_combine;
     id<MTLComputePipelineState> attn_prep_decode;
     id<MTLComputePipelineState> attn_score_combine_tg;
+    id<MTLComputePipelineState> attn_decode_fused;
     /* Cache of MPSMatrixVectorMultiplication objects keyed by
      * "<rows>x<cols>" — building one of these per matmul has measurable
      * cost (Metal shader compile lookup); cache cuts the per-call overhead
@@ -517,6 +518,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_combine     = metal_make_pipeline(ctx, @"qw36_attn_combine_f32", err, err_cap);
     ctx->attn_prep_decode = metal_make_pipeline(ctx, @"qw36_attn_prep_decode_f32", err, err_cap);
     ctx->attn_score_combine_tg = metal_make_pipeline(ctx, @"qw36_attn_score_combine_tg_f32", err, err_cap);
+    ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
         !ctx->f16_to_f32 || !ctx->silu_mul ||
@@ -526,7 +528,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine ||
-        !ctx->attn_prep_decode || !ctx->attn_score_combine_tg) {
+        !ctx->attn_prep_decode || !ctx->attn_score_combine_tg ||
+        !ctx->attn_decode_fused) {
+        ctx->attn_decode_fused = nil;
         ctx->attn_score_combine_tg = nil;
         ctx->attn_prep_decode = nil;
         ctx->attn_combine = nil;
@@ -591,6 +595,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->attn_combine = nil;
     ctx->attn_prep_decode = nil;
     ctx->attn_score_combine_tg = nil;
+    ctx->attn_decode_fused = nil;
     ctx->attn_softmax = nil;
     ctx->attn_scores = nil;
     ctx->kv_append = nil;
@@ -992,6 +997,49 @@ static void metal_attention(qw36_gpu_ctx *ctx,
     metal_matmul(ctx, v, x, wv, 1, kv_len, hidden);
 
     float rms_eps = 1.0e-6f;
+    uint32_t tg_size = 1;
+    while (tg_size < head_dim) tg_size <<= 1;
+
+    if (wq->dtype == QW36_DTYPE_F16 &&
+        wk->dtype == QW36_DTYPE_F16 &&
+        wv->dtype == QW36_DTYPE_F16 &&
+        tg_size <= 256 &&
+        tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
+        positions <= 4096) {
+        int owns_cb = 0;
+        id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
+        uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
+        [enc setComputePipelineState:ctx->attn_decode_fused];
+        [enc setBuffer:y->mtl       offset:0 atIndex:0];
+        [enc setBuffer:q->mtl       offset:0 atIndex:1];
+        [enc setBuffer:k->mtl       offset:0 atIndex:2];
+        [enc setBuffer:v->mtl       offset:0 atIndex:3];
+        [enc setBuffer:k_cache->mtl offset:0 atIndex:4];
+        [enc setBuffer:v_cache->mtl offset:0 atIndex:5];
+        [enc setBuffer:q_norm->mtl  offset:0 atIndex:6];
+        [enc setBuffer:k_norm->mtl  offset:0 atIndex:7];
+        [enc setBytes:&n_heads length:sizeof(n_heads) atIndex:8];
+        [enc setBytes:&n_kv length:sizeof(n_kv) atIndex:9];
+        [enc setBytes:&head_dim length:sizeof(head_dim) atIndex:10];
+        [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:11];
+        [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:12];
+        [enc setBytes:&rope_theta length:sizeof(rope_theta) atIndex:13];
+        [enc setBytes:&partial_rotary_factor length:sizeof(partial_rotary_factor) atIndex:14];
+        [enc setBytes:&rms_eps length:sizeof(rms_eps) atIndex:15];
+        [enc setBytes:&q_w_dtype length:sizeof(q_w_dtype) atIndex:16];
+        [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:17];
+        [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:18];
+        [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
+                                atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc endEncoding];
+        if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+        return;
+    }
+
     NSUInteger prep_n = (NSUInteger)n_heads + n_kv;
     metal_dispatch_1d(ctx, ctx->attn_prep_decode, prep_n, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
@@ -1015,8 +1063,6 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:16];
     });
 
-    uint32_t tg_size = 1;
-    while (tg_size < head_dim) tg_size <<= 1;
     if (tg_size <= 256 &&
         tg_size <= ctx->attn_score_combine_tg.maxTotalThreadsPerThreadgroup &&
         positions <= 4096) {

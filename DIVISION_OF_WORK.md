@@ -91,6 +91,7 @@ other agent picks up from there.
 | 2026-05-20 | Codex  | engine    | d24bbbd  | persistent GPU state (task #28): residual / rms / Q/K/V / KV cache / MLP scratch / logits live on device. DN/MoE still bridge through host. |
 | 2026-05-20 | Codex  | metal     | -        | Opt-in `QW36_METAL_FP16_WEIGHTS=1`: large lazy weights materialize as fp16 and run MPS half GEMV with f32↔f16 staging; q/k norm+RoPE+KV append and score/softmax/combine use fused decode kernels. Qwen3.5-0.8B `Hello -n 50`: 79.6 tok/s decode. |
 | 2026-05-20 | Codex  | metal     | -        | task #23 first pass: Metal MoE route/top-k, expert gate/up, down+combine kernels wired through `backend->moe_forward`; CPU fallback remains. Built on Apple Silicon; no local MoE GGUF found for numeric validation. |
+| 2026-05-20 | Codex  | metal     | -        | task #30: full decode-attention fp16 fast path folds q/k RMSNorm + RoPE + KV append + score/softmax/combine into one MSL dispatch per vanilla layer, using `simd_sum` two-stage head reductions. Qwen3.5-0.8B `Hello`: 82.1 tok/s (`n=50`), 81.8 tok/s (`n=128`). `tests/precision_cpu_vs_metal.sh` passes on the fp32 path. |
 
 ## Reference: agent-infer Metal kernel for Gated Delta Rule
 
@@ -138,21 +139,20 @@ Tracking on Qwen3.5-0.8B-Q4_K_M, M-class GPU:
 | bucketed MTLBuffer pool     | 2cd9da4  | 56   | recycle transient scratch |
 | fp16 weights (opt-in)       | e286627  | **81** | `QW36_METAL_FP16_WEIGHTS=1`, MPS half GEMV |
 | Metal MoE first pass        | efc7f6c  | 81   | task #23 — no MoE in 0.8B so no-op here |
+| full fused decode attention | -        | **82** | task #30 — prep+score+softmax+combine in one fp16 fast-path MSL dispatch |
 
 Sustained (longer ctx) at fp16:
-- n=16:  80.8 tok/s
-- n=64:  76.4 tok/s
-- n=128: 74.3 tok/s
+- n=50:  82.1 tok/s
+- n=128: 81.8 tok/s
 
-Decode rate degrades 81 → 74 as ctx grows — that's the per-position scan
-in `attn_scores` + `attn_softmax` + `attn_combine` dispatched as three
-separate kernels. Closing the remaining gap to ≥85 sustained likely
-needs:
+Decode rate now holds around 82 tok/s through `n=128`. Closing the
+remaining gap to ≥85 sustained likely needs:
 
-1. **Fused decode attention**: single MSL kernel that does score+softmax
-   +combine over the KV cache in one dispatch. Threadgroup per head;
-   simdgroup reduction for the running softmax. Eliminates 2 of the 3
-   dispatch syncs per layer and improves cache locality on the KV scan.
+1. **Further fused decode attention**: the fp16 fast path is one MSL
+   dispatch per vanilla layer, but still stores per-position scores in
+   threadgroup memory and normalizes in a serial lane-0 softmax. A true
+   streaming softmax across lanes may recover the last few tok/s if it
+   avoids extra barriers.
 2. **fp16 KV cache**: halves the bytes scanned in attention. The
    conversion only happens once at kv_append; reads stay cheap.
 3. **lm_head over fp16 weights**: already covered by

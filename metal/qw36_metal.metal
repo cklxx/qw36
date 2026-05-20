@@ -731,6 +731,140 @@ kernel void qw36_attn_score_combine_tg_f32(
     }
 }
 
+kernel void qw36_attn_decode_fused_f32(
+    device float       *y            [[buffer(0)]],
+    device const float *q_raw        [[buffer(1)]],
+    device const float *k_raw        [[buffer(2)]],
+    device const float *v_raw        [[buffer(3)]],
+    device float       *k_cache      [[buffer(4)]],
+    device float       *v_cache      [[buffer(5)]],
+    device const uchar *q_norm       [[buffer(6)]],
+    device const uchar *k_norm       [[buffer(7)]],
+    constant uint      &n_heads      [[buffer(8)]],
+    constant uint      &n_kv         [[buffer(9)]],
+    constant uint      &head_dim     [[buffer(10)]],
+    constant uint      &seq_pos      [[buffer(11)]],
+    constant uint      &seq_capacity [[buffer(12)]],
+    constant float     &theta        [[buffer(13)]],
+    constant float     &partial      [[buffer(14)]],
+    constant float     &eps          [[buffer(15)]],
+    constant uint      &q_w_dtype    [[buffer(16)]],
+    constant uint      &k_w_dtype    [[buffer(17)]],
+    constant uint      &tg_size      [[buffer(18)]],
+    threadgroup float  *scratch      [[threadgroup(0)]],
+    uint                lane         [[thread_index_in_threadgroup]],
+    uint3               tg_pos       [[threadgroup_position_in_grid]])
+{
+    uint h = tg_pos.x;
+    if (h >= n_heads || seq_pos >= seq_capacity) return;
+
+    uint kvh = h * n_kv / n_heads;
+    uint kv_len = n_kv * head_dim;
+    uint count = seq_pos + 1;
+    uint rot_dim = uint(float(head_dim) * partial);
+    if (rot_dim > head_dim) rot_dim = head_dim;
+    rot_dim &= ~1u;
+    uint half_dim = rot_dim / 2;
+
+    threadgroup float *partials = scratch;
+    threadgroup float *scores = scratch + tg_size;
+    uint simd_lane = lane & 31u;
+    uint simd_id = lane >> 5;
+    uint simd_count = (tg_size + 31u) >> 5;
+
+    device const float *qh_base = q_raw + h * head_dim;
+    device const float *kh_base = k_raw + kvh * head_dim;
+
+    float q_in = (lane < head_dim) ? qh_base[lane] : 0.0f;
+    float k_in = (lane < head_dim) ? kh_base[lane] : 0.0f;
+    float q_ss = simd_sum((lane < head_dim) ? q_in * q_in : 0.0f);
+    if (simd_lane == 0) partials[simd_id] = q_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    q_ss = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+    if (lane == 0) partials[0] = q_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_scale = rsqrt(partials[0] / float(head_dim) + eps);
+
+    float k_ss = simd_sum((lane < head_dim) ? k_in * k_in : 0.0f);
+    if (simd_lane == 0) partials[simd_id] = k_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    k_ss = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+    if (lane == 0) partials[0] = k_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_scale = rsqrt(partials[0] / float(head_dim) + eps);
+
+    float qv = 0.0f;
+    float kv = 0.0f;
+    if (lane < head_dim) {
+        qv = q_in * q_scale * qw36_load_scalar(q_norm, q_w_dtype, lane);
+        kv = k_in * k_scale * qw36_load_scalar(k_norm, k_w_dtype, lane);
+        if (lane < rot_dim) {
+            bool upper = lane >= half_dim;
+            uint pair = upper ? (lane - half_dim) : lane;
+            uint d0 = pair;
+            uint d1 = pair + half_dim;
+            float q0 = qh_base[d0] * q_scale * qw36_load_scalar(q_norm, q_w_dtype, d0);
+            float q1 = qh_base[d1] * q_scale * qw36_load_scalar(q_norm, q_w_dtype, d1);
+            float k0 = kh_base[d0] * k_scale * qw36_load_scalar(k_norm, k_w_dtype, d0);
+            float k1 = kh_base[d1] * k_scale * qw36_load_scalar(k_norm, k_w_dtype, d1);
+            float inv_freq = 1.0f / pow(theta, (2.0f * float(pair)) / float(rot_dim));
+            float angle = float(seq_pos) * inv_freq;
+            float c = cos(angle);
+            float s = sin(angle);
+            qv = upper ? (q0 * s + q1 * c) : (q0 * c - q1 * s);
+            kv = upper ? (k0 * s + k1 * c) : (k0 * c - k1 * s);
+        }
+    }
+
+    if (lane < head_dim && h == kvh * n_heads / n_kv) {
+        uint off = seq_pos * kv_len + kvh * head_dim + lane;
+        k_cache[off] = kv;
+        v_cache[off] = v_raw[kvh * head_dim + lane];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_sqrt_d = rsqrt(float(head_dim));
+    for (uint t = 0; t < count; ++t) {
+        float kval = 0.0f;
+        if (lane < head_dim) {
+            kval = (t == seq_pos)
+                ? kv
+                : k_cache[t * kv_len + kvh * head_dim + lane];
+        }
+        float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
+        if (simd_lane == 0) partials[simd_id] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+        if (lane == 0) scores[t] = dot * inv_sqrt_d;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        float maxv = scores[0];
+        for (uint t = 1; t < count; ++t) maxv = max(maxv, scores[t]);
+        float sum = 0.0f;
+        for (uint t = 0; t < count; ++t) {
+            float e = exp(scores[t] - maxv);
+            scores[t] = e;
+            sum += e;
+        }
+        float inv_sum = 1.0f / sum;
+        for (uint t = 0; t < count; ++t) scores[t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane < head_dim) {
+        float acc = 0.0f;
+        for (uint t = 0; t < count; ++t) {
+            float vv = (t == seq_pos)
+                ? v_raw[kvh * head_dim + lane]
+                : v_cache[t * kv_len + kvh * head_dim + lane];
+            acc += scores[t] * vv;
+        }
+        y[h * head_dim + lane] = acc;
+    }
+}
+
 /* =============================================================================
  * Gated Delta Rule step — transliterated from agent-infer's
  *   ../agent-infer/crates/mlx-sys/src/mlx_qwen35_model.cpp:203-275
