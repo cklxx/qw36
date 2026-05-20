@@ -23,6 +23,7 @@ static void usage(const char *prog) {
         "usage: %s -m <model.gguf> [-p <prompt>] [-n <max_new_tokens>]\n"
         "          [-t <temperature>] [--top-p <p>] [--top-k <k>] [--seed <u64>]\n"
         "          [--seq <capacity>] [--interactive] [--no-special]\n"
+        "          [--layer-trace <L> --layer-trace-out <path>] [--layer-trace-pos <pos>]\n"
         "          [--info]    print config + tokenizer summary and exit\n"
         "\n"
         "binary: %s\n", prog, qw36_version());
@@ -42,6 +43,9 @@ typedef struct {
     int   no_special;
     int   debug_top;     /* print top-K logits per step */
     int   dump_tokens;   /* tokenize the prompt and exit */
+    int   layer_trace;   /* vanilla layer index to dump, -1 disables */
+    int   layer_trace_pos; /* optional seq_pos filter for trace */
+    const char *layer_trace_out;
 } qw36_cli_args;
 
 static int parse_args(int argc, char **argv, qw36_cli_args *a) {
@@ -51,6 +55,8 @@ static int parse_args(int argc, char **argv, qw36_cli_args *a) {
     a->top_k        = 0;
     a->seed         = 42;
     a->seq_capacity = 2048;
+    a->layer_trace  = -1;
+    a->layer_trace_pos = -1;
     for (int i = 1; i < argc; i++) {
         const char *s = argv[i];
         #define EAT() (i + 1 < argc ? argv[++i] : NULL)
@@ -67,6 +73,9 @@ static int parse_args(int argc, char **argv, qw36_cli_args *a) {
         else if (!strcmp(s, "--no-special"))  a->no_special = 1;
         else if (!strcmp(s, "--debug-top"))   a->debug_top = atoi(EAT());
         else if (!strcmp(s, "--dump-tokens")) a->dump_tokens = 1;
+        else if (!strcmp(s, "--layer-trace")) a->layer_trace = atoi(EAT());
+        else if (!strcmp(s, "--layer-trace-out")) a->layer_trace_out = EAT();
+        else if (!strcmp(s, "--layer-trace-pos")) a->layer_trace_pos = atoi(EAT());
         else if (!strcmp(s, "-h") || !strcmp(s, "--help")) { usage(argv[0]); return 1; }
         else { fprintf(stderr, "unknown arg: %s\n", s); usage(argv[0]); return -1; }
         #undef EAT
@@ -203,6 +212,23 @@ int main(int argc, char **argv) {
     if (build_prompt_ids(tok, a.prompt, !a.no_special, &pids, &pn)) {
         fprintf(stderr, "qw36: tokenize failed\n");
         qw36_state_free(st); qw36_tokenizer_free(tok); qw36_engine_close(eng); return 7;
+    }
+    if (a.layer_trace >= 0) {
+        if (!a.layer_trace_out || !a.layer_trace_out[0]) {
+            fprintf(stderr, "qw36: --layer-trace requires --layer-trace-out <path>\n");
+            free(pids); qw36_state_free(st); qw36_tokenizer_free(tok);
+            qw36_engine_close(eng); return 7;
+        }
+        char trace_buf[32];
+        snprintf(trace_buf, sizeof(trace_buf), "%d", a.layer_trace);
+        setenv("QW36_TRACE_LAYER", trace_buf, 1);
+        setenv("QW36_TRACE_OUT", a.layer_trace_out, 1);
+        if (a.layer_trace_pos >= 0) {
+            snprintf(trace_buf, sizeof(trace_buf), "%d", a.layer_trace_pos);
+            setenv("QW36_TRACE_POS", trace_buf, 1);
+        } else {
+            unsetenv("QW36_TRACE_POS");
+        }
     }
     fprintf(stderr, "qw36: prompt tokens = %zu\n", pn);
 

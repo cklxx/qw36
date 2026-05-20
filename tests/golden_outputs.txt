@@ -1,0 +1,23 @@
+# Ground-truth outputs from MLX (Qwen3.5-0.8B-MLX-4bit) for #31 acceptance.
+# qw36 should produce similar (token-level may differ due to fp/quant; semantically close).
+
+PROMPT: Hello
+EXPECTED (MLX):
+,
+I am writing to express my interest in the opportunity to work with you.
+I am a 20-year-old female, and I am looking
+
+PROMPT: 写一首关于秋天的古诗
+EXPECTED (MLX):
+
+
+<think>
+
+</think>
+
+这是一首描写秋天景色的七言律诗，旨在通过视觉、嗅觉和触觉的层层递进，展现秋天那种成熟、宁静与收获的氛围。
+
+### 《秋夜怀远》
+
+**晚风微露湿衣襟，**
+**落叶归根入梦深**

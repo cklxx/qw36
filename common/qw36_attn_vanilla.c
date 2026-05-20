@@ -23,6 +23,91 @@ static float sigmoid_f32(float x)
     return 1.0f / (1.0f + expf(-x));
 }
 
+typedef struct {
+    int init;
+    int layer;
+    int pos;
+    int take;
+    int finished;
+    int wrote_any;
+    uint32_t active_layer;
+    uint32_t active_pos;
+    const char *out_path;
+    FILE *fp;
+} qw36_trace_state;
+
+static qw36_trace_state *trace_begin(uint32_t layer_idx, uint32_t seq_pos)
+{
+    static qw36_trace_state ts;
+    if (!ts.init) {
+        const char *l = getenv("QW36_TRACE_LAYER");
+        const char *p = getenv("QW36_TRACE_POS");
+        const char *t = getenv("QW36_TRACE_TAKE");
+        ts.layer = l ? atoi(l) : -1;
+        ts.pos = p ? atoi(p) : -1;
+        ts.take = t ? atoi(t) : 32;
+        if (ts.take <= 0) ts.take = 32;
+        ts.out_path = getenv("QW36_TRACE_OUT");
+        ts.init = 1;
+    }
+    if (ts.finished || ts.fp || ts.layer != (int)layer_idx)
+        return NULL;
+    if (ts.pos >= 0 && ts.pos != (int)seq_pos)
+        return NULL;
+    if (!ts.out_path || !ts.out_path[0])
+        return NULL;
+
+    ts.fp = fopen(ts.out_path, "w");
+    if (!ts.fp) {
+        fprintf(stderr, "qw36: failed to open layer trace output: %s\n",
+                ts.out_path);
+        ts.finished = 1;
+        return NULL;
+    }
+    ts.active_layer = layer_idx;
+    ts.active_pos = seq_pos;
+    ts.wrote_any = 0;
+    fprintf(ts.fp,
+            "{\n"
+            "  \"layer\": %u,\n"
+            "  \"seq_pos\": %u,\n"
+            "  \"captured\": {\n",
+            layer_idx, seq_pos);
+    return &ts;
+}
+
+static void trace_tensor(qw36_trace_state *ts, const char *name,
+                         const float *x, size_t n,
+                         const size_t *shape, size_t ndim)
+{
+    if (!ts || !ts->fp || !name || !x) return;
+    size_t take = n < (size_t)ts->take ? n : (size_t)ts->take;
+    if (ts->wrote_any) fprintf(ts->fp, ",\n");
+    fprintf(ts->fp, "    \"%s\": {\"shape\": [", name);
+    for (size_t i = 0; i < ndim; i++) {
+        if (i) fprintf(ts->fp, ", ");
+        fprintf(ts->fp, "%zu", shape[i]);
+    }
+    fprintf(ts->fp, "], \"first_n\": [");
+    for (size_t i = 0; i < take; i++) {
+        if (i) fprintf(ts->fp, ", ");
+        fprintf(ts->fp, "%.9g", x[i]);
+    }
+    fprintf(ts->fp, "]}");
+    ts->wrote_any = 1;
+}
+
+static void trace_finish(qw36_trace_state *ts)
+{
+    if (!ts || !ts->fp) return;
+    fprintf(ts->fp, "\n  }\n}\n");
+    fclose(ts->fp);
+    ts->fp = NULL;
+    ts->finished = 1;
+    fprintf(stderr, "qw36: wrote layer trace L%u pos %u to %s\n",
+            ts->active_layer, ts->active_pos, ts->out_path);
+}
+
 int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                                const qw36_layer_weights *L,
                                uint32_t layer_idx)
@@ -92,6 +177,16 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                                         c->partial_rotary_factor);
     float *staging = st->attn_scores
                    + (size_t)c->num_attention_heads * (st->seq_capacity + 1);
+    qw36_trace_state *trace = trace_begin(layer_idx, st->seq_pos);
+    size_t shape_hidden[3] = {1, 1, hidden};
+    size_t shape_q_raw[3] = {1, 1, c->has_q_gate ? (size_t)q_dim * 2 : q_dim};
+    size_t shape_q_split[4] = {1, 1, c->num_attention_heads, c->head_dim};
+    size_t shape_q_heads[4] = {1, c->num_attention_heads, 1, c->head_dim};
+    size_t shape_kv_raw[3] = {1, 1, kv_dim};
+    size_t shape_kv_heads[4] = {1, c->num_key_value_heads, 1, c->head_dim};
+    size_t shape_flat_q[3] = {1, 1, q_dim};
+    trace_tensor(trace, "input_layernorm_out", st->x_rms, hidden,
+                 shape_hidden, 3);
 
     int used_backend_attention = 0;
     if (!c->has_q_gate) {
@@ -107,6 +202,8 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
             v_rc |= qw36__matmul_lazy(st->q_full, st->x_rms,
                                       (const qw36_lazy_w *)L->q_proj,
                                       fc->row_scratch);
+            trace_tensor(trace, "q_proj_raw", st->q_full, (size_t)q_dim * 2,
+                         shape_q_raw, 3);
             for (uint32_t h = 0; h < c->num_attention_heads; h++) {
                 const float *src = st->q_full + (size_t)h * 2 * c->head_dim;
                 float *qd = st->q + (size_t)h * c->head_dim;
@@ -114,10 +211,15 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                 memcpy(qd, src, c->head_dim * sizeof(float));
                 memcpy(gd, src + c->head_dim, c->head_dim * sizeof(float));
             }
+            trace_tensor(trace, "q_split_pre_norm", st->q, q_dim,
+                         shape_q_split, 4);
+            trace_tensor(trace, "gate_split", st->q_gate, q_dim,
+                         shape_q_split, 4);
         } else {
             v_rc |= qw36__matmul_lazy(st->q, st->x_rms,
                                       (const qw36_lazy_w *)L->q_proj,
                                       fc->row_scratch);
+            trace_tensor(trace, "q_proj_raw", st->q, q_dim, shape_q_raw, 3);
         }
 
         float *k_row = (float *)st->k_cache[layer_idx]
@@ -130,6 +232,8 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
         v_rc |= qw36__matmul_lazy(v_row, st->x_rms,
                                   (const qw36_lazy_w *)L->v_proj,
                                   fc->row_scratch);
+        trace_tensor(trace, "k_proj_raw", k_row, kv_dim, shape_kv_raw, 3);
+        trace_tensor(trace, "v_proj_raw", v_row, kv_dim, shape_kv_raw, 3);
         if (v_rc) {
             fprintf(stderr, "qw36: vanilla QKV failed at layer %u "
                     "(ggml types %d/%d/%d)\n", layer_idx,
@@ -144,6 +248,7 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
             qw36__rmsnorm_dispatch(qh, qh, (const float *)L->q_norm,
                                    c->head_dim, c->rms_norm_eps);
         }
+        trace_tensor(trace, "q_post_norm", st->q, q_dim, shape_q_heads, 4);
         for (uint32_t h = 0; h < c->num_attention_heads; h++) {
             float *qh = st->q + (size_t)h * c->head_dim;
             qw36__rope_head(qh, st->seq_pos, rot_dim, c->rope_theta,
@@ -155,12 +260,15 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
             qw36__rmsnorm_dispatch(kh, kh, (const float *)L->k_norm,
                                    c->head_dim, c->rms_norm_eps);
         }
+        trace_tensor(trace, "k_post_norm", k_row, kv_dim, shape_kv_heads, 4);
         for (uint32_t h = 0; h < c->num_key_value_heads; h++) {
             float *kh = k_row + (size_t)h * c->head_dim;
             qw36__rope_head(kh, st->seq_pos, rot_dim, c->rope_theta,
                             c->rope_n_sections ? c->rope_sections : NULL,
                             c->rope_n_sections);
         }
+        trace_tensor(trace, "q_post_rope", st->q, q_dim, shape_q_heads, 4);
+        trace_tensor(trace, "k_post_rope", k_row, kv_dim, shape_kv_heads, 4);
 
         const float inv_sqrt_d = 1.0f / sqrtf((float)c->head_dim);
         for (uint32_t h = 0; h < c->num_attention_heads; h++) {
@@ -198,15 +306,21 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
         }
     }
 
+    trace_tensor(trace, "attn_out_pre_gate", staging, q_dim,
+                 shape_q_heads, 4);
     if (c->has_q_gate) {
         for (uint32_t i = 0; i < q_dim; i++)
             staging[i] *= sigmoid_f32(st->q_gate[i]);
+        trace_tensor(trace, "attn_out_gated", staging, q_dim,
+                     shape_flat_q, 3);
     }
 
     if (qw36__matmul_lazy(st->x_rms, staging,
                           (const qw36_lazy_w *)L->o_proj,
                           fc->row_scratch))
         return -6;
+    trace_tensor(trace, "o_proj_out", st->x_rms, hidden, shape_hidden, 3);
+    trace_finish(trace);
     qw36__residual_add_dispatch(x, st->x_rms, hidden);
 
     *fc->x_host_valid = 1;
