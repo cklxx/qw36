@@ -1128,3 +1128,247 @@ kernel void qw36_gated_delta_step_f32(
     for (uint i = 0; i < n_per_t; ++i)
         o_state[n_per_t * dk_idx + i] = state[i];
 }
+
+/* =============================================================================
+ * GGUF-native quantized matmul. Ported from agent-infer's
+ *   crates/mlx-sys/src/mlx_bridge.cpp:620-743, 748-812
+ * Operates directly on packed Q4_K/Q5_K/Q6_K/Q8_0/Q3_K row bytes — no fp16
+ * materialise step, no MPS-GEMV round-trip. One threadgroup per output row,
+ * 256 threads collaborate via threadgroup reduction.
+ * ========================================================================== */
+
+static inline float qw36_gguf_f16(device const uchar *p)
+{
+    ushort bits = ushort(p[0]) | (ushort(p[1]) << 8);
+    return float(as_type<half>(bits));
+}
+
+static inline int qw36_gguf_i8(uchar v)
+{
+    int x = int(v);
+    return x >= 128 ? x - 256 : x;
+}
+
+static inline void qw36_gguf_q4_scales(device const uchar *s,
+                                       thread uchar sc[8], thread uchar mn[8])
+{
+    for (int i = 0; i < 4; ++i) {
+        sc[i] = s[i] & 0x3f;
+        mn[i] = s[i + 4] & 0x3f;
+    }
+    for (int i = 0; i < 4; ++i) {
+        sc[4 + i] = (s[8 + i] & 0x0f) | ((s[i] >> 6) << 4);
+        mn[4 + i] = (s[8 + i] >> 4) | ((s[i + 4] >> 6) << 4);
+    }
+}
+
+static inline float qw36_gguf_q4_k_value(device const uchar *row, int k)
+{
+    int sb = k >> 8;
+    int local = k & 255;
+    device const uchar *p = row + sb * 144;
+    float d = qw36_gguf_f16(p);
+    float dmin = qw36_gguf_f16(p + 2);
+    uchar sc[8], mn[8];
+    qw36_gguf_q4_scales(p + 4, sc, mn);
+    int iter = local >> 6;
+    int h = (local >> 5) & 1;
+    int lane = local & 31;
+    int sub = iter * 2 + h;
+    uchar byte = p[16 + iter * 32 + lane];
+    float q = h == 0 ? float(byte & 0x0f) : float(byte >> 4);
+    return q * (d * float(sc[sub])) - dmin * float(mn[sub]);
+}
+
+static inline float qw36_gguf_q6_k_value(device const uchar *row, int k)
+{
+    int sb = k >> 8;
+    int local = k & 255;
+    device const uchar *p = row + sb * 210;
+    device const uchar *ql_all = p;
+    device const uchar *qh_all = p + 128;
+    device const uchar *scales_all = p + 192;
+    float d = qw36_gguf_f16(p + 208);
+    int h = local >> 7;
+    int rem = local & 127;
+    int lane = rem & 31;
+    device const uchar *ql = ql_all + h * 64;
+    device const uchar *qh = qh_all + h * 32;
+    device const uchar *sc = scales_all + h * 8;
+    int q;
+    int scale_idx;
+    if (rem < 32) {
+        q = int((ql[lane] & 0x0f) | ((qh[lane] & 0x03) << 4)) - 32;
+        scale_idx = lane / 16;
+    } else if (rem < 64) {
+        q = int((ql[lane + 32] & 0x0f) | (((qh[lane] >> 2) & 0x03) << 4)) - 32;
+        scale_idx = lane / 16 + 2;
+    } else if (rem < 96) {
+        q = int((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4)) - 32;
+        scale_idx = lane / 16 + 4;
+    } else {
+        q = int((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4)) - 32;
+        scale_idx = lane / 16 + 6;
+    }
+    return d * float(qw36_gguf_i8(sc[scale_idx])) * float(q);
+}
+
+static inline float qw36_gguf_q5_k_value(device const uchar *row, int k)
+{
+    int sb = k >> 8;
+    int local = k & 255;
+    device const uchar *p = row + sb * 176;
+    float d = qw36_gguf_f16(p);
+    float dmin = qw36_gguf_f16(p + 2);
+    uchar sc[8], mn[8];
+    qw36_gguf_q4_scales(p + 4, sc, mn);
+    device const uchar *qh = p + 16;
+    device const uchar *qs = p + 48;
+    int iter = local >> 6;
+    int h = (local >> 5) & 1;
+    int lane = local & 31;
+    int sub = iter * 2 + h;
+    uchar byte = qs[iter * 32 + lane];
+    int nib = h == 0 ? int(byte & 0x0f) : int(byte >> 4);
+    int hi = (int(qh[lane]) >> sub) & 1;
+    float q = float(nib | (hi << 4));
+    return q * (d * float(sc[sub])) - dmin * float(mn[sub]);
+}
+
+static inline float qw36_gguf_q8_0_value(device const uchar *row, int k)
+{
+    int block = k >> 5;
+    int lane = k & 31;
+    device const uchar *p = row + block * 34;
+    return qw36_gguf_f16(p) * float(qw36_gguf_i8(p[2 + lane]));
+}
+
+/* Q4_K matmul: y[n] = sum_k x[k] * dequant(w_row_n[k])
+ * Threadgroup grid: (N rows, 1, 1). Threads per group: 256. */
+kernel void qw36_matmul_q4_k_f32(
+    device float       *y    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device const uchar *w    [[buffer(2)]],
+    constant uint      &K    [[buffer(3)]],
+    constant uint      &N    [[buffer(4)]],
+    threadgroup float  *partial [[threadgroup(0)]],
+    uint tid                 [[thread_position_in_threadgroup]],
+    uint n                   [[threadgroup_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint TG = 256u;
+    uint row_bytes = (K / 256u) * 144u;
+    device const uchar *row = w + n * row_bytes;
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += TG) {
+        sum += x[k] * qw36_gguf_q4_k_value(row, int(k));
+    }
+    /* simd_sum-based reduction: collapse each 32-wide SIMD group with one
+     * intrinsic, then reduce the 8 partials in a single SIMD step. */
+    float simd_v = simd_sum(sum);
+    uint simd_lane = tid & 31u;
+    uint simd_id = tid >> 5;
+    if (simd_lane == 0u) partial[simd_id] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (TG >> 5)) {
+        float v = partial[tid];
+        v = simd_sum(v);
+        if (tid == 0u) y[n] = v;
+    }
+}
+
+kernel void qw36_matmul_q6_k_f32(
+    device float       *y    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device const uchar *w    [[buffer(2)]],
+    constant uint      &K    [[buffer(3)]],
+    constant uint      &N    [[buffer(4)]],
+    threadgroup float  *partial [[threadgroup(0)]],
+    uint tid                 [[thread_position_in_threadgroup]],
+    uint n                   [[threadgroup_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint TG = 256u;
+    uint row_bytes = (K / 256u) * 210u;
+    device const uchar *row = w + n * row_bytes;
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += TG) {
+        sum += x[k] * qw36_gguf_q6_k_value(row, int(k));
+    }
+    /* simd_sum-based reduction: collapse each 32-wide SIMD group with one
+     * intrinsic, then reduce the 8 partials in a single SIMD step. */
+    float simd_v = simd_sum(sum);
+    uint simd_lane = tid & 31u;
+    uint simd_id = tid >> 5;
+    if (simd_lane == 0u) partial[simd_id] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (TG >> 5)) {
+        float v = partial[tid];
+        v = simd_sum(v);
+        if (tid == 0u) y[n] = v;
+    }
+}
+
+kernel void qw36_matmul_q5_k_f32(
+    device float       *y    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device const uchar *w    [[buffer(2)]],
+    constant uint      &K    [[buffer(3)]],
+    constant uint      &N    [[buffer(4)]],
+    threadgroup float  *partial [[threadgroup(0)]],
+    uint tid                 [[thread_position_in_threadgroup]],
+    uint n                   [[threadgroup_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint TG = 256u;
+    uint row_bytes = (K / 256u) * 176u;
+    device const uchar *row = w + n * row_bytes;
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += TG) {
+        sum += x[k] * qw36_gguf_q5_k_value(row, int(k));
+    }
+    /* simd_sum-based reduction: collapse each 32-wide SIMD group with one
+     * intrinsic, then reduce the 8 partials in a single SIMD step. */
+    float simd_v = simd_sum(sum);
+    uint simd_lane = tid & 31u;
+    uint simd_id = tid >> 5;
+    if (simd_lane == 0u) partial[simd_id] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (TG >> 5)) {
+        float v = partial[tid];
+        v = simd_sum(v);
+        if (tid == 0u) y[n] = v;
+    }
+}
+
+kernel void qw36_matmul_q8_0_f32(
+    device float       *y    [[buffer(0)]],
+    device const float *x    [[buffer(1)]],
+    device const uchar *w    [[buffer(2)]],
+    constant uint      &K    [[buffer(3)]],
+    constant uint      &N    [[buffer(4)]],
+    threadgroup float  *partial [[threadgroup(0)]],
+    uint tid                 [[thread_position_in_threadgroup]],
+    uint n                   [[threadgroup_position_in_grid]])
+{
+    if (n >= N) return;
+    const uint TG = 256u;
+    uint row_bytes = (K / 32u) * 34u;
+    device const uchar *row = w + n * row_bytes;
+    float sum = 0.0f;
+    for (uint k = tid; k < K; k += TG) {
+        sum += x[k] * qw36_gguf_q8_0_value(row, int(k));
+    }
+    /* simd_sum-based reduction: collapse each 32-wide SIMD group with one
+     * intrinsic, then reduce the 8 partials in a single SIMD step. */
+    float simd_v = simd_sum(sum);
+    uint simd_lane = tid & 31u;
+    uint simd_id = tid >> 5;
+    if (simd_lane == 0u) partial[simd_id] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < (TG >> 5)) {
+        float v = partial[tid];
+        v = simd_sum(v);
+        if (tid == 0u) y[n] = v;
+    }
+}

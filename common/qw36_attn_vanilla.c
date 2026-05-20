@@ -127,11 +127,21 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     const qw36_lazy_w *wq_lw = (const qw36_lazy_w *)L->q_proj;
     const qw36_lazy_w *wk_lw = (const qw36_lazy_w *)L->k_proj;
     const qw36_lazy_w *wv_lw = (const qw36_lazy_w *)L->v_proj;
-    const int qgate_gpu_ok = !c->has_q_gate ||
-        (wq_lw && wk_lw && wv_lw &&
-         wq_lw->dtype == QW36_DTYPE_F16 &&
-         wk_lw->dtype == QW36_DTYPE_F16 &&
-         wv_lw->dtype == QW36_DTYPE_F16);
+    /* The fused decode kernel reads q/k/v as fp32; the matmul writing them
+     * may be either MPS (when weights are F16) or the native quantised
+     * dequant+gemv kernel (when weights stay Q4_K/Q5_K/Q6_K/Q8_0 on GPU).
+     * Either path produces fp32 q/k/v, so allow the fused fast-path in both
+     * cases — the slower prep+score+combine fallback still cannot consume
+     * the gated q layout, so non-fused matmul backends fall back to CPU. */
+    #define QW36_FUSED_DTYPE_OK(d_) ((d_) == QW36_DTYPE_F16 || \
+        (d_) == QW36_DTYPE_Q4_K || (d_) == QW36_DTYPE_Q5_K || \
+        (d_) == QW36_DTYPE_Q6_K || (d_) == QW36_DTYPE_Q8_0)
+    const int dtype_ok = wq_lw && wk_lw && wv_lw &&
+        QW36_FUSED_DTYPE_OK(wq_lw->dtype) &&
+        QW36_FUSED_DTYPE_OK(wk_lw->dtype) &&
+        QW36_FUSED_DTYPE_OK(wv_lw->dtype);
+    #undef QW36_FUSED_DTYPE_OK
+    const int qgate_gpu_ok = !c->has_q_gate || dtype_ok;
     if (qgate_gpu_ok &&
         fc->gpu_state && eng->backend && eng->backend->rmsnorm &&
         eng->backend->matmul && eng->backend->attention &&

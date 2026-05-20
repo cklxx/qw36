@@ -99,6 +99,30 @@ size_t qw36__dtype_nbytes(qw36_dtype dtype) {
     }
 }
 
+/* Total byte count for an n-element tensor in `dtype`. Handles dense and
+ * block-quantised dtypes uniformly: dense returns numel*sizeof(elem); quant
+ * returns (numel / qk) * bytes_per_block. */
+static size_t qw36_tensor_bytes(qw36_dtype dtype, size_t numel) {
+    size_t elem = qw36__dtype_nbytes(dtype);
+    if (elem) return numel * elem;
+    switch (dtype) {
+        case QW36_DTYPE_Q2_K: return (numel / 256u) *  84u;
+        case QW36_DTYPE_Q3_K: return (numel / 256u) * 110u;
+        case QW36_DTYPE_Q4_K: return (numel / 256u) * 144u;
+        case QW36_DTYPE_Q5_K: return (numel / 256u) * 176u;
+        case QW36_DTYPE_Q6_K: return (numel / 256u) * 210u;
+        case QW36_DTYPE_Q8_0: return (numel /  32u) *  34u;
+        default: return 0;
+    }
+}
+
+static int qw36_dtype_is_native_gpu_quant(qw36_dtype dt) {
+    /* Quantised dtypes for which the Metal backend has a native on-device
+     * matmul kernel. CUDA/AMD don't yet, so callers gate on backend name. */
+    return dt == QW36_DTYPE_Q4_K || dt == QW36_DTYPE_Q5_K ||
+           dt == QW36_DTYPE_Q6_K || dt == QW36_DTYPE_Q8_0;
+}
+
 /* Read element i of a tensor in storage dtype, return fp32. */
 static float load_elem_f32(const void *data, qw36_dtype dt, size_t i) {
     switch (dt) {
@@ -1555,6 +1579,15 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         const int fp16_lazy_weights =
             backend->name && strcmp(backend->name, "metal") == 0 &&
             fp16_env && atoi(fp16_env) != 0;
+        /* QW36_METAL_QUANT_GPU=1 keeps Q4_K/Q5_K/Q6_K/Q8_0 weights in their
+         * packed layout on the GPU and dispatches a native dequant+gemv
+         * kernel per matmul. Skips the fp16 materialise (saves RAM) and the
+         * f32↔f16 round-trip per call (lower per-op overhead, higher
+         * effective bandwidth utilisation). Overrides fp16_lazy_weights. */
+        const char *qgpu_env = getenv("QW36_METAL_QUANT_GPU");
+        const int quant_gpu_weights =
+            backend->name && strcmp(backend->name, "metal") == 0 &&
+            qgpu_env && atoi(qgpu_env) != 0;
 
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
@@ -1562,7 +1595,14 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             NULL
         };
         for (size_t i = 0; lws[i]; i++) {
-            int mrc = fp16_lazy_weights
+            /* Embed/lm_head stay materialised even in quant-GPU mode. The
+             * on-device dequant+gemv kernel is one threadgroup per output
+             * row — for the lm_head head (vocab × hidden ≈ 152k × 1024)
+             * that is 152k threadgroups, far slower than MPS fp16 gemv,
+             * so we keep them in dense form. Layer weights are small
+             * enough (n_heads*head_dim rows) that the per-row kernel wins. */
+            const int want_f16 = fp16_lazy_weights || quant_gpu_weights;
+            int mrc = want_f16
                 ? lazy_materialize_f16(eng, lws[i])
                 : lazy_materialize_f32(eng, lws[i]);
             if (mrc) {
@@ -1578,7 +1618,9 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
 
         #define MAT_AS(field, want_f16_) do { \
             qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
-            int mrc = lw ? ((want_f16_) \
+            int skip_mat = lw && quant_gpu_weights && \
+                qw36_dtype_is_native_gpu_quant(lw->dtype); \
+            int mrc = (lw && !skip_mat) ? ((want_f16_) \
                 ? lazy_materialize_f16(eng, lw) \
                 : lazy_materialize_f32(eng, lw)) : 0; \
             if (mrc) { \
@@ -1620,10 +1662,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             if (lw && lw->data && !lw->gpu_buf) { \
                 size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1); \
                 if (lw->n_extra) numel *= (size_t)lw->n_extra; \
-                size_t elem = qw36__dtype_nbytes(lw->dtype); \
-                if (!elem) { qw36_engine_close(eng); return NULL; } \
+                size_t bytes = qw36_tensor_bytes(lw->dtype, numel); \
+                if (!bytes) { qw36_engine_close(eng); return NULL; } \
                 lw->gpu_buf = backend->upload(eng->ctx, lw->data, \
-                    numel * elem, lw->dtype); \
+                    bytes, lw->dtype); \
             } \
         } while (0)
         for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
@@ -1641,18 +1683,18 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         if (w->embed_tokens) {
             qw36_lazy_w *lw = (qw36_lazy_w *)w->embed_tokens;
             size_t numel = (size_t)lw->cols * lw->rows;
-            size_t elem = qw36__dtype_nbytes(lw->dtype);
-            if (!elem) { qw36_engine_close(eng); return NULL; }
+            size_t bytes = qw36_tensor_bytes(lw->dtype, numel);
+            if (!bytes) { qw36_engine_close(eng); return NULL; }
             lw->gpu_buf = backend->upload(eng->ctx, lw->data,
-                numel * elem, lw->dtype);
+                bytes, lw->dtype);
         }
         if (w->lm_head && w->lm_head != w->embed_tokens) {
             qw36_lazy_w *lw = (qw36_lazy_w *)w->lm_head;
             size_t numel = (size_t)lw->cols * lw->rows;
-            size_t elem = qw36__dtype_nbytes(lw->dtype);
-            if (!elem) { qw36_engine_close(eng); return NULL; }
+            size_t bytes = qw36_tensor_bytes(lw->dtype, numel);
+            if (!bytes) { qw36_engine_close(eng); return NULL; }
             lw->gpu_buf = backend->upload(eng->ctx, lw->data,
-                numel * elem, lw->dtype);
+                bytes, lw->dtype);
         } else if (w->lm_head == w->embed_tokens) {
             ((qw36_lazy_w *)w->lm_head)->gpu_buf =
                 ((qw36_lazy_w *)w->embed_tokens)->gpu_buf;

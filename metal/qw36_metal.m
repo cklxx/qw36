@@ -47,6 +47,14 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> attn_score_combine_tg;
     id<MTLComputePipelineState> attn_decode_fused;
     id<MTLComputePipelineState> attn_decode_fused_f16kv;
+    /* GGUF-native quantised matmul (port of agent-infer's
+     * gguf_q*_k_matmul). One threadgroup per output row, on-the-fly
+     * dequant per element — replaces the f32→f16 MPS round-trip when the
+     * weight is kept as Q4_K / Q5_K / Q6_K / Q8_0. */
+    id<MTLComputePipelineState> matmul_q4_k;
+    id<MTLComputePipelineState> matmul_q5_k;
+    id<MTLComputePipelineState> matmul_q6_k;
+    id<MTLComputePipelineState> matmul_q8_0;
     /* Cache of MPSMatrixVectorMultiplication objects keyed by
      * "<rows>x<cols>" — building one of these per matmul has measurable
      * cost (Metal shader compile lookup); cache cuts the per-call overhead
@@ -521,6 +529,10 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_score_combine_tg = metal_make_pipeline(ctx, @"qw36_attn_score_combine_tg_f32", err, err_cap);
     ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
     ctx->attn_decode_fused_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_f32", err, err_cap);
+    ctx->matmul_q4_k = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_f32", err, err_cap);
+    ctx->matmul_q5_k = metal_make_pipeline(ctx, @"qw36_matmul_q5_k_f32", err, err_cap);
+    ctx->matmul_q6_k = metal_make_pipeline(ctx, @"qw36_matmul_q6_k_f32", err, err_cap);
+    ctx->matmul_q8_0 = metal_make_pipeline(ctx, @"qw36_matmul_q8_0_f32", err, err_cap);
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
         !ctx->f16_to_f32 || !ctx->silu_mul ||
@@ -845,6 +857,40 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                          qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
     if (!y || !x || !w) return;
+
+    /* GGUF-native quantised matmul: when the weight is still in its packed
+     * Q4_K / Q5_K / Q6_K / Q8_0 layout on the GPU, the per-row dequant kernel
+     * does on-the-fly unpack + accumulation, skipping the fp16 / fp32 stage. */
+    if (ctx && batch == 1 && y->dtype == QW36_DTYPE_F32 &&
+        x->dtype == QW36_DTYPE_F32 && w->mtl) {
+        id<MTLComputePipelineState> qpipe = nil;
+        switch (w->dtype) {
+            case QW36_DTYPE_Q4_K: qpipe = ctx->matmul_q4_k; break;
+            case QW36_DTYPE_Q5_K: qpipe = ctx->matmul_q5_k; break;
+            case QW36_DTYPE_Q6_K: qpipe = ctx->matmul_q6_k; break;
+            case QW36_DTYPE_Q8_0: qpipe = ctx->matmul_q8_0; break;
+            default: break;
+        }
+        if (qpipe) {
+            int owns_cb = 0;
+            id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:qpipe];
+            [enc setBuffer:y->mtl offset:0 atIndex:0];
+            [enc setBuffer:x->mtl offset:0 atIndex:1];
+            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBytes:&cols length:sizeof(cols) atIndex:3];
+            [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+            [enc setThreadgroupMemoryLength:(NSUInteger)256 * sizeof(float)
+                                    atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+            return;
+        }
+    }
+
     if (metal_dtype_is_host_dequant(w->dtype)) {
         float *w_f32 = metal_dequant_matrix(w, rows, cols);
         if (!w_f32) {
@@ -1013,9 +1059,19 @@ static void metal_attention(qw36_gpu_ctx *ctx,
     uint32_t tg_size = 1;
     while (tg_size < head_dim) tg_size <<= 1;
 
-    if (wq->dtype == QW36_DTYPE_F16 &&
-        wk->dtype == QW36_DTYPE_F16 &&
-        wv->dtype == QW36_DTYPE_F16 &&
+    /* Fused decode path. The decode kernel consumes q/k/v as fp32, so any
+     * matmul that lands fp32 is OK upstream. Accept both fp16 weights (MPS
+     * gemv) and native quantised weights (our on-device dequant+gemv). */
+    int wq_ok = wq->dtype == QW36_DTYPE_F16 ||
+                wq->dtype == QW36_DTYPE_Q4_K || wq->dtype == QW36_DTYPE_Q5_K ||
+                wq->dtype == QW36_DTYPE_Q6_K || wq->dtype == QW36_DTYPE_Q8_0;
+    int wk_ok = wk->dtype == QW36_DTYPE_F16 ||
+                wk->dtype == QW36_DTYPE_Q4_K || wk->dtype == QW36_DTYPE_Q5_K ||
+                wk->dtype == QW36_DTYPE_Q6_K || wk->dtype == QW36_DTYPE_Q8_0;
+    int wv_ok = wv->dtype == QW36_DTYPE_F16 ||
+                wv->dtype == QW36_DTYPE_Q4_K || wv->dtype == QW36_DTYPE_Q5_K ||
+                wv->dtype == QW36_DTYPE_Q6_K || wv->dtype == QW36_DTYPE_Q8_0;
+    if (wq_ok && wk_ok && wv_ok &&
         tg_size <= 256 &&
         tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
         positions <= 4096) {
