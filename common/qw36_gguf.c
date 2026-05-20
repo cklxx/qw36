@@ -296,7 +296,9 @@ static qw36_dtype ggml_to_qw36(uint32_t t) {
         case GGML_TYPE_BF16: return QW36_DTYPE_BF16;
         case GGML_TYPE_Q8_0: return QW36_DTYPE_Q8_0;
         case GGML_TYPE_Q4_K: return QW36_DTYPE_Q4_K;
+        case GGML_TYPE_Q5_K: return QW36_DTYPE_Q5_K;
         case GGML_TYPE_Q6_K: return QW36_DTYPE_Q6_K;
+        case GGML_TYPE_Q3_K: return QW36_DTYPE_Q3_K;
         case GGML_TYPE_Q2_K: return QW36_DTYPE_Q2_K;
         default:             return QW36_DTYPE_UNSUPPORTED;
     }

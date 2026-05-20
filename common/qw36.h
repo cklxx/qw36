@@ -36,8 +36,10 @@ typedef enum {
     QW36_DTYPE_F16  = 1,
     QW36_DTYPE_BF16 = 30,
     QW36_DTYPE_Q4_K = 12,
+    QW36_DTYPE_Q5_K = 13,
     QW36_DTYPE_Q6_K = 14,
     QW36_DTYPE_Q8_0 = 8,
+    QW36_DTYPE_Q3_K = 11,
     QW36_DTYPE_Q2_K = 10,
     QW36_DTYPE_UNSUPPORTED = 0xFF
 } qw36_dtype;

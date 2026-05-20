@@ -169,6 +169,50 @@ static void dq_q4_K(const uint8_t *blocks, float *out, size_t n) {
     }
 }
 
+/* Q5_K: 176 bytes/block. Layout:
+ *   fp16 d, fp16 dmin
+ *   u8 scales[12]   — same 6-bit packing as Q4_K
+ *   u8 qh[32]       — 5th bit per element
+ *   u8 qs[128]      — lower 4 bits
+ * Mirrors dequantize_row_q5_K in ggml-quants.c. */
+static void dq_q5_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 176;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b,     2);
+        memcpy(&dmh, b + 2, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qh     = b + 16;
+        const uint8_t *ql     = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            #define GS_K4(jj) do { \
+                if ((jj) < 4) { sc = scales[(jj)] & 63; m = scales[(jj)+4] & 63; } \
+                else { \
+                    sc = (scales[(jj)+4] & 0xF) | ((scales[(jj)-4] >> 6) << 4); \
+                    m  = (scales[(jj)+4] >>  4) | ((scales[(jj)-0] >> 6) << 4); \
+                } \
+            } while (0)
+            GS_K4(is + 0);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            GS_K4(is + 1);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            #undef GS_K4
+            for (int l = 0; l < 32; l++)
+                *out++ = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                *out++ = d2 * (float)((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
 /* Q6_K: 210 bytes/block. Layout:
  *   u8 ql[128]  — lower 4 bits per quant
  *   u8 qh[64]   — upper 2 bits per quant
@@ -226,6 +270,9 @@ static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
         case QW36_DTYPE_Q4_K:
             dq_q4_K((const uint8_t *)data, out, n);
             return out;
+        case QW36_DTYPE_Q5_K:
+            dq_q5_K((const uint8_t *)data, out, n);
+            return out;
         case QW36_DTYPE_Q6_K:
             dq_q6_K((const uint8_t *)data, out, n);
             return out;
@@ -246,6 +293,7 @@ static inline float silu(float x);
 static int dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
     switch (dt) {
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
         case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
         default: *qk = 0; *bytes_per_block = 0; return -1;
@@ -281,6 +329,7 @@ static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
                        + row_idx * blocks_per_row * bpb;
     switch (w->dtype) {
         case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q5_K: dq_q5_K(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
         case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
         default: return -1;
@@ -395,7 +444,12 @@ static void gated_delta_decode(const float *qkv,
     const float    inv_sqrt_d  = 1.0f / sqrtf((float)key_dim);
 
     for (uint32_t v = 0; v < n_value; v++) {
-        const uint32_t kh = v * n_key / n_value;
+        /* We keep GGUF's native V-head order instead of materializing the
+         * agent-infer/HF reorder. GGUF stores value heads tiled by
+         * V-within-K-group, so raw value head v maps to key head v % n_key.
+         * agent-infer reverses this order at load time and then uses
+         * v * n_key / n_value. */
+        const uint32_t kh = v % n_key;
 
         /* Copy and L2-normalize q, k for this head. */
         double qss = 0.0, kss = 0.0;
@@ -865,22 +919,57 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     eng_get_u32(eng, "expert_feed_forward_length",&c->moe_intermediate_size);
     if (!c->moe_decoder_sparse_step) c->moe_decoder_sparse_step = 1;
 
-    /* Gated DeltaNet config. Infer from tensor shapes since the GGUF
-     * metadata for "linear attention" head config varies between
-     * variants. We pick the first SSM layer we see. */
+    /* Gated DeltaNet config. Prefer the explicit GGUF SSM metadata:
+     *   group_count = key heads
+     *   state_size  = key/value head dim
+     *   inner_size  = value_heads * value_head_dim
+     * Tensor-shape fallback keeps older experimental files loadable. */
     {
         qw36_gguf_tensor t;
-        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
-            /* GGUF stores dims innermost-first. ssm_conv1d shape is
-             * [k, channels] in numpy → dims[0]=k, dims[1]=channels. */
-            c->dn_conv_kernel_size = (uint32_t)t.dims[0];
+        uint32_t inner_size = 0;
+        eng_get_u32(eng, "ssm.group_count", &c->dn_num_key_heads);
+        eng_get_u32(eng, "ssm.state_size",  &c->dn_key_head_dim);
+        eng_get_u32(eng, "ssm.inner_size",  &inner_size);
+        if (eng_get_u32(eng, "ssm.conv_kernel", &c->dn_conv_kernel_size)) {
+            if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
+                /* GGUF stores dims innermost-first. ssm_conv1d shape is
+                 * [k, channels] in numpy -> dims[0]=k, dims[1]=channels. */
+                c->dn_conv_kernel_size = (uint32_t)t.dims[0];
+            }
         }
-        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_a", &t) == 0)
+        if (inner_size && c->dn_key_head_dim) {
+            c->dn_value_head_dim = c->dn_key_head_dim;
+            c->dn_num_value_heads = inner_size / c->dn_value_head_dim;
+        }
+        if (!c->dn_num_value_heads &&
+            qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_a", &t) == 0)
             c->dn_num_value_heads = (uint32_t)t.dims[0];
-        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_norm.weight", &t) == 0)
+        if (!c->dn_value_head_dim &&
+            qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_norm.weight", &t) == 0)
             c->dn_value_head_dim = (uint32_t)t.dims[0];
-        c->dn_num_key_heads = c->dn_num_value_heads;
-        c->dn_key_head_dim  = c->dn_value_head_dim;
+        if (!c->dn_key_head_dim) c->dn_key_head_dim = c->dn_value_head_dim;
+        if (!c->dn_num_key_heads &&
+            qw36_gguf_get_tensor(eng->gguf, "blk.0.attn_qkv.weight", &t) == 0 &&
+            t.n_dims >= 2 && c->dn_key_head_dim &&
+            c->dn_num_value_heads && c->dn_value_head_dim) {
+            uint64_t v_dim = (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
+            if (t.dims[1] > v_dim) {
+                uint64_t qk_dim = (t.dims[1] - v_dim) / 2;
+                if (qk_dim && qk_dim % c->dn_key_head_dim == 0)
+                    c->dn_num_key_heads = (uint32_t)(qk_dim / c->dn_key_head_dim);
+            }
+        }
+        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
+            uint64_t qkv_dim = (uint64_t)c->dn_num_key_heads * c->dn_key_head_dim * 2
+                             + (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
+            if (qkv_dim && t.n_dims >= 2 && t.dims[1] != qkv_dim) {
+                fprintf(stderr,
+                    "qw36: warning: DeltaNet qkv channels mismatch: "
+                    "config=%llu tensor=%llu\n",
+                    (unsigned long long)qkv_dim,
+                    (unsigned long long)t.dims[1]);
+            }
+        }
     }
 
     /* Qwen3.5/3.6 hybrid checkpoints sometimes report a head_count in
@@ -984,6 +1073,14 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         BIND_NORM(dn_conv1d,     "blk.%u.ssm_conv1d.weight");
         BIND_NORM(dn_dt_bias,    "blk.%u.ssm_dt.bias");
         BIND_NORM(dn_a_log,      "blk.%u.ssm_a");
+        if (L->dn_a_log && c->dn_num_value_heads) {
+            float *a = (float *)L->dn_a_log;
+            for (uint32_t i = 0; i < c->dn_num_value_heads; i++) {
+                float v = fabsf(a[i]);
+                if (v < 1.0e-10f) v = 1.0e-10f;
+                a[i] = logf(v);
+            }
+        }
         BIND_NORM(dn_norm,       "blk.%u.ssm_norm.weight");
         BIND_W(dn_out,           "blk.%u.ssm_out.weight");
 
