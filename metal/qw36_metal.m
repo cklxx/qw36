@@ -83,6 +83,7 @@ struct qw36_gpu_ctx {
      * eliminates the ~200 sync points per token that otherwise dominate
      * decode latency. */
     id<MTLCommandBuffer> batch_cb;
+    id<MTLComputeCommandEncoder> batch_compute_encoder;
     BOOL batch_active;
 
     qw36_gpu_buf *matmul_x_f16_scratch;
@@ -112,6 +113,8 @@ struct qw36_gpu_buf {
     size_t        bytes;
     qw36_dtype    dtype;
 };
+
+static void metal_flush_compute_encoder(qw36_gpu_ctx *ctx);
 
 static void metal_release_buf(qw36_gpu_buf *buf)
 {
@@ -608,10 +611,12 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
 {
     if (!ctx) return;
     if (ctx->batch_cb) {
+        metal_flush_compute_encoder(ctx);
         [ctx->batch_cb commit];
         [ctx->batch_cb waitUntilCompleted];
         ctx->batch_cb = nil;
     }
+    ctx->batch_compute_encoder = nil;
     metal_release_buf(ctx->dn_y_grouped_scratch);
     metal_release_buf(ctx->dn_beta_scratch);
     metal_release_buf(ctx->dn_g_scratch);
@@ -673,6 +678,7 @@ static void metal_begin_batch(qw36_gpu_ctx *ctx)
     if (ctx->batch_active) return;       /* already in a batch */
     ctx->batch_active = YES;
     ctx->batch_cb = [ctx->queue commandBuffer];
+    ctx->batch_compute_encoder = nil;
 }
 
 static void metal_end_batch(qw36_gpu_ctx *ctx)
@@ -680,6 +686,7 @@ static void metal_end_batch(qw36_gpu_ctx *ctx)
     if (!ctx || !ctx->batch_active) return;
     ctx->batch_active = NO;
     if (ctx->batch_cb) {
+        metal_flush_compute_encoder(ctx);
         id<MTLCommandBuffer> cb = ctx->batch_cb;
         ctx->batch_cb = nil;          /* clear *before* commit so re-entrant
                                        * ops within end_batch don't reuse it */
@@ -724,9 +731,39 @@ static id<MTLCommandBuffer> metal_cb_for_op(qw36_gpu_ctx *ctx, int *owns)
     *owns = 1; return [ctx->queue commandBuffer];
 }
 
+static void metal_flush_compute_encoder(qw36_gpu_ctx *ctx)
+{
+    if (!ctx || !ctx->batch_compute_encoder) return;
+    [ctx->batch_compute_encoder endEncoding];
+    ctx->batch_compute_encoder = nil;
+}
+
+static id<MTLComputeCommandEncoder>
+metal_compute_encoder_for_op(qw36_gpu_ctx *ctx, id<MTLCommandBuffer> cb,
+                             int owns_cb)
+{
+    if (!ctx || owns_cb || !ctx->batch_active) {
+        return [cb computeCommandEncoder];
+    }
+    if (!ctx->batch_compute_encoder) {
+        ctx->batch_compute_encoder = [cb computeCommandEncoder];
+    }
+    return ctx->batch_compute_encoder;
+}
+
+static void metal_finish_compute_encoder(qw36_gpu_ctx *ctx,
+                                         id<MTLComputeCommandEncoder> enc,
+                                         int owns_cb)
+{
+    if (!enc) return;
+    if (ctx && ctx->batch_active && !owns_cb) return;
+    [enc endEncoding];
+}
+
 static void metal_flush_batch(qw36_gpu_ctx *ctx)
 {
     if (!ctx || !ctx->batch_cb) return;
+    metal_flush_compute_encoder(ctx);
     id<MTLCommandBuffer> cb = ctx->batch_cb;
     ctx->batch_cb = nil;
     [cb commit];
@@ -881,7 +918,8 @@ static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
     if (!ctx || !pipe || n == 0) return;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
     [enc setComputePipelineState:pipe];
     bind(enc);
     NSUInteger tg = pipe.maxTotalThreadsPerThreadgroup;
@@ -889,7 +927,7 @@ static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
     if (tg > n) tg = n;
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
   threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    [enc endEncoding];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
@@ -973,7 +1011,8 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             }
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc =
+                metal_compute_encoder_for_op(ctx, cb, owns_cb);
             [enc setComputePipelineState:qpipe];
             [enc setBuffer:y->mtl offset:0 atIndex:0];
             [enc setBuffer:x->mtl offset:0 atIndex:1];
@@ -983,7 +1022,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
+            metal_finish_compute_encoder(ctx, enc, owns_cb);
             if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
             return;
         }
@@ -1033,7 +1072,8 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             ctx->matmul_qmv_quad_f16 && w->mtl) {
             int owns_cb = 0;
             id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc =
+                metal_compute_encoder_for_op(ctx, cb, owns_cb);
             [enc setComputePipelineState:ctx->matmul_qmv_quad_f16];
             uint32_t x_dtype = (uint32_t)x->dtype;
             uint32_t y_dtype = (uint32_t)y->dtype;
@@ -1046,7 +1086,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:6];
             [enc dispatchThreadgroups:MTLSizeMake(1, (rows + 63u) / 64u, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            [enc endEncoding];
+            metal_finish_compute_encoder(ctx, enc, owns_cb);
             if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
             return;
         }
@@ -1105,6 +1145,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:yh->mtl descriptor:y_desc];
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        metal_flush_compute_encoder(ctx);
         [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
         if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
         if (!y_is_f16) {
@@ -1144,6 +1185,7 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         MPSVector *yv = [[MPSVector alloc] initWithBuffer:y->mtl descriptor:y_desc];
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        metal_flush_compute_encoder(ctx);
         [gemv encodeToCommandBuffer:cb inputMatrix:wm inputVector:xv resultVector:yv];
         if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
         return;
@@ -1262,7 +1304,8 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             v_cache->dtype == QW36_DTYPE_F16;
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc =
+            metal_compute_encoder_for_op(ctx, cb, owns_cb);
         uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
         uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
         [enc setComputePipelineState:f16_kv
@@ -1307,7 +1350,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-        [enc endEncoding];
+        metal_finish_compute_encoder(ctx, enc, owns_cb);
         if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
         return;
     }
@@ -1342,7 +1385,8 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         positions <= 4096) {
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc =
+            metal_compute_encoder_for_op(ctx, cb, owns_cb);
         [enc setComputePipelineState:ctx->attn_score_combine_tg];
         [enc setBuffer:y->mtl       offset:0 atIndex:0];
         [enc setBuffer:q->mtl       offset:0 atIndex:1];
@@ -1360,7 +1404,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-        [enc endEncoding];
+        metal_finish_compute_encoder(ctx, enc, owns_cb);
         if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
         return;
     }
@@ -1511,7 +1555,8 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     uint32_t T = 1;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
     [enc setComputePipelineState:ctx->dn_gated_delta];
     [enc setBuffer:q->mtl         offset:0 atIndex:0];
     [enc setBuffer:k->mtl         offset:0 atIndex:1];
@@ -1528,7 +1573,7 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:12];
     [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    [enc endEncoding];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
@@ -1571,7 +1616,8 @@ static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     const uint32_t tg_size = 256;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
     [enc setComputePipelineState:ctx->dn_prep_gdr_conv1d];
     [enc setBuffer:q->mtl          offset:0 atIndex:0];
     [enc setBuffer:k->mtl          offset:0 atIndex:1];
@@ -1595,10 +1641,8 @@ static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc setThreadgroupMemoryLength:(NSUInteger)(2 * tg_size * sizeof(float)) atIndex:0];
     [enc dispatchThreads:MTLSizeMake(tg_size, heads, 1)
   threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-    [enc endEncoding];
 
     uint32_t T = 1;
-    enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:ctx->dn_gated_delta];
     [enc setBuffer:q->mtl         offset:0 atIndex:0];
     [enc setBuffer:k->mtl         offset:0 atIndex:1];
@@ -1615,7 +1659,7 @@ static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:12];
     [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    [enc endEncoding];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
@@ -1684,7 +1728,8 @@ static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
     const uint32_t tg_size = 256;
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
     [enc setComputePipelineState:ctx->dn_gated_rmsnorm_matmul];
     uint32_t y_dtype = (uint32_t)y->dtype;
     uint32_t w_dtype = (uint32_t)w_out->dtype;
@@ -1705,7 +1750,7 @@ static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
                             atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(out_rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-    [enc endEncoding];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
@@ -1819,7 +1864,8 @@ static void metal_residual_rmsnorm(qw36_gpu_ctx *ctx,
     metal_invalidate_matmul_xh(ctx);
     int owns_cb = 0;
     id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
     [enc setComputePipelineState:ctx->residual_rmsnorm];
     uint32_t x_dtype = (uint32_t)x->dtype;
     uint32_t y_dtype = (uint32_t)y->dtype;
@@ -1843,7 +1889,7 @@ static void metal_residual_rmsnorm(qw36_gpu_ctx *ctx,
     [enc setThreadgroupMemoryLength:simd_count * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-    [enc endEncoding];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
