@@ -685,7 +685,7 @@ static void attention_f32(float *y,
     /* Attention. */
     const float inv_sqrt_d = 1.0f / sqrtf((float)head_dim);
     for (uint32_t h = 0; h < n_heads; h++) {
-        const uint32_t kvh = h % n_kv;
+        const uint32_t kvh = h * n_kv / n_heads;
         const float *qh = q + h * head_dim;
         float *scores = attn_scratch + (size_t)h * (seq_capacity + 1);
 
@@ -719,7 +719,7 @@ static void attention_f32(float *y,
      * the n_heads * head_dim staging buffer. */
     float *staging = attn_scratch + (size_t)n_heads * (seq_capacity + 1);
     for (uint32_t h = 0; h < n_heads; h++) {
-        const uint32_t kvh = h % n_kv;
+        const uint32_t kvh = h * n_kv / n_heads;
         const float *scores = attn_scratch + (size_t)h * (seq_capacity + 1);
         float *out = staging + h * head_dim;
         for (uint32_t d = 0; d < head_dim; d++) {
@@ -1166,6 +1166,19 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     if (embed_lookup_lazy((const qw36_lazy_w *)w->embed_tokens, token, st->x))
         return -3;
 
+    /* Optional debug: per-layer norm trace, enabled by env var. */
+    static int debug_layer = -1;
+    if (debug_layer < 0) {
+        const char *e = getenv("QW36_DEBUG_LAYER");
+        debug_layer = e && atoi(e) ? 1 : 0;
+    }
+    if (debug_layer) {
+        double ss = 0.0;
+        for (size_t i = 0; i < hidden; i++) ss += (double)st->x[i] * st->x[i];
+        fprintf(stderr, "[layer 0 in]  ||x||=%.4f x[0..3]=%.3f %.3f %.3f\n",
+                sqrt(ss), st->x[0], st->x[1], st->x[2]);
+    }
+
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
@@ -1230,7 +1243,16 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             /* Out projection: hidden = ssm_out @ gout. */
             matmul_lazy(st->x_rms, gout,
                         (const qw36_lazy_w *)L->dn_out, row_scratch);
-            for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+            /* Debug knob: QW36_SKIP_DN=1 zeroes the DN contribution to
+             * isolate whether the bug is in the DeltaNet path. */
+            static int skip_dn = -1;
+            if (skip_dn < 0) {
+                const char *e = getenv("QW36_SKIP_DN");
+                skip_dn = e && atoi(e) ? 1 : 0;
+            }
+            if (!skip_dn) {
+                for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+            }
             free(blk);
 
             /* MLP block (shared with full-attention path below). */
@@ -1245,6 +1267,15 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         /* --- vanilla full-attention block --- */
         rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
                     hidden, c->rms_norm_eps);
+        if (debug_layer) {
+            double ss = 0.0;
+            for (size_t i = 0; i < hidden; i++) ss += (double)st->x_rms[i] * st->x_rms[i];
+            fprintf(stderr, "[L%u attn x_rms ||=%.4f] norm_w[0..2]=%.4f %.4f %.4f\n",
+                    l, sqrt(ss),
+                    ((const float*)L->input_layernorm)[0],
+                    ((const float*)L->input_layernorm)[1],
+                    ((const float*)L->input_layernorm)[2]);
+        }
 
         const uint32_t kv_dim = c->num_key_value_heads * c->head_dim;
         const uint32_t rot_dim = (uint32_t)((float)c->head_dim *
@@ -1252,6 +1283,13 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 
         /* QKV projections via lazy matmul. */
         matmul_lazy(st->q, st->x_rms, (const qw36_lazy_w *)L->q_proj, row_scratch);
+        if (debug_layer) {
+            double ss = 0.0;
+            for (size_t i = 0; i < c->num_attention_heads * c->head_dim; i++)
+                ss += (double)st->q[i] * st->q[i];
+            fprintf(stderr, "[L%u q ||=%.4f] q[0..2]=%.4f %.4f %.4f\n",
+                    l, sqrt(ss), st->q[0], st->q[1], st->q[2]);
+        }
         float *k_row = (float *)st->k_cache[l] + (size_t)st->seq_pos * kv_dim;
         float *v_row = (float *)st->v_cache[l] + (size_t)st->seq_pos * kv_dim;
         matmul_lazy(k_row, st->x_rms, (const qw36_lazy_w *)L->k_proj, row_scratch);
@@ -1272,12 +1310,14 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         }
 
         /* Attention: for each head h, score against k_cache[0..=seq_pos]
-         * of kv_head (h mod n_kv), softmax, weighted sum of v_cache. */
+         * of kv_head (h * n_kv / n_heads, GQA group-replicate), softmax,
+         * weighted sum of v_cache. */
         const float inv_sqrt_d = 1.0f / sqrtf((float)c->head_dim);
         float *staging = st->attn_scores
                        + (size_t)c->num_attention_heads * (st->seq_capacity + 1);
         for (uint32_t h = 0; h < c->num_attention_heads; h++) {
-            const uint32_t kvh = h % c->num_key_value_heads;
+            const uint32_t kvh = h * c->num_key_value_heads
+                               / c->num_attention_heads;
             const float *qh = st->q + h * c->head_dim;
             float *scores = st->attn_scores
                           + (size_t)h * (st->seq_capacity + 1);
@@ -1314,6 +1354,11 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
 
 mlp_block:
+        if (debug_layer) {
+            double ss = 0.0;
+            for (size_t i = 0; i < hidden; i++) ss += (double)x[i] * x[i];
+            fprintf(stderr, "[L%u post-attn] ||x||=%.4f\n", l, sqrt(ss));
+        }
         /* --- mlp block (shared by vanilla and DeltaNet branches) --- */
         rmsnorm_f32(st->x_rms, x, (const float *)L->post_attn_layernorm,
                     hidden, c->rms_norm_eps);
@@ -1358,6 +1403,11 @@ mlp_block:
             matmul_lazy(st->x_rms, st->gate,
                         (const qw36_lazy_w *)L->down_proj, row_scratch);
             for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+        }
+        if (debug_layer) {
+            double ss = 0.0;
+            for (size_t i = 0; i < hidden; i++) ss += (double)x[i] * x[i];
+            fprintf(stderr, "[L%u out]  ||x||=%.4f\n", l, sqrt(ss));
         }
     }
 

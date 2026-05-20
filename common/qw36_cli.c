@@ -40,6 +40,8 @@ typedef struct {
     int   info_only;
     int   seq_capacity;
     int   no_special;
+    int   debug_top;     /* print top-K logits per step */
+    int   dump_tokens;   /* tokenize the prompt and exit */
 } qw36_cli_args;
 
 static int parse_args(int argc, char **argv, qw36_cli_args *a) {
@@ -63,6 +65,8 @@ static int parse_args(int argc, char **argv, qw36_cli_args *a) {
         else if (!strcmp(s, "--interactive")) a->interactive = 1;
         else if (!strcmp(s, "--info"))        a->info_only = 1;
         else if (!strcmp(s, "--no-special"))  a->no_special = 1;
+        else if (!strcmp(s, "--debug-top"))   a->debug_top = atoi(EAT());
+        else if (!strcmp(s, "--dump-tokens")) a->dump_tokens = 1;
         else if (!strcmp(s, "-h") || !strcmp(s, "--help")) { usage(argv[0]); return 1; }
         else { fprintf(stderr, "unknown arg: %s\n", s); usage(argv[0]); return -1; }
         #undef EAT
@@ -174,6 +178,23 @@ int main(int argc, char **argv) {
         qw36_tokenizer_free(tok); qw36_engine_close(eng); return 5;
     }
 
+    if (a.dump_tokens) {
+        uint32_t *pids = NULL; size_t pn = 0;
+        if (build_prompt_ids(tok, a.prompt, !a.no_special, &pids, &pn)) {
+            fprintf(stderr, "qw36: tokenize failed\n");
+            qw36_tokenizer_free(tok); qw36_engine_close(eng); return 7;
+        }
+        fprintf(stderr, "tokens (%zu):\n", pn);
+        for (size_t i = 0; i < pn; i++) {
+            size_t blen = 0;
+            const char *s = qw36_tokenizer_decode_one(tok, pids[i], &blen);
+            fprintf(stderr, "  [%zu] id=%u  ", i, pids[i]);
+            if (s) { fwrite(s, 1, blen, stderr); }
+            fputc('\n', stderr);
+        }
+        free(pids); qw36_tokenizer_free(tok); qw36_engine_close(eng); return 0;
+    }
+
     qw36_state *st = qw36_state_new(eng, (uint32_t)a.seq_capacity);
     if (!st) { fprintf(stderr, "qw36: state alloc failed\n");
                qw36_tokenizer_free(tok); qw36_engine_close(eng); return 6; }
@@ -210,6 +231,29 @@ int main(int argc, char **argv) {
     double tg0 = mono_seconds();
     const uint32_t vocab = qw36_engine_config(eng)->vocab_size;
     for (int i = 0; i < a.max_new; i++) {
+        if (a.debug_top > 0) {
+            /* Print top-K logits for the current step (before sampling). */
+            int K = a.debug_top;
+            float *tk_val = (float *)alloca(K * sizeof(float));
+            uint32_t *tk_idx = (uint32_t *)alloca(K * sizeof(uint32_t));
+            for (int j = 0; j < K; j++) { tk_val[j] = -1e30f; tk_idx[j] = 0; }
+            for (uint32_t v = 0; v < vocab; v++) {
+                if (st->logits[v] <= tk_val[K-1]) continue;
+                int j = K - 1;
+                while (j > 0 && st->logits[v] > tk_val[j-1]) {
+                    tk_val[j] = tk_val[j-1]; tk_idx[j] = tk_idx[j-1]; j--;
+                }
+                tk_val[j] = st->logits[v]; tk_idx[j] = v;
+            }
+            fprintf(stderr, "[step %d] top-%d:\n", i, K);
+            for (int j = 0; j < K; j++) {
+                size_t blen = 0;
+                const char *s = qw36_tokenizer_decode_one(tok, tk_idx[j], &blen);
+                fprintf(stderr, "  %.4f  id=%u  '", tk_val[j], tk_idx[j]);
+                if (s) fwrite(s, 1, blen, stderr);
+                fprintf(stderr, "'\n");
+            }
+        }
         uint32_t next = qw36_sample(st->logits, vocab, &sp);
         if (next == eos || (imend && next == imend)) break;
         size_t blen = 0;
