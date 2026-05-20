@@ -971,6 +971,7 @@ static qw36_gpu_backend g_amd_backend = {
     /* swiglu_mlp        */ amd_swiglu,
     /* dn_conv1d_silu    */ nullptr,
     /* dn_gated_delta    */ nullptr,
+    /* dn_gated_delta_conv1d */ nullptr,
     /* dn_gated_rmsnorm  */ nullptr,
     /* dn_gated_rmsnorm_matmul */ nullptr,
     /* moe_forward       */ nullptr,

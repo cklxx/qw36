@@ -34,6 +34,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> moe_down_combine;
     id<MTLComputePipelineState> dn_conv1d_silu;
     id<MTLComputePipelineState> dn_prep_gdr;
+    id<MTLComputePipelineState> dn_prep_gdr_conv1d;
     id<MTLComputePipelineState> dn_gated_delta;
     id<MTLComputePipelineState> dn_reorder_gdr_y;
     id<MTLComputePipelineState> dn_gated_rmsnorm;
@@ -529,6 +530,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->moe_down_combine = metal_make_pipeline(ctx, @"qw36_moe_down_combine_f32", err, err_cap);
     ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
     ctx->dn_prep_gdr      = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk", err, err_cap);
+    ctx->dn_prep_gdr_conv1d = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk_conv1d", err, err_cap);
     ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_gated_delta_step_f32", err, err_cap);
     ctx->dn_reorder_gdr_y = metal_make_pipeline(ctx, @"qw36_dn_reorder_grouped_y_to_raw_f32", err, err_cap);
     ctx->dn_gated_rmsnorm = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f32", err, err_cap);
@@ -556,7 +558,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         !ctx->f16_to_f32 || !ctx->silu_mul ||
         !ctx->moe_route || !ctx->moe_gate_up || !ctx->moe_down_combine ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
-        !ctx->dn_prep_gdr || !ctx->dn_reorder_gdr_y ||
+        !ctx->dn_prep_gdr || !ctx->dn_prep_gdr_conv1d ||
+        !ctx->dn_reorder_gdr_y ||
         !ctx->dn_gated_rmsnorm || !ctx->dn_gated_rmsnorm_f16 ||
         !ctx->dn_gated_rmsnorm_matmul ||
         !ctx->residual_add ||
@@ -580,6 +583,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->dn_gated_rmsnorm = nil;
         ctx->dn_reorder_gdr_y = nil;
         ctx->dn_gated_delta = nil;
+        ctx->dn_prep_gdr_conv1d = nil;
         ctx->dn_prep_gdr = nil;
         ctx->dn_conv1d_silu = nil;
         ctx->moe_down_combine = nil;
@@ -646,6 +650,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->dn_gated_rmsnorm = nil;
     ctx->dn_reorder_gdr_y = nil;
     ctx->dn_gated_delta = nil;
+    ctx->dn_prep_gdr_conv1d = nil;
     ctx->dn_prep_gdr = nil;
     ctx->dn_conv1d_silu = nil;
     ctx->moe_down_combine = nil;
@@ -1527,6 +1532,93 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
+static void metal_dn_gated_delta_conv1d(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
+                                        qw36_gpu_buf *qkv_raw,
+                                        qw36_gpu_buf *beta_raw,
+                                        qw36_gpu_buf *alpha_raw,
+                                        qw36_gpu_buf *dt_bias,
+                                        qw36_gpu_buf *a_log,
+                                        qw36_gpu_buf *state,
+                                        qw36_gpu_buf *conv_w,
+                                        qw36_gpu_buf *conv_state,
+                                        uint32_t n_key, uint32_t n_value,
+                                        uint32_t key_dim, uint32_t val_dim,
+                                        uint32_t alpha_offset,
+                                        uint32_t beta_offset,
+                                        uint32_t kernel_size)
+{
+    if (!ctx || !ctx->dn_prep_gdr_conv1d || !y || !qkv_raw ||
+        !beta_raw || !alpha_raw || !dt_bias || !a_log || !state ||
+        !conv_w || !conv_state || !n_key || !n_value || !key_dim ||
+        !val_dim)
+        return;
+    if (key_dim % 32 != 0) return;
+
+    qw36_gpu_buf *q = metal_scratch(ctx, &ctx->dn_q_scratch,
+        (size_t)n_key * key_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *k = metal_scratch(ctx, &ctx->dn_k_scratch,
+        (size_t)n_key * key_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *v = metal_scratch(ctx, &ctx->dn_v_scratch,
+        (size_t)n_value * val_dim * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *g = metal_scratch(ctx, &ctx->dn_g_scratch,
+        (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *beta = metal_scratch(ctx, &ctx->dn_beta_scratch,
+        (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
+    if (!q || !k || !v || !g || !beta) return;
+
+    const uint32_t channels = n_key * key_dim * 2 + n_value * val_dim;
+    const uint32_t heads = n_key > n_value ? n_key : n_value;
+    const uint32_t tg_size = 256;
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->dn_prep_gdr_conv1d];
+    [enc setBuffer:q->mtl          offset:0 atIndex:0];
+    [enc setBuffer:k->mtl          offset:0 atIndex:1];
+    [enc setBuffer:v->mtl          offset:0 atIndex:2];
+    [enc setBuffer:g->mtl          offset:0 atIndex:3];
+    [enc setBuffer:beta->mtl       offset:0 atIndex:4];
+    [enc setBuffer:qkv_raw->mtl    offset:0 atIndex:5];
+    [enc setBuffer:alpha_raw->mtl  offset:(NSUInteger)alpha_offset * sizeof(float) atIndex:6];
+    [enc setBuffer:beta_raw->mtl   offset:(NSUInteger)beta_offset * sizeof(float) atIndex:7];
+    [enc setBuffer:dt_bias->mtl    offset:0 atIndex:8];
+    [enc setBuffer:a_log->mtl      offset:0 atIndex:9];
+    [enc setBuffer:conv_w->mtl     offset:0 atIndex:10];
+    [enc setBuffer:conv_state->mtl offset:0 atIndex:11];
+    [enc setBytes:&n_key       length:sizeof(n_key)       atIndex:12];
+    [enc setBytes:&n_value     length:sizeof(n_value)     atIndex:13];
+    [enc setBytes:&key_dim     length:sizeof(key_dim)     atIndex:14];
+    [enc setBytes:&val_dim     length:sizeof(val_dim)     atIndex:15];
+    [enc setBytes:&kernel_size length:sizeof(kernel_size) atIndex:16];
+    [enc setBytes:&channels    length:sizeof(channels)    atIndex:17];
+    [enc setBytes:&tg_size     length:sizeof(tg_size)     atIndex:18];
+    [enc setThreadgroupMemoryLength:(NSUInteger)(2 * tg_size * sizeof(float)) atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(tg_size, heads, 1)
+  threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    [enc endEncoding];
+
+    uint32_t T = 1;
+    enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->dn_gated_delta];
+    [enc setBuffer:q->mtl         offset:0 atIndex:0];
+    [enc setBuffer:k->mtl         offset:0 atIndex:1];
+    [enc setBuffer:v->mtl         offset:0 atIndex:2];
+    [enc setBuffer:g->mtl         offset:0 atIndex:3];
+    [enc setBuffer:beta->mtl      offset:0 atIndex:4];
+    [enc setBuffer:state->mtl     offset:0 atIndex:5];
+    [enc setBuffer:y->mtl         offset:0 atIndex:6];
+    [enc setBuffer:state->mtl     offset:0 atIndex:7];
+    [enc setBytes:&T        length:sizeof(T)        atIndex:8];
+    [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:9];
+    [enc setBytes:&n_value  length:sizeof(n_value)  atIndex:10];
+    [enc setBytes:&key_dim  length:sizeof(key_dim)  atIndex:11];
+    [enc setBytes:&val_dim  length:sizeof(val_dim)  atIndex:12];
+    [enc dispatchThreads:MTLSizeMake(32, val_dim, n_value)
+  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+}
+
 static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
                                    qw36_gpu_buf *x, qw36_gpu_buf *z,
                                    qw36_gpu_buf *weight,
@@ -1805,6 +1897,7 @@ static qw36_gpu_backend g_metal_backend = {
     .swiglu_mlp        = metal_swiglu,
     .dn_conv1d_silu    = metal_dn_conv1d_silu,
     .dn_gated_delta    = metal_dn_gated_delta,
+    .dn_gated_delta_conv1d = metal_dn_gated_delta_conv1d,
     .dn_gated_rmsnorm  = metal_dn_gated_rmsnorm,
     .dn_gated_rmsnorm_matmul = metal_dn_gated_rmsnorm_matmul,
     .moe_forward       = metal_moe_forward,

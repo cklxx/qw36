@@ -209,7 +209,8 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
         !L->dn_norm || !L->dn_out ||
         !qw36__active_backend(&be, &ctx) ||
         !be->matmul || !be->rmsnorm || !be->residual_add ||
-        !be->dn_conv1d_silu || !be->dn_gated_delta ||
+        ((!be->dn_gated_delta_conv1d) &&
+         (!be->dn_conv1d_silu || !be->dn_gated_delta)) ||
         !be->dn_gated_rmsnorm)
         return -1;
 
@@ -268,20 +269,40 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     }
     if (rc) return -1;
 
-    be->dn_conv1d_silu(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev,
-                       (qw36_gpu_buf *)st->dn_qkv_dev,
-                       conv_w,
-                       (qw36_gpu_buf *)st->conv_state_dev[layer_idx],
-                       qkv_dim, c->dn_conv_kernel_size);
-    be->dn_gated_delta(ctx, (qw36_gpu_buf *)st->dn_gout_dev,
-                       (qw36_gpu_buf *)st->dn_qkv_act_dev,
-                       fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
-                                  : (qw36_gpu_buf *)st->dn_beta_dev,
-                       fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
-                                  : (qw36_gpu_buf *)st->dn_alpha_dev,
-                       dt_bias, a_log,
-                       (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
-                       n_k, n_v, kd, vd, alpha_offset, beta_offset);
+    static int fuse_dn_conv = -1;
+    if (fuse_dn_conv < 0) {
+        const char *e = getenv("QW36_METAL_FUSE_DN_CONV");
+        fuse_dn_conv = (!e || atoi(e) != 0) ? 1 : 0;
+    }
+    if (fuse_dn_conv && be->dn_gated_delta_conv1d) {
+        be->dn_gated_delta_conv1d(
+            ctx, (qw36_gpu_buf *)st->dn_gout_dev,
+            (qw36_gpu_buf *)st->dn_qkv_dev,
+            fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                       : (qw36_gpu_buf *)st->dn_beta_dev,
+            fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                       : (qw36_gpu_buf *)st->dn_alpha_dev,
+            dt_bias, a_log,
+            (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
+            conv_w, (qw36_gpu_buf *)st->conv_state_dev[layer_idx],
+            n_k, n_v, kd, vd, alpha_offset, beta_offset,
+            c->dn_conv_kernel_size);
+    } else {
+        be->dn_conv1d_silu(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                           (qw36_gpu_buf *)st->dn_qkv_dev,
+                           conv_w,
+                           (qw36_gpu_buf *)st->conv_state_dev[layer_idx],
+                           qkv_dim, c->dn_conv_kernel_size);
+        be->dn_gated_delta(ctx, (qw36_gpu_buf *)st->dn_gout_dev,
+                           (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                           fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                      : (qw36_gpu_buf *)st->dn_beta_dev,
+                           fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                      : (qw36_gpu_buf *)st->dn_alpha_dev,
+                           dt_bias, a_log,
+                           (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
+                           n_k, n_v, kd, vd, alpha_offset, beta_offset);
+    }
     static int fuse_dn_tail = -1;
     if (fuse_dn_tail < 0) {
         const char *e = getenv("QW36_METAL_FUSE_DN_TAIL");

@@ -115,6 +115,25 @@ typedef struct qw36_gpu_backend {
                            uint32_t alpha_offset,
                            uint32_t beta_offset);
 
+    /* Fused depthwise conv1d+silu prep plus Gated Delta Rule. qkv_raw is
+     * the unactivated dn_qkv projection; conv_state is updated in-place.
+     * Optional Metal fast path. Backends without it can leave NULL and use
+     * dn_conv1d_silu + dn_gated_delta above. */
+    void (*dn_gated_delta_conv1d)(qw36_gpu_ctx *ctx,
+                                  qw36_gpu_buf *y, qw36_gpu_buf *qkv_raw,
+                                  qw36_gpu_buf *beta_raw,
+                                  qw36_gpu_buf *alpha_raw,
+                                  qw36_gpu_buf *dt_bias,
+                                  qw36_gpu_buf *a_log,
+                                  qw36_gpu_buf *state,
+                                  qw36_gpu_buf *conv_w,
+                                  qw36_gpu_buf *conv_state,
+                                  uint32_t n_key, uint32_t n_value,
+                                  uint32_t key_dim, uint32_t val_dim,
+                                  uint32_t alpha_offset,
+                                  uint32_t beta_offset,
+                                  uint32_t kernel_size);
+
     void (*dn_gated_rmsnorm)(qw36_gpu_ctx *ctx,
                              qw36_gpu_buf *y, qw36_gpu_buf *x,
                              qw36_gpu_buf *z, qw36_gpu_buf *weight,

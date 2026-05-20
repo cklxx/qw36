@@ -488,6 +488,134 @@ kernel void qw36_compute_g_beta_norm_qk(
     }
 }
 
+static inline float qw36_dn_conv1d_silu_value(device const float *x,
+                                               device const float *conv_w,
+                                               device const float *conv_state,
+                                               uint channels,
+                                               uint kernel_size,
+                                               uint c)
+{
+    float acc = 0.0f;
+    if (kernel_size == 0) {
+        acc = x[c];
+    } else {
+        device const float *wt = conv_w + c * kernel_size;
+        for (uint t = 0; t + 1 < kernel_size; ++t) {
+            acc += wt[t] * conv_state[t * channels + c];
+        }
+        acc += wt[kernel_size - 1] * x[c];
+    }
+    return acc / (1.0f + exp(-acc));
+}
+
+static inline void qw36_dn_conv1d_update_state(device float *conv_state,
+                                                device const float *x,
+                                                uint channels,
+                                                uint kernel_size,
+                                                uint c)
+{
+    if (kernel_size <= 1) return;
+    for (uint t = 0; t + 2 < kernel_size; ++t) {
+        conv_state[t * channels + c] = conv_state[(t + 1) * channels + c];
+    }
+    conv_state[(kernel_size - 2) * channels + c] = x[c];
+}
+
+/* Fused DeltaNet prep: inline depthwise conv1d+silu before q/k L2 norm,
+ * v copy, alpha/beta transform, and in-place conv_state shift+append.
+ * One threadgroup owns one key/value head, so state updates occur only
+ * after all reads for that head have finished. */
+kernel void qw36_compute_g_beta_norm_qk_conv1d(
+    device float       *q_out      [[buffer(0)]],
+    device float       *k_out      [[buffer(1)]],
+    device float       *v_out      [[buffer(2)]],
+    device float       *g_out      [[buffer(3)]],
+    device float       *beta_out   [[buffer(4)]],
+    device const float *qkv_raw    [[buffer(5)]],
+    device const float *alpha_raw  [[buffer(6)]],
+    device const float *beta_raw   [[buffer(7)]],
+    device const float *dt_bias    [[buffer(8)]],
+    device const float *a_log      [[buffer(9)]],
+    device const float *conv_w     [[buffer(10)]],
+    device float       *conv_state [[buffer(11)]],
+    constant uint      &Hk         [[buffer(12)]],
+    constant uint      &Hv         [[buffer(13)]],
+    constant uint      &Dk         [[buffer(14)]],
+    constant uint      &Dv         [[buffer(15)]],
+    constant uint      &kernel_size [[buffer(16)]],
+    constant uint      &channels   [[buffer(17)]],
+    constant uint      &tg_size    [[buffer(18)]],
+    threadgroup float  *scratch    [[threadgroup(0)]],
+    uint                tid        [[thread_index_in_threadgroup]],
+    uint3               tg         [[threadgroup_position_in_grid]])
+{
+    uint head = tg.y;
+    uint q_total = Hk * Dk;
+    uint k_total = q_total;
+
+    threadgroup float *q_part = scratch;
+    threadgroup float *k_part = scratch + tg_size;
+
+    if (head < Hk) {
+        float qss = 0.0f;
+        float kss = 0.0f;
+        for (uint d = tid; d < Dk; d += tg_size) {
+            uint qc = head * Dk + d;
+            uint kc = q_total + head * Dk + d;
+            float qv = qw36_dn_conv1d_silu_value(qkv_raw, conv_w,
+                                                  conv_state, channels,
+                                                  kernel_size, qc);
+            float kv = qw36_dn_conv1d_silu_value(qkv_raw, conv_w,
+                                                  conv_state, channels,
+                                                  kernel_size, kc);
+            q_out[qc] = qv;
+            k_out[qc] = kv;
+            qss += qv * qv;
+            kss += kv * kv;
+        }
+        q_part[tid] = qss;
+        k_part[tid] = kss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                q_part[tid] += q_part[tid + stride];
+                k_part[tid] += k_part[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float q_scale = rsqrt(q_part[0] + 1.0e-12f) / sqrt(float(Dk));
+        float k_scale = rsqrt(k_part[0] + 1.0e-12f);
+        for (uint d = tid; d < Dk; d += tg_size) {
+            uint qc = head * Dk + d;
+            uint kc = q_total + head * Dk + d;
+            q_out[qc] *= q_scale;
+            k_out[qc] *= k_scale;
+            qw36_dn_conv1d_update_state(conv_state, qkv_raw, channels,
+                                         kernel_size, qc);
+            qw36_dn_conv1d_update_state(conv_state, qkv_raw, channels,
+                                         kernel_size, kc);
+        }
+    }
+
+    if (head < Hv) {
+        for (uint d = tid; d < Dv; d += tg_size) {
+            uint vc = q_total + k_total + head * Dv + d;
+            v_out[head * Dv + d] = qw36_dn_conv1d_silu_value(
+                qkv_raw, conv_w, conv_state, channels, kernel_size, vc);
+            qw36_dn_conv1d_update_state(conv_state, qkv_raw, channels,
+                                         kernel_size, vc);
+        }
+        if (tid == 0) {
+            float av = alpha_raw[head] + dt_bias[head];
+            float softplus = av > 20.0f ? av : log(1.0f + exp(av));
+            g_out[head] = exp(-exp(a_log[head]) * softplus);
+            beta_out[head] = 1.0f / (1.0f + exp(-beta_raw[head]));
+        }
+    }
+}
+
 kernel void qw36_dn_reorder_grouped_y_to_raw_f32(
     device float       *y_raw     [[buffer(0)]],
     device const float *y_grouped [[buffer(1)]],
