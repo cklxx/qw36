@@ -69,6 +69,40 @@ one session.
 
 ## Open items
 
+### #31 — output coherence — **partial fix landed, more remaining**
+
+#### Progress
+
+| step                              | sample output (`Hello`, n=8)           |
+|-----------------------------------|----------------------------------------|
+| start of session                  | `$h$h$h:$:$:$:$:$`  (pure punctuation) |
+| Q5_K dequant fix (c479cad)        | `ól>$;$;$;$`  (mixed, still degenerate)|
+| Q3_K + matmul checks (2df5298+)   | `($($($($($($($($` (looping cluster)   |
+| **QKV interleave fix (b25b124)**  | `old dispersionemenogaellini…`         |
+| Metal sync (24661fc)              | same multilingual fragments at 78 tok/s|
+
+**Real bug found and fixed**: Qwen3.5/3.6 store `attn_qkv.weight` outputs
+per-head interleaved `[Qh0(Dk), Kh0(Dk), Vh0(Dv), Qh1, Kh1, Vh1, ...]`,
+not as the `[Q_block | K_block | V_block]` layout that agent-infer's
+MLX path reaches at split-time (it must reorder at load). With the
+correct layout:
+
+- bisection `L=1` logit on `\n` jumps from 7.68 → 40.66 (DN L0 no
+  longer destroys the residual)
+- top-1 token at full L=24 changes from `{$` to `old`/`雨`/`老` — i.e.
+  real word tokens, multilingual mix
+- speed unchanged (~78 tok/s with fp16)
+
+Still not coherent though. Need agent-infer / HF transformers
+reference dump (see tests/golden_diff.md) to chase the residual
+defect — likely in:
+- vanilla q/k/v split inside the per-head reshape (similar mistake
+  possible since L=4 transforms `\n` directly into `万` instead of an
+  English continuation token, despite English prompt)
+- conv1d weight stride / state-shift direction
+- ssm_out row/col interpretation
+- z gating broadcast across value heads
+
 ### #31 — output coherence — **localized to DN block math** (commit b709cb7)
 
 Layer-bisection with `QW36_MAX_LAYERS=N` running prompt `Hello`:
