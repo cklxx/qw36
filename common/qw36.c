@@ -727,19 +727,35 @@ static void gated_delta_decode(const float *qkv,
     const uint32_t k_dim_total = q_dim_total;
     const float    inv_sqrt_d  = 1.0f / sqrtf((float)key_dim);
 
+    /* Qwen3.5 / 3.6 store attn_qkv as per-head interleaved blocks
+     * [Qh0,Kh0,Vh0,Qh1,Kh1,Vh1,...] rather than the block layout
+     * [Q | K | V] that's more common in other transformer families.
+     * Confirmed via layer-0 bisection on Qwen3.5-0.8B-Q4_K_M (task #31):
+     * with this layout the DN L0 logit on token 9419 ('Hello') stays at
+     * ~40 instead of collapsing to ~8 (which kept the residual direction
+     * close to the input embed, as expected for a small per-layer ∆).
+     * Default ON for Qwen3 hybrid models; opt out with
+     * QW36_QKV_INTERLEAVE=0 if testing a checkpoint with block layout. */
+    static int qkv_interleave = -1;
+    if (qkv_interleave < 0) {
+        const char *e = getenv("QW36_QKV_INTERLEAVE");
+        qkv_interleave = (e && atoi(e) == 0) ? 0 : 1;
+    }
+
     for (uint32_t v = 0; v < n_value; v++) {
-        /* We keep GGUF's native V-head order instead of materializing the
-         * agent-infer/HF reorder. GGUF stores value heads tiled by
-         * V-within-K-group, so raw value head v maps to key head v % n_key.
-         * agent-infer reverses this order at load time and then uses
-         * v * n_key / n_value. */
         const uint32_t kh = v % n_key;
+        const uint32_t head_stride = 2 * key_dim + val_dim;  /* per-head: q,k,v */
 
         /* Copy and L2-normalize q, k for this head. */
         double qss = 0.0, kss = 0.0;
         for (uint32_t d = 0; d < key_dim; d++) {
-            qbuf[d] = qkv[kh * key_dim + d];
-            kbuf[d] = qkv[q_dim_total + kh * key_dim + d];
+            if (qkv_interleave) {
+                qbuf[d] = qkv[kh * head_stride + d];
+                kbuf[d] = qkv[kh * head_stride + key_dim + d];
+            } else {
+                qbuf[d] = qkv[kh * key_dim + d];
+                kbuf[d] = qkv[q_dim_total + kh * key_dim + d];
+            }
             qss += (double)qbuf[d] * qbuf[d];
             kss += (double)kbuf[d] * kbuf[d];
         }
@@ -750,7 +766,9 @@ static void gated_delta_decode(const float *qkv,
             kbuf[d] *= k_scale;
         }
 
-        const float *vin = qkv + q_dim_total + k_dim_total + v * val_dim;
+        const float *vin = qkv_interleave
+            ? qkv + v * head_stride + 2 * key_dim
+            : qkv + q_dim_total + k_dim_total + v * val_dim;
 
         /* Gating scalars. */
         float a_v = a_proj_raw[v] + dt_bias[v];
