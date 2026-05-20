@@ -195,13 +195,16 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     qw36_engine *eng = qw36__active_engine;
     qw36_gpu_backend *be;
     qw36_gpu_ctx *ctx;
+    const int fused_proj = L && L->dn_qkv && !L->dn_gate &&
+                           !L->dn_alpha && !L->dn_beta;
     if (!st || !L || !c ||
         !st->x_dev || !st->x_rms_dev || !st->dn_qkv_dev ||
         !st->dn_qkv_act_dev || !st->dn_z_dev || !st->dn_alpha_dev ||
         !st->dn_beta_dev || !st->dn_gout_dev ||
         !st->conv_state_dev || !st->delta_state_dev ||
         !st->conv_state_dev[layer_idx] || !st->delta_state_dev[layer_idx] ||
-        !L->dn_qkv || !L->dn_gate || !L->dn_alpha || !L->dn_beta ||
+        !L->dn_qkv ||
+        (!fused_proj && (!L->dn_gate || !L->dn_alpha || !L->dn_beta)) ||
         !L->dn_conv1d || !L->dn_dt_bias || !L->dn_a_log ||
         !L->dn_norm || !L->dn_out ||
         !qw36__active_backend(&be, &ctx) ||
@@ -227,6 +230,10 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     const uint32_t vd = c->dn_value_head_dim;
     if (!n_v || !n_k || !kd || !vd) return -1;
     const uint32_t qkv_dim = n_k * kd * 2 + n_v * vd;
+    const uint32_t z_dim = n_v * vd;
+    const uint32_t alpha_offset = fused_proj ? qkv_dim + z_dim : 0;
+    const uint32_t beta_offset = fused_proj ? qkv_dim + z_dim + n_v : 0;
+    const uint32_t z_offset = fused_proj ? qkv_dim : 0;
     qw36_gpu_buf *conv_w = qw36__gpu_cached_upload(eng, L->dn_conv1d,
         (size_t)qkv_dim * c->dn_conv_kernel_size * sizeof(float),
         QW36_DTYPE_F32);
@@ -248,15 +255,17 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_qkv_dev,
                           (qw36_gpu_buf *)st->x_rms_dev,
                           (const qw36_lazy_w *)L->dn_qkv);
-    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_z_dev,
-                          (qw36_gpu_buf *)st->x_rms_dev,
-                          (const qw36_lazy_w *)L->dn_gate);
-    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_alpha_dev,
-                          (qw36_gpu_buf *)st->x_rms_dev,
-                          (const qw36_lazy_w *)L->dn_alpha);
-    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_beta_dev,
-                          (qw36_gpu_buf *)st->x_rms_dev,
-                          (const qw36_lazy_w *)L->dn_beta);
+    if (!fused_proj) {
+        rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_z_dev,
+                              (qw36_gpu_buf *)st->x_rms_dev,
+                              (const qw36_lazy_w *)L->dn_gate);
+        rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_alpha_dev,
+                              (qw36_gpu_buf *)st->x_rms_dev,
+                              (const qw36_lazy_w *)L->dn_alpha);
+        rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_beta_dev,
+                              (qw36_gpu_buf *)st->x_rms_dev,
+                              (const qw36_lazy_w *)L->dn_beta);
+    }
     if (rc) return -1;
 
     be->dn_conv1d_silu(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev,
@@ -266,15 +275,18 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
                        qkv_dim, c->dn_conv_kernel_size);
     be->dn_gated_delta(ctx, (qw36_gpu_buf *)st->dn_gout_dev,
                        (qw36_gpu_buf *)st->dn_qkv_act_dev,
-                       (qw36_gpu_buf *)st->dn_beta_dev,
-                       (qw36_gpu_buf *)st->dn_alpha_dev,
+                       fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                  : (qw36_gpu_buf *)st->dn_beta_dev,
+                       fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                  : (qw36_gpu_buf *)st->dn_alpha_dev,
                        dt_bias, a_log,
                        (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
-                       n_k, n_v, kd, vd);
+                       n_k, n_v, kd, vd, alpha_offset, beta_offset);
     be->dn_gated_rmsnorm(ctx, (qw36_gpu_buf *)st->dn_qkv_dev,
                          (qw36_gpu_buf *)st->dn_gout_dev,
-                         (qw36_gpu_buf *)st->dn_z_dev,
-                         dn_norm, n_v, vd, c->rms_norm_eps);
+                         fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                    : (qw36_gpu_buf *)st->dn_z_dev,
+                         dn_norm, n_v, vd, z_offset, c->rms_norm_eps);
     rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
                           (qw36_gpu_buf *)st->dn_qkv_dev,
                           (const qw36_lazy_w *)L->dn_out);
@@ -334,6 +346,9 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     const uint32_t k_dim_t = n_k * kd;
     const uint32_t v_dim = n_v * vd;
     const uint32_t qkv_dim = q_dim + k_dim_t + v_dim;
+    const int fused_proj = L->dn_qkv && !L->dn_gate &&
+                           !L->dn_alpha && !L->dn_beta;
+    const size_t fused_dim = (size_t)qkv_dim + v_dim + (size_t)n_v * 2;
 
     qw36__rmsnorm_dispatch(st->x_rms, x, (const float *)L->input_layernorm,
                            hidden, c->rms_norm_eps);
@@ -342,7 +357,8 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
                       + (size_t)v_dim
                       + (size_t)n_v * 2
                       + (size_t)v_dim
-                      + (size_t)kd * 2;
+                      + (size_t)kd * 2
+                      + (fused_proj ? fused_dim : 0);
     float *blk = (float *)calloc(need, sizeof(float));
     if (!blk) return -3;
     float *qkv = blk;
@@ -353,28 +369,40 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     float *gout = beta + n_v;
     float *qb = gout + v_dim;
     float *kb = qb + kd;
+    float *fused_raw = kb + kd;
 
     int dn_rc = 0;
-    dn_rc |= qw36__matmul_lazy(qkv, st->x_rms,
-                               (const qw36_lazy_w *)L->dn_qkv,
-                               fc->row_scratch);
-    dn_rc |= qw36__matmul_lazy(z_proj, st->x_rms,
-                               (const qw36_lazy_w *)L->dn_gate,
-                               fc->row_scratch);
-    dn_rc |= qw36__matmul_lazy(alpha, st->x_rms,
-                               (const qw36_lazy_w *)L->dn_alpha,
-                               fc->row_scratch);
-    dn_rc |= qw36__matmul_lazy(beta, st->x_rms,
-                               (const qw36_lazy_w *)L->dn_beta,
-                               fc->row_scratch);
+    if (fused_proj) {
+        dn_rc |= qw36__matmul_lazy(fused_raw, st->x_rms,
+                                   (const qw36_lazy_w *)L->dn_qkv,
+                                   fc->row_scratch);
+        memcpy(qkv, fused_raw, (size_t)qkv_dim * sizeof(float));
+        memcpy(z_proj, fused_raw + qkv_dim, (size_t)v_dim * sizeof(float));
+        memcpy(alpha, fused_raw + qkv_dim + v_dim, (size_t)n_v * sizeof(float));
+        memcpy(beta, fused_raw + qkv_dim + v_dim + n_v,
+               (size_t)n_v * sizeof(float));
+    } else {
+        dn_rc |= qw36__matmul_lazy(qkv, st->x_rms,
+                                   (const qw36_lazy_w *)L->dn_qkv,
+                                   fc->row_scratch);
+        dn_rc |= qw36__matmul_lazy(z_proj, st->x_rms,
+                                   (const qw36_lazy_w *)L->dn_gate,
+                                   fc->row_scratch);
+        dn_rc |= qw36__matmul_lazy(alpha, st->x_rms,
+                                   (const qw36_lazy_w *)L->dn_alpha,
+                                   fc->row_scratch);
+        dn_rc |= qw36__matmul_lazy(beta, st->x_rms,
+                                   (const qw36_lazy_w *)L->dn_beta,
+                                   fc->row_scratch);
+    }
     if (dn_rc) {
         fprintf(stderr, "qw36: DN projection failed at layer %u "
                 "(unsupported dtype in attn_qkv/gate/alpha/beta - "
                 "ggml types %d/%d/%d/%d)\n", layer_idx,
                 ((const qw36_lazy_w *)L->dn_qkv)->ggml_type,
-                ((const qw36_lazy_w *)L->dn_gate)->ggml_type,
-                ((const qw36_lazy_w *)L->dn_alpha)->ggml_type,
-                ((const qw36_lazy_w *)L->dn_beta)->ggml_type);
+                L->dn_gate ? ((const qw36_lazy_w *)L->dn_gate)->ggml_type : -1,
+                L->dn_alpha ? ((const qw36_lazy_w *)L->dn_alpha)->ggml_type : -1,
+                L->dn_beta ? ((const qw36_lazy_w *)L->dn_beta)->ggml_type : -1);
         free(blk);
         return -4;
     }

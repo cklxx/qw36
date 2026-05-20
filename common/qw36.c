@@ -285,6 +285,76 @@ static int lazy_fuse_vanilla_qkv(qw36_engine *eng, qw36_layer_weights *L,
     return 0;
 }
 
+/* Metal DeltaNet fast path: concatenate the four projections that share the
+ * same x_rms input into one fp16 [qkv | z | alpha | beta] matrix. The fused
+ * signal is L->dn_gate == L->dn_alpha == L->dn_beta == NULL; downstream code
+ * reads z/alpha/beta by element offsets from the dn_qkv matmul output. */
+static int lazy_fuse_dn_qkvzab(qw36_engine *eng, qw36_layer_weights *L,
+                               const qw36_config *c) {
+    if (!eng || !L || !c || !L->dn_qkv || !L->dn_gate ||
+        !L->dn_alpha || !L->dn_beta)
+        return 0;
+    qw36_lazy_w *qkv = (qw36_lazy_w *)L->dn_qkv;
+    qw36_lazy_w *z   = (qw36_lazy_w *)L->dn_gate;
+    qw36_lazy_w *a   = (qw36_lazy_w *)L->dn_alpha;
+    qw36_lazy_w *b   = (qw36_lazy_w *)L->dn_beta;
+    if (qkv->dtype != QW36_DTYPE_F16 || z->dtype != QW36_DTYPE_F16 ||
+        a->dtype != QW36_DTYPE_F16 || b->dtype != QW36_DTYPE_F16 ||
+        qkv->cols != z->cols || qkv->cols != a->cols || qkv->cols != b->cols ||
+        qkv->n_extra || z->n_extra || a->n_extra || b->n_extra)
+        return 0;
+
+    const uint64_t qkv_rows =
+        (uint64_t)c->dn_num_key_heads * c->dn_key_head_dim * 2u +
+        (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
+    const uint64_t z_rows =
+        (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
+    const uint64_t ab_rows = c->dn_num_value_heads;
+    if (!qkv_rows || !z_rows || !ab_rows ||
+        qkv->rows != qkv_rows || z->rows != z_rows ||
+        a->rows != ab_rows || b->rows != ab_rows)
+        return 0;
+    if (qkv_rows > UINT64_MAX - z_rows ||
+        qkv_rows + z_rows > UINT64_MAX - ab_rows ||
+        qkv_rows + z_rows + ab_rows > UINT64_MAX - ab_rows)
+        return -1;
+
+    const uint64_t rows64 = qkv_rows + z_rows + ab_rows + ab_rows;
+    const size_t cols = (size_t)qkv->cols;
+    if (rows64 > SIZE_MAX) return -1;
+    const size_t rows = (size_t)rows64;
+    if (cols && rows > SIZE_MAX / cols) return -1;
+    const size_t numel = rows * cols;
+    if (numel > SIZE_MAX / sizeof(uint16_t)) return -1;
+    const size_t qkv_bytes = (size_t)qkv_rows * cols * sizeof(uint16_t);
+    const size_t z_bytes = (size_t)z_rows * cols * sizeof(uint16_t);
+    const size_t ab_bytes = (size_t)ab_rows * cols * sizeof(uint16_t);
+
+    uint8_t *buf = (uint8_t *)malloc(numel * sizeof(uint16_t));
+    qw36_lazy_w *fused = (qw36_lazy_w *)calloc(1, sizeof(*fused));
+    if (!buf || !fused) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    uint8_t *dst = buf;
+    memcpy(dst, qkv->data, qkv_bytes); dst += qkv_bytes;
+    memcpy(dst, z->data, z_bytes);     dst += z_bytes;
+    memcpy(dst, a->data, ab_bytes);    dst += ab_bytes;
+    memcpy(dst, b->data, ab_bytes);
+    *fused = *qkv;
+    fused->data = buf;
+    fused->rows = rows64;
+    fused->gpu_buf = NULL;
+    qw36__eng_own(eng, buf);
+    qw36__eng_own(eng, fused);
+    L->dn_qkv = fused;
+    L->dn_gate = NULL;
+    L->dn_alpha = NULL;
+    L->dn_beta = NULL;
+    return 0;
+}
+
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
@@ -645,6 +715,11 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             backend->name && strcmp(backend->name, "metal") == 0 &&
             fp16_lazy_weights && !quant_gpu_weights &&
             (!fuse_qkv_env || atoi(fuse_qkv_env) != 0);
+        const char *fuse_dn_env = getenv("QW36_METAL_FUSE_DN_QKVZAB");
+        const int fuse_dn_qkvzab =
+            backend->name && strcmp(backend->name, "metal") == 0 &&
+            fp16_lazy_weights && !quant_gpu_weights &&
+            (!fuse_dn_env || atoi(fuse_dn_env) != 0);
 
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
@@ -695,8 +770,8 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             MAT_AS(o_proj, fp16_lazy_weights);
             MAT_AS(dn_qkv, fp16_lazy_weights);
             MAT_AS(dn_gate, fp16_lazy_weights);
-            MAT_AS(dn_alpha, 0);
-            MAT_AS(dn_beta, 0);
+            MAT_AS(dn_alpha, fuse_dn_qkvzab);
+            MAT_AS(dn_beta, fuse_dn_qkvzab);
             MAT_AS(dn_out, fp16_lazy_weights);
             MAT_AS(gate_proj, fp16_lazy_weights);
             MAT_AS(up_proj, fp16_lazy_weights);
@@ -728,6 +803,17 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 if (lazy_fuse_vanilla_qkv(eng, L, c)) {
                     if (err && err_cap) snprintf(err, err_cap,
                         "%s: backend qkv fuse failed at blk.%u",
+                        backend->name, l);
+                    qw36_engine_close(eng); return NULL;
+                }
+            }
+        }
+        if (fuse_dn_qkvzab) {
+            for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+                qw36_layer_weights *L = &eng->weights.layers[l];
+                if (lazy_fuse_dn_qkvzab(eng, L, c)) {
+                    if (err && err_cap) snprintf(err, err_cap,
+                        "%s: backend DN qkvzab fuse failed at blk.%u",
                         backend->name, l);
                     qw36_engine_close(eng); return NULL;
                 }
@@ -829,6 +915,9 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         : 0;
     const size_t dn_v_dim = c->dn_num_value_heads
         ? (size_t)c->dn_num_value_heads * c->dn_value_head_dim
+        : 0;
+    const size_t dn_proj_dim = c->dn_num_value_heads
+        ? dn_qkv_dim + dn_v_dim + (size_t)c->dn_num_value_heads * 2
         : 0;
     const size_t dn_conv_window = (c->dn_num_value_heads &&
                                    c->dn_conv_kernel_size)
@@ -982,7 +1071,7 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         st->up_dev = be->alloc(ctx, inter * sizeof(float), QW36_DTYPE_F32);
         st->logits_dev = be->alloc(ctx, vocab * sizeof(float), QW36_DTYPE_F32);
         if (c->dn_num_value_heads) {
-            st->dn_qkv_dev = be->alloc(ctx, dn_qkv_dim * sizeof(float),
+            st->dn_qkv_dev = be->alloc(ctx, dn_proj_dim * sizeof(float),
                                        QW36_DTYPE_F32);
             st->dn_qkv_act_dev = be->alloc(ctx, dn_qkv_dim * sizeof(float),
                                            QW36_DTYPE_F32);

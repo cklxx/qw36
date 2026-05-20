@@ -110,13 +110,17 @@ typedef struct qw36_gpu_backend {
                            qw36_gpu_buf *a_log,
                            qw36_gpu_buf *state,
                            uint32_t n_key, uint32_t n_value,
-                           uint32_t key_dim, uint32_t val_dim);
+                           uint32_t key_dim, uint32_t val_dim,
+                           /* element offsets into alpha_raw/beta_raw */
+                           uint32_t alpha_offset,
+                           uint32_t beta_offset);
 
     void (*dn_gated_rmsnorm)(qw36_gpu_ctx *ctx,
                              qw36_gpu_buf *y, qw36_gpu_buf *x,
                              qw36_gpu_buf *z, qw36_gpu_buf *weight,
                              uint32_t n_value, uint32_t val_dim,
-                             float eps);
+                             /* element offset into z */
+                             uint32_t z_offset, float eps);
 
     /* MoE forward (optional — set to NULL on dense-only builds). */
     void (*moe_forward)(qw36_gpu_ctx *ctx,

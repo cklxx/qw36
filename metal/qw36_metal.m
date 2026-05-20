@@ -1452,7 +1452,9 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
                                  qw36_gpu_buf *alpha_raw, qw36_gpu_buf *dt_bias,
                                  qw36_gpu_buf *a_log, qw36_gpu_buf *state,
                                  uint32_t n_key, uint32_t n_value,
-                                 uint32_t key_dim, uint32_t val_dim)
+                                 uint32_t key_dim, uint32_t val_dim,
+                                 uint32_t alpha_offset,
+                                 uint32_t beta_offset)
 {
     if (!ctx || !y || !qkv || !beta_raw || !alpha_raw || !dt_bias ||
         !a_log || !state || !n_key || !n_value || !key_dim || !val_dim)
@@ -1481,8 +1483,8 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
         [enc setBuffer:g->mtl         offset:0 atIndex:3];
         [enc setBuffer:beta->mtl      offset:0 atIndex:4];
         [enc setBuffer:qkv->mtl       offset:0 atIndex:5];
-        [enc setBuffer:alpha_raw->mtl offset:0 atIndex:6];
-        [enc setBuffer:beta_raw->mtl  offset:0 atIndex:7];
+        [enc setBuffer:alpha_raw->mtl offset:(NSUInteger)alpha_offset * sizeof(float) atIndex:6];
+        [enc setBuffer:beta_raw->mtl  offset:(NSUInteger)beta_offset * sizeof(float) atIndex:7];
         [enc setBuffer:dt_bias->mtl   offset:0 atIndex:8];
         [enc setBuffer:a_log->mtl     offset:0 atIndex:9];
         [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:10];
@@ -1519,14 +1521,14 @@ static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
                                    qw36_gpu_buf *x, qw36_gpu_buf *z,
                                    qw36_gpu_buf *weight,
                                    uint32_t n_value, uint32_t val_dim,
-                                   float eps)
+                                   uint32_t z_offset, float eps)
 {
     if (!ctx || !y || !x || !z || !weight) return;
     NSUInteger n = (NSUInteger)n_value * (NSUInteger)val_dim;
     metal_dispatch_1d(ctx, ctx->dn_gated_rmsnorm, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:y->mtl      offset:0 atIndex:0];
         [enc setBuffer:x->mtl      offset:0 atIndex:1];
-        [enc setBuffer:z->mtl      offset:0 atIndex:2];
+        [enc setBuffer:z->mtl      offset:(NSUInteger)z_offset * sizeof(float) atIndex:2];
         [enc setBuffer:weight->mtl offset:0 atIndex:3];
         [enc setBytes:&n_value length:sizeof(n_value) atIndex:4];
         [enc setBytes:&val_dim length:sizeof(val_dim) atIndex:5];
