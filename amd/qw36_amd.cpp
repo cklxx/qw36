@@ -878,6 +878,8 @@ static qw36_gpu_backend g_amd_backend = {
     /* name              */ "amd",
     /* init              */ amd_init,
     /* destroy           */ amd_destroy,
+    /* begin_batch       */ nullptr,
+    /* end_batch         */ nullptr,
     /* upload            */ amd_upload,
     /* download          */ amd_download,
     /* alloc             */ amd_alloc,

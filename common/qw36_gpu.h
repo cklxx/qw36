@@ -40,6 +40,15 @@ typedef struct qw36_gpu_backend {
     qw36_gpu_ctx *(*init)(char *err, size_t err_cap);
     void          (*destroy)(qw36_gpu_ctx *ctx);
 
+    /* Optional: batched command submission. The engine calls begin_batch
+     * at the top of a forward step and end_batch at the bottom. Backends
+     * that implement this should hold a single command buffer between the
+     * pair so every op (matmul/rmsnorm/...) encodes into it without an
+     * individual commit+wait. A no-op (NULL) fallback keeps the old per-op
+     * commit semantics. */
+    void (*begin_batch)(qw36_gpu_ctx *ctx);
+    void (*end_batch)(qw36_gpu_ctx *ctx);   /* commit + waitUntilCompleted */
+
     /* Tensor management */
     qw36_gpu_buf *(*upload)(qw36_gpu_ctx *ctx, const void *host,
                             size_t bytes, qw36_dtype dtype);

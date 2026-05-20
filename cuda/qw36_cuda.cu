@@ -854,6 +854,8 @@ static qw36_gpu_backend g_cuda_backend = {
     /* name              */ "cuda",
     /* init              */ cuda_init,
     /* destroy           */ cuda_destroy,
+    /* begin_batch       */ nullptr,
+    /* end_batch         */ nullptr,
     /* upload            */ cuda_upload,
     /* download          */ cuda_download,
     /* alloc             */ cuda_alloc,

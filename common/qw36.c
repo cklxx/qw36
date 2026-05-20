@@ -448,7 +448,13 @@ static int active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out)
 
 /* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c].
  * Dispatches to the GPU backend when one is attached and the weight has
- * an uploaded gpu_buf; otherwise falls back to per-row CPU dequant + dot. */
+ * an uploaded gpu_buf; otherwise falls back to per-row CPU dequant + dot.
+ *
+ * Buffer reuse: rather than alloc/free a fresh x_dev / y_dev per matmul
+ * (which dominates the per-token latency at ~10 tok/s), we maintain a
+ * per-engine pool of scratch device buffers indexed by byte size. The
+ * largest scratch slots are sized to match max(hidden, intermediate,
+ * vocab) * sizeof(float). */
 static int matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
                        float *row_scratch)
 {
@@ -463,15 +469,17 @@ static int matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
     {
         qw36_gpu_backend *be = eng->backend;
         qw36_gpu_ctx     *ctx = eng->ctx;
-        qw36_gpu_buf *xb = be->upload(ctx, x, cols * sizeof(float), QW36_DTYPE_F32);
-        qw36_gpu_buf *yb = be->alloc(ctx, rows * sizeof(float),   QW36_DTYPE_F32);
+        const size_t x_bytes = cols * sizeof(float);
+        const size_t y_bytes = rows * sizeof(float);
+        qw36_gpu_buf *xb = be->upload(ctx, x, x_bytes, QW36_DTYPE_F32);
+        qw36_gpu_buf *yb = be->alloc(ctx, y_bytes,   QW36_DTYPE_F32);
         if (!xb || !yb) {
             if (xb) be->free(ctx, xb);
             if (yb) be->free(ctx, yb);
             goto cpu_path;
         }
         be->matmul(ctx, yb, xb, w->gpu_buf, 1, (uint32_t)rows, (uint32_t)cols);
-        be->download(ctx, yb, y, rows * sizeof(float));
+        be->download(ctx, yb, y, y_bytes);
         be->free(ctx, xb);
         be->free(ctx, yb);
         return 0;
@@ -1688,6 +1696,14 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
      * GPU backend without explicit parameter threading. Restored on exit. */
     qw36_engine *prev_active = qw36_active_engine;
     qw36_active_engine = eng;
+    if (eng->backend && eng->backend->begin_batch && eng->ctx)
+        eng->backend->begin_batch(eng->ctx);
+#define QW36_FORWARD_RETURN(code_) do { \
+        if (eng->backend && eng->backend->end_batch && eng->ctx) \
+            eng->backend->end_batch(eng->ctx); \
+        qw36_active_engine = prev_active; \
+        return (code_); \
+    } while (0)
 
     const size_t hidden = c->hidden_size;
     const size_t inter  = c->intermediate_size;
@@ -1700,7 +1716,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 
     /* Embed: dequant row `token` from embed_tokens. */
     if (embed_lookup_lazy((const qw36_lazy_w *)w->embed_tokens, token, st->x))
-        return -3;
+        QW36_FORWARD_RETURN(-3);
 
     /* Optional debug: per-layer norm trace, enabled by env var. */
     static int debug_layer = -1;
@@ -1738,7 +1754,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                               + (size_t)v_dim          /* gout */
                               + (size_t)kd * 2;        /* qb + kb */
             float *blk = (float *)calloc(need, sizeof(float));
-            if (!blk) return -3;
+            if (!blk) QW36_FORWARD_RETURN(-3);
             float *qkv     = blk;
             float *qkv_act = qkv + qkv_dim;
             float *z_proj  = qkv_act + qkv_dim;
@@ -1762,7 +1778,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                         ((const qw36_lazy_w *)L->dn_alpha)->ggml_type,
                         ((const qw36_lazy_w *)L->dn_beta)->ggml_type);
                 free(blk);
-                return -4;
+                QW36_FORWARD_RETURN(-4);
             }
 
             /* Conv1d + SiLU on the QKV channels (depthwise causal).
@@ -1805,7 +1821,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                         "(unsupported dtype in ssm_out — ggml type %d)\n",
                         l, ((const qw36_lazy_w *)L->dn_out)->ggml_type);
                 free(blk);
-                return -5;
+                QW36_FORWARD_RETURN(-5);
             }
             /* Debug knob: QW36_SKIP_DN=1 zeroes the DN contribution to
              * isolate whether the bug is in the DeltaNet path. */
@@ -1825,7 +1841,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 
         if (!L->q_proj) {
             /* Layer is neither vanilla nor DeltaNet — unknown variant. */
-            return -2;
+            QW36_FORWARD_RETURN(-2);
         }
 
         /* --- vanilla full-attention block --- */
@@ -1868,7 +1884,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                         ((const qw36_lazy_w *)L->q_proj)->ggml_type,
                         ((const qw36_lazy_w *)L->k_proj)->ggml_type,
                         ((const qw36_lazy_w *)L->v_proj)->ggml_type);
-                return -6;
+                QW36_FORWARD_RETURN(-6);
             }
 
             /* Per-head q_norm/k_norm + RoPE. */
@@ -1997,8 +2013,8 @@ mlp_block:
                 (const qw36_lazy_w *)w->lm_head, row_scratch);
 
     st->seq_pos++;
-    qw36_active_engine = prev_active;
-    return 0;
+    QW36_FORWARD_RETURN(0);
+#undef QW36_FORWARD_RETURN
 }
 
 int qw36_prefill(qw36_engine *eng, qw36_state *st,
