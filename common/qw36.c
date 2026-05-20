@@ -2293,7 +2293,24 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                 sqrt(ss), st->x[0], st->x[1], st->x[2]);
     }
 
+    /* QW36_BYPASS_LAYERS=1: skip all transformer layers entirely.
+     * QW36_MAX_LAYERS=N: run only layers 0..N-1.  Use for bisecting
+     * which layer first corrupts the output direction. */
+    static int bypass_layers = -1;
+    static int max_layers    = -1;
+    if (bypass_layers < 0) {
+        const char *e = getenv("QW36_BYPASS_LAYERS");
+        bypass_layers = e && atoi(e) ? 1 : 0;
+    }
+    if (max_layers < 0) {
+        const char *e = getenv("QW36_MAX_LAYERS");
+        max_layers = e ? atoi(e) : (int)c->num_hidden_layers;
+        if (max_layers < 0) max_layers = (int)c->num_hidden_layers;
+    }
+
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+        if (bypass_layers) break;
+        if ((int)l >= max_layers) break;
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
 
