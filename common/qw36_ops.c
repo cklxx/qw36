@@ -483,8 +483,8 @@ int qw36__swiglu_dispatch(float *y, const float *x,
 {
     qw36_gpu_backend *be;
     qw36_gpu_ctx *ctx;
-    if (w_gate && w_up && w_down &&
-        w_gate->gpu_buf && w_up->gpu_buf && w_down->gpu_buf &&
+    if (w_gate && w_down &&
+        w_gate->gpu_buf && (!w_up || w_up->gpu_buf) && w_down->gpu_buf &&
         qw36__active_backend(&be, &ctx) && be->swiglu_mlp)
     {
         qw36_gpu_buf *xb = be->upload(ctx, x, (size_t)hidden * sizeof(float),
@@ -492,7 +492,8 @@ int qw36__swiglu_dispatch(float *y, const float *x,
         qw36_gpu_buf *yb = be->alloc(ctx, (size_t)hidden * sizeof(float),
                                      QW36_DTYPE_F32);
         if (xb && yb) {
-            be->swiglu_mlp(ctx, yb, xb, w_gate->gpu_buf, w_up->gpu_buf,
+            be->swiglu_mlp(ctx, yb, xb, w_gate->gpu_buf,
+                           w_up ? w_up->gpu_buf : NULL,
                            w_down->gpu_buf, hidden, inter);
             be->download(ctx, yb, y, (size_t)hidden * sizeof(float));
             be->free(ctx, xb);
@@ -503,8 +504,28 @@ int qw36__swiglu_dispatch(float *y, const float *x,
         if (yb) be->free(ctx, yb);
     }
 
-    if (qw36__matmul_lazy(scratch_gate, x, w_gate, row_scratch)) return -1;
-    if (qw36__matmul_lazy(scratch_up,   x, w_up,   row_scratch)) return -1;
+    qw36_lazy_w gate_view, up_view;
+    const qw36_lazy_w *gate_w = w_gate;
+    const qw36_lazy_w *up_w = w_up;
+    if (!up_w) {
+        if (!w_gate || w_gate->cols != hidden || w_gate->rows != (uint64_t)inter * 2 ||
+            (w_gate->dtype != QW36_DTYPE_F32 && w_gate->dtype != QW36_DTYPE_F16))
+            return -1;
+        const size_t elem = qw36__dtype_nbytes(w_gate->dtype);
+        const size_t half_bytes = (size_t)inter * (size_t)hidden * elem;
+        gate_view = *w_gate;
+        gate_view.rows = inter;
+        gate_view.gpu_buf = NULL;
+        up_view = *w_gate;
+        up_view.data = (const uint8_t *)w_gate->data + half_bytes;
+        up_view.rows = inter;
+        up_view.gpu_buf = NULL;
+        gate_w = &gate_view;
+        up_w = &up_view;
+    }
+
+    if (qw36__matmul_lazy(scratch_gate, x, gate_w, row_scratch)) return -1;
+    if (qw36__matmul_lazy(scratch_up,   x, up_w,   row_scratch)) return -1;
     for (uint32_t i = 0; i < inter; i++)
         scratch_gate[i] = qw36__silu(scratch_gate[i]) * scratch_up[i];
     if (qw36__matmul_lazy(y, scratch_gate, w_down, row_scratch)) return -1;
@@ -519,11 +540,13 @@ int qw36__swiglu_dispatch_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
 {
     qw36_gpu_backend *be;
     qw36_gpu_ctx *ctx;
-    if (!y || !x || !w_gate || !w_up || !w_down ||
-        !w_gate->gpu_buf || !w_up->gpu_buf || !w_down->gpu_buf ||
+    if (!y || !x || !w_gate || !w_down ||
+        !w_gate->gpu_buf || (w_up && !w_up->gpu_buf) || !w_down->gpu_buf ||
         !qw36__active_backend(&be, &ctx) || !be->swiglu_mlp)
         return -1;
-    be->swiglu_mlp(ctx, y, x, w_gate->gpu_buf, w_up->gpu_buf,
+    if (!w_up && w_gate->rows != (uint64_t)inter * 2) return -1;
+    be->swiglu_mlp(ctx, y, x, w_gate->gpu_buf,
+                   w_up ? w_up->gpu_buf : NULL,
                    w_down->gpu_buf, hidden, inter);
     return 0;
 }

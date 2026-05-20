@@ -1296,7 +1296,27 @@ static void metal_swiglu(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                          qw36_gpu_buf *w_gate, qw36_gpu_buf *w_up, qw36_gpu_buf *w_down,
                          uint32_t hidden, uint32_t inter)
 {
-    if (!ctx || !y || !x || !w_gate || !w_up || !w_down) return;
+    if (!ctx || !y || !x || !w_gate || !w_down) return;
+    if (!w_up) {
+        qw36_gpu_buf *gate_up = metal_scratch(ctx, &ctx->swiglu_gate_scratch,
+            (size_t)inter * 2u * sizeof(float), QW36_DTYPE_F32);
+        if (!gate_up) return;
+        metal_matmul(ctx, gate_up, x, w_gate, 1, inter * 2u, hidden);
+        metal_dispatch_1d(ctx, ctx->silu_mul, inter, ^(id<MTLComputeCommandEncoder> enc) {
+            uint32_t dtype = (uint32_t)gate_up->dtype;
+            uint32_t gate_offset = 0;
+            uint32_t up_offset = inter;
+            [enc setBuffer:gate_up->mtl offset:0 atIndex:0];
+            [enc setBuffer:gate_up->mtl offset:0 atIndex:1];
+            [enc setBytes:&inter length:sizeof(inter) atIndex:2];
+            [enc setBytes:&dtype length:sizeof(dtype) atIndex:3];
+            [enc setBytes:&dtype length:sizeof(dtype) atIndex:4];
+            [enc setBytes:&gate_offset length:sizeof(gate_offset) atIndex:5];
+            [enc setBytes:&up_offset length:sizeof(up_offset) atIndex:6];
+        });
+        metal_matmul(ctx, y, gate_up, w_down, 1, hidden, inter);
+        return;
+    }
     qw36_gpu_buf *gate = metal_scratch(ctx, &ctx->swiglu_gate_scratch,
         (size_t)inter * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *up = metal_scratch(ctx, &ctx->swiglu_up_scratch,
@@ -1307,11 +1327,15 @@ static void metal_swiglu(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
     metal_dispatch_1d(ctx, ctx->silu_mul, inter, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t gate_dtype = (uint32_t)gate->dtype;
         uint32_t up_dtype = (uint32_t)up->dtype;
+        uint32_t gate_offset = 0;
+        uint32_t up_offset = 0;
         [enc setBuffer:gate->mtl offset:0 atIndex:0];
         [enc setBuffer:up->mtl   offset:0 atIndex:1];
         [enc setBytes:&inter length:sizeof(inter) atIndex:2];
         [enc setBytes:&gate_dtype length:sizeof(gate_dtype) atIndex:3];
         [enc setBytes:&up_dtype length:sizeof(up_dtype) atIndex:4];
+        [enc setBytes:&gate_offset length:sizeof(gate_offset) atIndex:5];
+        [enc setBytes:&up_offset length:sizeof(up_offset) atIndex:6];
     });
     metal_matmul(ctx, y, gate, w_down, 1, hidden, inter);
 }

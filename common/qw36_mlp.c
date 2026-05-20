@@ -16,6 +16,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static int has_dense_swiglu_weights(const qw36_layer_weights *L, uint32_t inter)
+{
+    if (!L || L->moe_router || !L->gate_proj || !L->down_proj) return 0;
+    if (L->up_proj) return 1;
+    const qw36_lazy_w *gate = (const qw36_lazy_w *)L->gate_proj;
+    return gate && gate->rows == (uint64_t)inter * 2;
+}
+
 int qw36__mlp_forward(qw36_forward_ctx *fc,
                       const qw36_layer_weights *L,
                       uint32_t layer_idx)
@@ -31,8 +39,7 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
     float *x = st->x;
 
     int mlp_gpu_done = 0;
-    if (fc->gpu_state && !L->moe_router &&
-        L->gate_proj && L->up_proj && L->down_proj &&
+    if (fc->gpu_state && has_dense_swiglu_weights(L, (uint32_t)inter) &&
         eng->backend && eng->backend->rmsnorm &&
         eng->backend->swiglu_mlp && eng->backend->residual_add) {
         int erc = qw36__ensure_x_dev(fc);
@@ -138,7 +145,7 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
         free(moe_scratch);
         if (mrc) return -11;
         qw36__residual_add_dispatch(x, st->x_rms, hidden);
-    } else if (L->gate_proj && L->up_proj && L->down_proj) {
+    } else if (has_dense_swiglu_weights(L, (uint32_t)inter)) {
         if (qw36__swiglu_dispatch(st->x_rms, st->x_rms,
                                   (const qw36_lazy_w *)L->gate_proj,
                                   (const qw36_lazy_w *)L->up_proj,

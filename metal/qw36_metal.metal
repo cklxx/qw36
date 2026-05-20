@@ -128,12 +128,16 @@ kernel void qw36_silu_mul_f32(
     constant uint      &n        [[buffer(2)]],
     constant uint      &gate_dtype [[buffer(3)]],
     constant uint      &up_dtype [[buffer(4)]],
+    constant uint      &gate_offset [[buffer(5)]],
+    constant uint      &up_offset [[buffer(6)]],
     uint                tid      [[thread_position_in_grid]])
 {
     if (tid >= n) return;
-    float g = qw36_load_scalar(gate_io, gate_dtype, tid);
-    float u = qw36_load_scalar(up, up_dtype, tid);
-    qw36_store_scalar(gate_io, gate_dtype, tid,
+    uint gi = gate_offset + tid;
+    uint ui = up_offset + tid;
+    float g = qw36_load_scalar(gate_io, gate_dtype, gi);
+    float u = qw36_load_scalar(up, up_dtype, ui);
+    qw36_store_scalar(gate_io, gate_dtype, gi,
                       (g / (1.0f + exp(-g))) * u);
 }
 

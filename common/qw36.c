@@ -177,6 +177,53 @@ static int lazy_materialize_f16(qw36_engine *eng, qw36_lazy_w *lw) {
     return 0;
 }
 
+/* Metal dense-MLP fast path: concatenate gate_proj and up_proj into one
+ * [2*inter, hidden] dense matrix after materialization and before upload.
+ * L->up_proj == NULL is the internal signal that the backend should split
+ * w_gate's output into gate/up halves. */
+static int lazy_fuse_dense_gate_up(qw36_engine *eng, qw36_layer_weights *L) {
+    if (!eng || !L || L->moe_router || !L->gate_proj || !L->up_proj ||
+        !L->down_proj)
+        return 0;
+    qw36_lazy_w *gate = (qw36_lazy_w *)L->gate_proj;
+    qw36_lazy_w *up   = (qw36_lazy_w *)L->up_proj;
+    if (gate->dtype != up->dtype ||
+        (gate->dtype != QW36_DTYPE_F32 && gate->dtype != QW36_DTYPE_F16) ||
+        gate->rows != up->rows || gate->cols != up->cols ||
+        gate->n_extra || up->n_extra)
+        return 0;
+    if (gate->rows > SIZE_MAX || gate->cols > SIZE_MAX ||
+        gate->rows > UINT64_MAX / 2)
+        return -1;
+    const size_t rows = (size_t)gate->rows;
+    const size_t cols = (size_t)gate->cols;
+    const size_t elem = qw36__dtype_nbytes(gate->dtype);
+    if (!elem || (cols && rows > SIZE_MAX / cols)) return -1;
+    const size_t half_numel = rows * cols;
+    if (half_numel > SIZE_MAX / elem) return -1;
+    const size_t half_bytes = half_numel * elem;
+    if (half_bytes > SIZE_MAX / 2) return -1;
+
+    uint8_t *buf = (uint8_t *)malloc(2 * half_bytes);
+    qw36_lazy_w *fused = (qw36_lazy_w *)calloc(1, sizeof(*fused));
+    if (!buf || !fused) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    memcpy(buf, gate->data, half_bytes);
+    memcpy(buf + half_bytes, up->data, half_bytes);
+    *fused = *gate;
+    fused->data = buf;
+    fused->rows = gate->rows * 2;
+    fused->gpu_buf = NULL;
+    qw36__eng_own(eng, buf);
+    qw36__eng_own(eng, fused);
+    L->gate_proj = fused;
+    L->up_proj = NULL;
+    return 0;
+}
+
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
@@ -530,6 +577,8 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         const int quant_gpu_weights =
             backend->name && strcmp(backend->name, "metal") == 0 &&
             qgpu_env && atoi(qgpu_env) != 0;
+        const int fuse_dense_gate_up =
+            backend->name && strcmp(backend->name, "metal") == 0;
 
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
@@ -595,6 +644,18 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             MAT_AS(moe_shared_down, fp16_lazy_weights);
         }
         #undef MAT_AS
+
+        if (fuse_dense_gate_up) {
+            for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+                qw36_layer_weights *L = &eng->weights.layers[l];
+                if (lazy_fuse_dense_gate_up(eng, L)) {
+                    if (err && err_cap) snprintf(err, err_cap,
+                        "%s: backend gate_up fuse failed at blk.%u",
+                        backend->name, l);
+                    qw36_engine_close(eng); return NULL;
+                }
+            }
+        }
 
         /* Now wrap every materialized buffer as a device-visible view.
          * For Apple Metal this is zero-copy via MTLBuffer NoCopy; for

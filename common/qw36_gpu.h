@@ -86,7 +86,9 @@ typedef struct qw36_gpu_backend {
                       uint32_t seq_capacity,
                       float rope_theta, float partial_rotary_factor);
 
-    /* SwiGLU MLP: y = down(silu(gate(x)) * up(x)) */
+    /* SwiGLU MLP: y = down(silu(gate(x)) * up(x)).
+     * If w_up is NULL, w_gate is a fused [2*intermediate, hidden]
+     * gate_up matrix and the backend splits the matmul output in half. */
     void (*swiglu_mlp)(qw36_gpu_ctx *ctx,
                        qw36_gpu_buf *y, qw36_gpu_buf *x,
                        qw36_gpu_buf *w_gate, qw36_gpu_buf *w_up,
