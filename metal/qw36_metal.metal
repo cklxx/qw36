@@ -427,12 +427,17 @@ kernel void qw36_dn_reorder_grouped_y_to_raw_f32(
 /* Residual add                                                      */
 /* ---------------------------------------------------------------- */
 kernel void qw36_residual_add_f32(
-    device float       *x        [[buffer(0)]],
-    device const float *y        [[buffer(1)]],
+    device uchar       *x        [[buffer(0)]],
+    device const uchar *y        [[buffer(1)]],
     constant uint      &n        [[buffer(2)]],
+    constant uint      &x_dtype  [[buffer(3)]],
+    constant uint      &y_dtype  [[buffer(4)]],
     uint                tid      [[thread_position_in_grid]])
 {
-    if (tid < n) x[tid] += y[tid];
+    if (tid >= n) return;
+    float a = qw36_load_scalar(x, x_dtype, tid);
+    float b = qw36_load_scalar(y, y_dtype, tid);
+    qw36_store_scalar(x, x_dtype, tid, a + b);
 }
 
 /* ---------------------------------------------------------------- */

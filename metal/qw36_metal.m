@@ -1480,9 +1480,13 @@ static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf 
      * the next matmul — drop the cached fp16 input copy. */
     metal_invalidate_matmul_xh(ctx);
     metal_dispatch_1d(ctx, ctx->residual_add, n, ^(id<MTLComputeCommandEncoder> enc) {
+        uint32_t x_dtype = (uint32_t)x->dtype;
+        uint32_t y_dtype = (uint32_t)y->dtype;
         [enc setBuffer:x->mtl offset:0 atIndex:0];
         [enc setBuffer:y->mtl offset:0 atIndex:1];
         [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:3];
+        [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:4];
     });
 }
 
