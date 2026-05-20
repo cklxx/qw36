@@ -867,6 +867,7 @@ static void metal_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
     metal_dispatch_1d(ctx, ctx->rmsnorm, hidden, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t x_dtype = (uint32_t)x->dtype;
         uint32_t w_dtype = (uint32_t)w->dtype;
+        uint32_t out_dtype = (uint32_t)out->dtype;
         [enc setBuffer:out->mtl offset:0 atIndex:0];
         [enc setBuffer:x->mtl   offset:0 atIndex:1];
         [enc setBuffer:w->mtl   offset:0 atIndex:2];
@@ -874,6 +875,7 @@ static void metal_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
         [enc setBytes:&eps    length:sizeof(eps)    atIndex:4];
         [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
         [enc setBytes:&w_dtype length:sizeof(w_dtype) atIndex:6];
+        [enc setBytes:&out_dtype length:sizeof(out_dtype) atIndex:7];
     });
 }
 

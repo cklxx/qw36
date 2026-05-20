@@ -51,13 +51,14 @@ static inline void qw36_store_scalar(device uchar *ptr, uint dtype, uint i, floa
 /* RMSNorm: out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]            */
 /* ---------------------------------------------------------------- */
 kernel void qw36_rmsnorm_f32(
-    device float       *out      [[buffer(0)]],
+    device uchar       *out      [[buffer(0)]],
     device const uchar *x        [[buffer(1)]],
     device const uchar *w        [[buffer(2)]],
     constant uint      &hidden   [[buffer(3)]],
     constant float     &eps      [[buffer(4)]],
     constant uint      &x_dtype  [[buffer(5)]],
     constant uint      &w_dtype  [[buffer(6)]],
+    constant uint      &out_dtype [[buffer(7)]],
     uint                tid      [[thread_position_in_grid]])
 {
     if (tid >= hidden) return;
@@ -67,8 +68,9 @@ kernel void qw36_rmsnorm_f32(
         ss += v * v;
     }
     float scale = rsqrt(ss / float(hidden) + eps);
-    out[tid] = qw36_load_scalar(x, x_dtype, tid) * scale *
-               qw36_load_scalar(w, w_dtype, tid);
+    float val = qw36_load_scalar(x, x_dtype, tid) * scale *
+                qw36_load_scalar(w, w_dtype, tid);
+    qw36_store_scalar(out, out_dtype, tid, val);
 }
 
 /* ---------------------------------------------------------------- */
