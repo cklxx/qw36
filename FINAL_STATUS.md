@@ -69,7 +69,39 @@ one session.
 
 ## Open items
 
-### #31 — output coherence (the elephant in the room)
+### #31 — output coherence — **localized to DN block math** (commit b709cb7)
+
+Layer-bisection with `QW36_MAX_LAYERS=N` running prompt `Hello`:
+
+| N  | top-1                     | comment |
+|----|---------------------------|---------|
+| 0  | `\n` logit 120 (input)    | bypass; tied embed self-correlation |
+| 1  | `zé`, logit 7.68          | **DN layer 0 destroys the residual direction** |
+| 8  | `WER`, logit 13.4         | drift continues |
+| 24 | `{$`, logit 12.1          | final degenerate cluster |
+
+Cross-check: `QW36_SKIP_DN=1 ./qw36_cpu -p Hello` (zero DN contribution,
+only 6 vanilla layers contribute) → top-1 `\n` (id 198) at logit 12.5.
+**Vanilla-only path is sensible.**
+
+Bug is inside `gated_delta_decode` (CPU `common/qw36.c:715`) and
+`qw36_gated_delta_step_f32` (Metal `metal/qw36_metal.metal`). Both
+backends produce identical degenerate output → shared algorithmic
+defect. Likely candidates, ranked:
+
+1. **DN state update axis swap** — agent-infer's state layout is
+   `[Hv, Dv, Dk]` (Dk innermost); ours is `[Hv, Dk, Dv]` (Dv innermost).
+   Self-consistent inside our impl but the layout difference matters if
+   any reader (e.g. gated rmsnorm input) expects the agent-infer order.
+2. **Per-head Q/K split inside attn_qkv** — our split is
+   `q[0:q_dim] | k[q_dim:q_dim+k_dim] | v[…]`. If GGUF stores
+   `[q_h0, k_h0, v_h0, …]` interleaved per head, our q is corrupt.
+3. **`ssm_out.weight` row/col interpretation** — if GGUF stores ssm_out
+   transposed, projection axis is flipped.
+4. **`silu(z) * rmsnorm(gout)` z indexing** — if z is per-head but we
+   broadcast across all values.
+
+### #31 — symptoms (legacy)
 On the same Qwen3.5-0.8B-Q4_K_M.gguf:
 
   - llama.cpp `Hello` → `Hello! How can I help you today?`  (170 tok/s)
