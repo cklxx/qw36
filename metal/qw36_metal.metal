@@ -370,11 +370,16 @@ kernel void qw36_compute_g_beta_norm_qk(
     uint group = (Hk == 0) ? 1 : (Hv / Hk);
     if (group == 0) group = 1;
 
+    /* Qwen3.5/3.6 attn_qkv layout is per-head interleaved
+     * [Qh0(Dk), Kh0(Dk), Vh0(Dv), Qh1, Kh1, Vh1, ...]. Confirmed by
+     * CPU layer-0 bisection on Qwen3.5-0.8B (commit b25b124). */
+    uint head_stride = 2 * Dk + Dv;
+
     if (gid < q_total) {
         uint h = gid / Dk;
         uint d = gid - h * Dk;
-        device const float *qh = qkv + h * Dk;
-        device const float *kh = qkv + q_total + h * Dk;
+        device const float *qh = qkv + h * head_stride;
+        device const float *kh = qkv + h * head_stride + Dk;
         float qss = 0.0f;
         float kss = 0.0f;
         for (uint i = 0; i < Dk; ++i) {
@@ -393,7 +398,7 @@ kernel void qw36_compute_g_beta_norm_qk(
         uint grouped_v = raw_v;
         if (Hk != 0 && Hv % Hk == 0)
             grouped_v = (raw_v % Hk) * group + raw_v / Hk;
-        v_out[grouped_v * Dv + d] = qkv[q_total * 2 + raw_v * Dv + d];
+        v_out[grouped_v * Dv + d] = qkv[raw_v * head_stride + 2 * Dk + d];
     }
 
     if (gid < Hv) {
