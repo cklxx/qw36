@@ -13,6 +13,7 @@ LDLIBS   := -lm
 
 COMMON_SRC := \
     $(COMMON)/qw36.c \
+    $(COMMON)/qw36_dequant.c \
     $(COMMON)/qw36_ops.c \
     $(COMMON)/qw36_attn_vanilla.c \
     $(COMMON)/qw36_attn_deltanet.c \

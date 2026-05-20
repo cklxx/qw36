@@ -67,8 +67,15 @@ extern int qw36__skip_logits_this_forward;
 
 void *qw36__eng_own(qw36_engine *eng, void *p);
 size_t qw36__dtype_nbytes(qw36_dtype dtype);
+size_t qw36__tensor_bytes(qw36_dtype dtype, size_t numel);
+int qw36__dtype_is_native_gpu_quant(qw36_dtype dt);
+int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk,
+                           size_t *bytes_per_block);
+int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out);
 float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n);
 uint16_t qw36__f32_to_f16(float f);
+float    qw36__f16_to_f32(uint16_t h);
+int qw36__active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out);
 
 qw36_gpu_buf *qw36__gpu_cached_upload(qw36_engine *eng, const void *host,
                                       size_t bytes, qw36_dtype dtype);

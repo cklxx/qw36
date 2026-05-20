@@ -186,6 +186,101 @@ void qw36__conv1d_silu_decode(const float *x, const float *conv_w,
 }
 
 
+int qw36__deltanet_dispatch_dev(qw36_state *st,
+                                 const qw36_layer_weights *L,
+                                 const qw36_config *c,
+                                 uint32_t layer_idx)
+{
+    qw36_engine *eng = qw36__active_engine;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!st || !L || !c ||
+        !st->x_dev || !st->x_rms_dev || !st->dn_qkv_dev ||
+        !st->dn_qkv_act_dev || !st->dn_z_dev || !st->dn_alpha_dev ||
+        !st->dn_beta_dev || !st->dn_gout_dev ||
+        !st->conv_state_dev || !st->delta_state_dev ||
+        !st->conv_state_dev[layer_idx] || !st->delta_state_dev[layer_idx] ||
+        !L->dn_qkv || !L->dn_gate || !L->dn_alpha || !L->dn_beta ||
+        !L->dn_conv1d || !L->dn_dt_bias || !L->dn_a_log ||
+        !L->dn_norm || !L->dn_out ||
+        !qw36__active_backend(&be, &ctx) ||
+        !be->matmul || !be->rmsnorm || !be->residual_add ||
+        !be->dn_conv1d_silu || !be->dn_gated_delta ||
+        !be->dn_gated_rmsnorm)
+        return -1;
+
+    static int skip_conv = -1, skip_dn = -1;
+    if (skip_conv < 0) {
+        const char *e = getenv("QW36_SKIP_CONV1D");
+        skip_conv = e && atoi(e) ? 1 : 0;
+    }
+    if (skip_dn < 0) {
+        const char *e = getenv("QW36_SKIP_DN");
+        skip_dn = e && atoi(e) ? 1 : 0;
+    }
+    if (skip_conv || skip_dn) return -1;
+
+    const uint32_t n_v = c->dn_num_value_heads;
+    const uint32_t n_k = c->dn_num_key_heads;
+    const uint32_t kd = c->dn_key_head_dim;
+    const uint32_t vd = c->dn_value_head_dim;
+    if (!n_v || !n_k || !kd || !vd) return -1;
+    const uint32_t qkv_dim = n_k * kd * 2 + n_v * vd;
+    qw36_gpu_buf *conv_w = qw36__gpu_cached_upload(eng, L->dn_conv1d,
+        (size_t)qkv_dim * c->dn_conv_kernel_size * sizeof(float),
+        QW36_DTYPE_F32);
+    qw36_gpu_buf *dt_bias = qw36__gpu_cached_upload(eng, L->dn_dt_bias,
+        (size_t)n_v * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *a_log = qw36__gpu_cached_upload(eng, L->dn_a_log,
+        (size_t)n_v * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *dn_norm = qw36__gpu_cached_upload(eng, L->dn_norm,
+        (size_t)vd * sizeof(float), QW36_DTYPE_F32);
+    if (!conv_w || !dt_bias || !a_log || !dn_norm) return -1;
+
+    int rc = 0;
+    rc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
+                               (qw36_gpu_buf *)st->x_dev,
+                               (const float *)L->input_layernorm,
+                               c->hidden_size, c->rms_norm_eps);
+    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_qkv_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_qkv);
+    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_z_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_gate);
+    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_alpha_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_alpha);
+    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->dn_beta_dev,
+                          (qw36_gpu_buf *)st->x_rms_dev,
+                          (const qw36_lazy_w *)L->dn_beta);
+    if (rc) return -1;
+
+    be->dn_conv1d_silu(ctx, (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                       (qw36_gpu_buf *)st->dn_qkv_dev,
+                       conv_w,
+                       (qw36_gpu_buf *)st->conv_state_dev[layer_idx],
+                       qkv_dim, c->dn_conv_kernel_size);
+    be->dn_gated_delta(ctx, (qw36_gpu_buf *)st->dn_gout_dev,
+                       (qw36_gpu_buf *)st->dn_qkv_act_dev,
+                       (qw36_gpu_buf *)st->dn_beta_dev,
+                       (qw36_gpu_buf *)st->dn_alpha_dev,
+                       dt_bias, a_log,
+                       (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
+                       n_k, n_v, kd, vd);
+    be->dn_gated_rmsnorm(ctx, (qw36_gpu_buf *)st->dn_qkv_dev,
+                         (qw36_gpu_buf *)st->dn_gout_dev,
+                         (qw36_gpu_buf *)st->dn_z_dev,
+                         dn_norm, n_v, vd, c->rms_norm_eps);
+    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
+                          (qw36_gpu_buf *)st->dn_qkv_dev,
+                          (const qw36_lazy_w *)L->dn_out);
+    rc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                    (qw36_gpu_buf *)st->x_rms_dev,
+                                    c->hidden_size);
+    return rc ? -1 : 0;
+}
+
 int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
                                 const qw36_layer_weights *L,
                                 uint32_t layer_idx)

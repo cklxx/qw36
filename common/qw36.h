@@ -174,6 +174,10 @@ typedef struct {
     uint32_t seq_capacity;
     uint32_t seq_pos;       /* how many tokens have been written */
     qw36_dtype kv_dtype;
+    /* Dtype of the residual stream / attn-output device buffers (x_dev,
+     * x_rms_dev, q_dev). When QW36_DTYPE_F16 the kernels store fp16
+     * directly and the engine's host↔device sync helpers convert. */
+    qw36_dtype dev_x_dtype;
 
     /* Gated DeltaNet per-layer state (NULL on vanilla layers):
      *   conv_state[L]:  short-window history for ssm_conv1d (depthwise).

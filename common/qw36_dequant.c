@@ -1,0 +1,421 @@
+/* qw36_dequant.c - GGUF dtype conversion and block dequantization.
+ *
+ * This module owns dense fp16/bf16 conversion, GGML block dequantizers,
+ * whole-tensor materialization to fp32, and row-at-a-time lazy dequant for
+ * matrix/vector kernels. All entry points are package-private and are used
+ * by engine binding plus common ops; public API signatures remain unchanged.
+ */
+
+#include "qw36_internal.h"
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* --------------------------------------------------------------------- */
+/* dtype conversion helpers                                               */
+/* --------------------------------------------------------------------- */
+
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) & 1u;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) { f = sign << 31; }
+        else {
+            /* denorm → normalize */
+            int e = 1;
+            while (!(mant & 0x400u)) { mant <<= 1; e--; }
+            mant &= 0x3FFu;
+            f = (sign << 31) | ((uint32_t)(e + (127 - 15)) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1F) {
+        f = (sign << 31) | (0xFFu << 23) | (mant << 13);
+    } else {
+        f = (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    union { uint32_t u; float f; } u; u.u = f; return u.f;
+}
+
+static float bf16_to_f32(uint16_t b) {
+    union { uint32_t u; float f; } u;
+    u.u = (uint32_t)b << 16;
+    return u.f;
+}
+
+float qw36__f16_to_f32(uint16_t h) { return f16_to_f32(h); }
+
+uint16_t qw36__f32_to_f16(float f) {
+    union { float f; uint32_t u; } in;
+    in.f = f;
+    uint32_t x = in.u;
+    uint32_t sign = (x >> 16) & 0x8000u;
+    uint32_t mant = x & 0x007fffffu;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x00800000u;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t half_mant = mant >> shift;
+        if ((mant >> (shift - 1)) & 1u) half_mant++;
+        return (uint16_t)(sign | half_mant);
+    }
+    if (exp >= 31) {
+        if (mant == 0) return (uint16_t)(sign | 0x7c00u);
+        return (uint16_t)(sign | 0x7c00u | (mant >> 13) | 1u);
+    }
+
+    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
+    if (mant & 0x00001000u) half++;
+    return (uint16_t)half;
+}
+
+size_t qw36__dtype_nbytes(qw36_dtype dtype) {
+    switch (dtype) {
+        case QW36_DTYPE_F32:  return 4;
+        case QW36_DTYPE_F16:  return 2;
+        case QW36_DTYPE_BF16: return 2;
+        default: return 0;
+    }
+}
+
+/* Total byte count for an n-element tensor in `dtype`. Handles dense and
+ * block-quantised dtypes uniformly: dense returns numel*sizeof(elem); quant
+ * returns (numel / qk) * bytes_per_block. */
+size_t qw36__tensor_bytes(qw36_dtype dtype, size_t numel) {
+    size_t elem = qw36__dtype_nbytes(dtype);
+    if (elem) return numel * elem;
+    switch (dtype) {
+        case QW36_DTYPE_Q2_K: return (numel / 256u) *  84u;
+        case QW36_DTYPE_Q3_K: return (numel / 256u) * 110u;
+        case QW36_DTYPE_Q4_K: return (numel / 256u) * 144u;
+        case QW36_DTYPE_Q5_K: return (numel / 256u) * 176u;
+        case QW36_DTYPE_Q6_K: return (numel / 256u) * 210u;
+        case QW36_DTYPE_Q8_0: return (numel /  32u) *  34u;
+        default: return 0;
+    }
+}
+
+int qw36__dtype_is_native_gpu_quant(qw36_dtype dt) {
+    /* Quantised dtypes for which the Metal backend has a native on-device
+     * matmul kernel. CUDA/AMD don't yet, so callers gate on backend name. */
+    return dt == QW36_DTYPE_Q4_K || dt == QW36_DTYPE_Q5_K ||
+           dt == QW36_DTYPE_Q6_K || dt == QW36_DTYPE_Q8_0;
+}
+
+/* --------------------------------------------------------------------- */
+/* GGML-style quantized block dequantizers.                               */
+/*                                                                        */
+/* Block layouts mirror llama.cpp's ggml-quants.h. Numeric output matches */
+/* dequantize_row_* in ggml-quants.c so loaded weights are bit-equivalent */
+/* to a fresh load through the upstream library.                         */
+/* --------------------------------------------------------------------- */
+
+#define QW36_QK_K   256
+#define QW36_QK8_0  32
+
+static void dq_q8_0(const uint8_t *blocks, float *out, size_t n) {
+    /* block: fp16 d (2B) + int8 qs[32] (32B) = 34B per 32 elements. */
+    const size_t nb = n / QW36_QK8_0;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 34;
+        uint16_t dh; memcpy(&dh, b, 2);
+        float d = f16_to_f32(dh);
+        const int8_t *qs = (const int8_t *)(b + 2);
+        for (int j = 0; j < QW36_QK8_0; j++) *out++ = d * (float)qs[j];
+    }
+}
+
+/* Q4_K: 144 bytes/block. Layout:
+ *   fp16 d, fp16 dmin, u8 scales[12], u8 qs[128]
+ * Per 64-element chunk a sub-scale and sub-min are unpacked from scales[]. */
+static void q4_K_get_scale_min(int j, const uint8_t *q,
+                               uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j]     & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void dq_q4_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 144;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b,     2);
+        memcpy(&dmh, b + 2, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qs     = b + 16;
+        int is = 0;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            q4_K_get_scale_min(is + 0, scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            q4_K_get_scale_min(is + 1, scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (int l = 0; l < 32; l++) *out++ = d1 * (float)(qs[l] & 0xF) - m1;
+            for (int l = 0; l < 32; l++) *out++ = d2 * (float)(qs[l] >>  4) - m2;
+            qs += 32; is += 2;
+        }
+    }
+}
+
+/* Q2_K: 84 bytes/block. Layout:
+ *   u8 scales[16]
+ *   u8 qs[64]      (2-bit quants)
+ *   fp16 d, fp16 dmin
+ * Mirrors dequantize_row_q2_K in ggml-quants.c. */
+static void dq_q2_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b      = blocks + i * 84;
+        const uint8_t *scales = b;
+        const uint8_t *qs     = b + 16;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b + 80, 2);
+        memcpy(&dmh, b + 82, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (float)(sc & 0xF), ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l] >> shift) & 3)) - ml;
+                sc = scales[is++];
+                dl = d * (float)(sc & 0xF); ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            qs += 32;
+        }
+    }
+}
+
+/* Q3_K: 110 bytes/block. Layout:
+ *   u8 hmask[32]   — high bit per element
+ *   u8 qs[64]      — low 2 bits per element
+ *   u8 scales[12]  — 6-bit packed scales
+ *   fp16 d
+ * Mirrors dequantize_row_q3_K in ggml-quants.c. */
+static void dq_q3_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    static const uint32_t kmask1 = 0x03030303;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b  = blocks + i * 110;
+        const uint8_t *hm = b;
+        const uint8_t *qs = b + 32;
+        uint16_t dh;
+        memcpy(&dh, b + 32 + 64 + 12, 2);
+        const float d_all = f16_to_f32(dh);
+
+        uint32_t aux[4];
+        memcpy(aux, b + 32 + 64, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0]      & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1]      & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t *scales = (const int8_t *)aux;
+
+        uint8_t mask = 1;
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                const float dl = d_all * (float)((int)scales[is++] - 32);
+                for (int l = 0; l < 32; l++) {
+                    int q = ((qs[l] >> shift) & 3) - ((hm[l] & mask) ? 0 : 4);
+                    *out++ = dl * (float)q;
+                }
+                shift += 2; mask <<= 1;
+            }
+            qs += 32;
+        }
+    }
+}
+
+/* Q5_K: 176 bytes/block. Layout:
+ *   fp16 d, fp16 dmin
+ *   u8 scales[12]   — same 6-bit packing as Q4_K
+ *   u8 qh[32]       — 5th bit per element
+ *   u8 qs[128]      — lower 4 bits
+ * Mirrors dequantize_row_q5_K in ggml-quants.c. */
+static void dq_q5_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 176;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b,     2);
+        memcpy(&dmh, b + 2, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qh     = b + 16;
+        const uint8_t *ql     = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            #define GS_K4(jj) do { \
+                if ((jj) < 4) { sc = scales[(jj)] & 63; m = scales[(jj)+4] & 63; } \
+                else { \
+                    sc = (scales[(jj)+4] & 0xF) | ((scales[(jj)-4] >> 6) << 4); \
+                    m  = (scales[(jj)+4] >>  4) | ((scales[(jj)-0] >> 6) << 4); \
+                } \
+            } while (0)
+            GS_K4(is + 0);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            GS_K4(is + 1);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            #undef GS_K4
+            for (int l = 0; l < 32; l++)
+                *out++ = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                *out++ = d2 * (float)((ql[l] >>  4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
+/* Q6_K: 210 bytes/block. Layout:
+ *   u8 ql[128]  — lower 4 bits per quant
+ *   u8 qh[64]   — upper 2 bits per quant
+ *   i8 scales[16]
+ *   fp16 d      — super-block scale
+ */
+static void dq_q6_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 210;
+        const uint8_t *ql = b;
+        const uint8_t *qh = b + 128;
+        const int8_t  *sc = (const int8_t *)(b + 128 + 64);
+        uint16_t dh; memcpy(&dh, b + 128 + 64 + 16, 2);
+        const float d = f16_to_f32(dh);
+        for (int n_off = 0; n_off < QW36_QK_K; n_off += 128) {
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[l +  0] = d * (float)sc[is + 0] * (float)q1;
+                out[l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            out += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
+/* Materialize an entire tensor to a freshly malloc'd fp32 buffer. Caller
+ * frees. Returns NULL on unsupported dtype / oom. */
+float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n) {
+    float *out = (float *)malloc(n * sizeof(float));
+    if (!out) return NULL;
+    switch (dt) {
+        case QW36_DTYPE_F32:
+            memcpy(out, data, n * sizeof(float));
+            return out;
+        case QW36_DTYPE_F16: {
+            const uint16_t *p = (const uint16_t *)data;
+            for (size_t i = 0; i < n; i++) out[i] = f16_to_f32(p[i]);
+            return out;
+        }
+        case QW36_DTYPE_BF16: {
+            const uint16_t *p = (const uint16_t *)data;
+            for (size_t i = 0; i < n; i++) out[i] = bf16_to_f32(p[i]);
+            return out;
+        }
+        case QW36_DTYPE_Q8_0:
+            dq_q8_0((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q2_K:
+            dq_q2_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q3_K:
+            dq_q3_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q4_K:
+            dq_q4_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q5_K:
+            dq_q5_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q6_K:
+            dq_q6_K((const uint8_t *)data, out, n);
+            return out;
+        default:
+            free(out);
+            return NULL;
+    }
+}
+
+/* --------------------------------------------------------------------- */
+/* Lazy block-quantized helpers: dequantize one row at a time.            */
+/* --------------------------------------------------------------------- */
+
+int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
+    switch (dt) {
+        case QW36_DTYPE_Q2_K: *qk = 256; *bytes_per_block =  84; return 0;
+        case QW36_DTYPE_Q3_K: *qk = 256; *bytes_per_block = 110; return 0;
+        case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
+        case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
+        case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
+        default: *qk = 0; *bytes_per_block = 0; return -1;
+    }
+}
+
+/* Decode `cols` elements of row `row_idx` from a block-quantized stack
+ * where each row is laid out as cols-elements-worth of blocks. */
+int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
+    const size_t cols = (size_t)w->cols;
+    switch (w->dtype) {
+        case QW36_DTYPE_F32: {
+            const float *p = (const float *)w->data + row_idx * cols;
+            memcpy(out, p, cols * sizeof(float));
+            return 0;
+        }
+        case QW36_DTYPE_F16: {
+            const uint16_t *p = (const uint16_t *)w->data + row_idx * cols;
+            for (size_t i = 0; i < cols; i++) out[i] = f16_to_f32(p[i]);
+            return 0;
+        }
+        case QW36_DTYPE_BF16: {
+            const uint16_t *p = (const uint16_t *)w->data + row_idx * cols;
+            for (size_t i = 0; i < cols; i++) out[i] = bf16_to_f32(p[i]);
+            return 0;
+        }
+        default: break;
+    }
+    size_t qk, bpb;
+    if (qw36__dtype_block_geom(w->dtype, &qk, &bpb) || cols % qk != 0)
+        return -1;
+    const size_t blocks_per_row = cols / qk;
+    const uint8_t *row = (const uint8_t *)w->data
+                       + row_idx * blocks_per_row * bpb;
+    switch (w->dtype) {
+        case QW36_DTYPE_Q2_K: dq_q2_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q3_K: dq_q3_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q5_K: dq_q5_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
+        default: return -1;
+    }
+}
