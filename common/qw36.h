@@ -125,6 +125,7 @@ typedef struct {
     /* KV cache: [num_layers][seq_len, n_kv * head_dim] */
     void   **k_cache;
     void   **v_cache;
+    uint32_t num_layers;    /* length of k_cache / v_cache arrays */
     uint32_t seq_capacity;
     uint32_t seq_pos;       /* how many tokens have been written */
     qw36_dtype kv_dtype;
@@ -146,8 +147,8 @@ typedef struct {
 /* --------------------------------------------------------------------- */
 
 typedef struct qw36_engine qw36_engine;
-
-struct qw36_gpu_backend; /* forward — see qw36_gpu.h */
+struct qw36_gguf_file;     /* forward — see qw36_gguf.h */
+struct qw36_gpu_backend;   /* forward — see qw36_gpu.h  */
 
 /* Construction / destruction. */
 qw36_engine *qw36_engine_open(const char *gguf_path,
@@ -157,6 +158,10 @@ void         qw36_engine_close(qw36_engine *eng);
 
 const qw36_config  *qw36_engine_config(const qw36_engine *eng);
 const qw36_weights *qw36_engine_weights(const qw36_engine *eng);
+
+/* Borrowed pointer to the engine's GGUF file — used to construct a
+ * tokenizer without reopening. Lifetime = engine. */
+const struct qw36_gguf_file *qw36_engine_gguf(const qw36_engine *eng);
 
 /* Allocate / free per-sequence state. */
 qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity);

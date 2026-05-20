@@ -1,0 +1,32 @@
+# cpu/Makefile — CPU-only build, no GPU toolchain required.
+#
+# Owner: Claude. Used to smoke-test the engine end-to-end while the GPU
+# backends are still being filled in. The binary uses the pure-C reference
+# forward pass from common/qw36.c.
+
+ROOT     ?= $(abspath ..)
+COMMON    = $(ROOT)/common
+CC       ?= cc
+CFLAGS   ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-function
+INCLUDES := -I$(COMMON)
+LDLIBS   := -lm
+
+COMMON_SRC := \
+    $(COMMON)/qw36.c \
+    $(COMMON)/qw36_gguf.c \
+    $(COMMON)/qw36_tokenizer.c \
+    $(COMMON)/qw36_cli.c
+
+BACKEND_SRC := qw36_cpu_stub.c
+
+OUT := $(ROOT)/qw36_cpu
+
+.PHONY: all clean
+
+all: $(OUT)
+
+$(OUT): $(COMMON_SRC) $(BACKEND_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h
+	$(CC) $(CFLAGS) $(INCLUDES) $(COMMON_SRC) $(BACKEND_SRC) -o $@ $(LDLIBS)
+
+clean:
+	rm -f $(OUT)
