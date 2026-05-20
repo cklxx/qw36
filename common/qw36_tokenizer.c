@@ -426,18 +426,14 @@ static int encode_chunk(const qw36_tokenizer *t,
     return 0;
 }
 
-int qw36_tokenizer_encode(const qw36_tokenizer *t,
-                          const char *text,
-                          uint32_t *out_ids, size_t *out_n)
+/* Encode one segment of plain text (no special tokens inside) by mapping
+ * bytes → byte-level UTF-8 → BPE merge. */
+static int encode_segment(const qw36_tokenizer *t, const char *text,
+                          size_t in_len, uint32_t *out_ids,
+                          size_t *cap, size_t *used)
 {
-    if (!t || !text || !out_n) return -1;
-    size_t cap = *out_n;
-    size_t used = 0;
-
+    if (!in_len) return 0;
     byte_table_init();
-
-    /* Map input bytes to a byte-level UTF-8 string. */
-    size_t in_len = strlen(text);
     size_t bs_cap = in_len * 2 + 4;
     char *bs = (char *)malloc(bs_cap);
     if (!bs) return -1;
@@ -448,11 +444,63 @@ int qw36_tokenizer_encode(const qw36_tokenizer *t,
         memcpy(bs + bsn, g->bytes, g->len);
         bsn += g->len;
     }
-
-    int rc = encode_chunk(t, bs, bsn, out_ids, &cap, &used);
+    int rc = encode_chunk(t, bs, bsn, out_ids, cap, used);
     free(bs);
-    *out_n = used;
     return rc;
+}
+
+int qw36_tokenizer_encode(const qw36_tokenizer *t,
+                          const char *text,
+                          uint32_t *out_ids, size_t *out_n)
+{
+    if (!t || !text || !out_n) return -1;
+    size_t cap = *out_n;
+    size_t used = 0;
+
+    /* Walk the input, splitting on known Qwen3 chat-template specials.
+     * A special token like "<|im_start|>" must be emitted as its single
+     * vocab id (e.g. 248045), not character-by-character — without this
+     * the model sees the literal '<', '|', 'im', ...' sequence and
+     * generates garbage. */
+    static const char *const SPECIALS[] = {
+        "<|im_start|>", "<|im_end|>",
+        "<|endoftext|>", "<|object_ref_start|>", "<|object_ref_end|>",
+        "<|box_start|>", "<|box_end|>", "<|quad_start|>", "<|quad_end|>",
+        "<|vision_start|>", "<|vision_end|>",
+        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        NULL,
+    };
+
+    size_t i = 0, seg_start = 0;
+    while (text[i]) {
+        if (text[i] == '<' && text[i+1] == '|') {
+            for (int k = 0; SPECIALS[k]; k++) {
+                size_t slen = strlen(SPECIALS[k]);
+                if (strncmp(text + i, SPECIALS[k], slen) != 0) continue;
+                uint32_t id;
+                if (hmap_get(&t->str_to_id, SPECIALS[k], (uint32_t)slen, &id)) break;
+                /* flush plain segment before this special */
+                if (i > seg_start) {
+                    if (encode_segment(t, text + seg_start, i - seg_start,
+                                       out_ids, &cap, &used)) return -1;
+                }
+                if (used >= cap) return -1;
+                out_ids[used++] = id;
+                i += slen;
+                seg_start = i;
+                goto next_iter;
+            }
+        }
+        i++;
+        next_iter:;
+    }
+    if (i > seg_start) {
+        if (encode_segment(t, text + seg_start, i - seg_start,
+                           out_ids, &cap, &used)) return -1;
+    }
+
+    *out_n = used;
+    return 0;
 }
 
 /* --------------------------------------------------------------------- */

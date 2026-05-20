@@ -435,6 +435,17 @@ static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
  * Single-threaded today; promote to __thread when batched/multi-stream. */
 static qw36_engine *qw36_active_engine = NULL;
 
+static int active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out)
+{
+    qw36_engine *eng = qw36_active_engine;
+    if (!eng || !eng->backend || !eng->ctx) return 0;
+    qw36_gpu_backend *be = eng->backend;
+    if (!be->upload || !be->download || !be->alloc || !be->free) return 0;
+    if (be_out) *be_out = be;
+    if (ctx_out) *ctx_out = eng->ctx;
+    return 1;
+}
+
 /* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c].
  * Dispatches to the GPU backend when one is attached and the weight has
  * an uploaded gpu_buf; otherwise falls back to per-row CPU dequant + dot. */
@@ -498,6 +509,10 @@ static int matmul_lazy_slice(float *y, const float *x,
                               + slice_idx * rows * row_bytes;
     qw36_lazy_w view = *w;
     view.data = (const void *)slice_data;
+    /* A whole-stack gpu_buf cannot represent an expert slice until task 23
+     * adds a real matmul_slice/view contract. Keep MoE slices correct by
+     * using the host fp32 slice path for now. */
+    view.gpu_buf = NULL;
     return matmul_lazy(y, x, &view, row_scratch);
 }
 
@@ -747,6 +762,20 @@ static int moe_forward_f32(float *y, const float *x,
 
 /* Embedding lookup: write hidden=W.cols floats to out from row `token`. */
 static int embed_lookup_lazy(const qw36_lazy_w *w, uint32_t token, float *out) {
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (w && w->gpu_buf && w->cols <= UINT32_MAX &&
+        active_backend(&be, &ctx) && be->embedding_lookup)
+    {
+        qw36_gpu_buf *yb = be->alloc(ctx, (size_t)w->cols * sizeof(float),
+                                     QW36_DTYPE_F32);
+        if (yb) {
+            be->embedding_lookup(ctx, yb, w->gpu_buf, token, (uint32_t)w->cols);
+            be->download(ctx, yb, out, (size_t)w->cols * sizeof(float));
+            be->free(ctx, yb);
+            return 0;
+        }
+    }
     return dequant_row(w, token, out);
 }
 
@@ -792,18 +821,21 @@ static void swiglu_mlp_f32(float *y, const float *x,
 
 /* In-place RoPE on a single head. Rotates the first `rot_dim` components;
  * the tail is left untouched (partial rotary). Pair convention:
- * (x[2i], x[2i+1]) — the "interleaved" convention Qwen3 uses. */
+ * (x[i], x[i + d/2]) — the half-rotation / NEOX convention used by
+ * llama.cpp's ggml_rope NEOX mode. Qwen3 / Qwen3.5 / Qwen3.6 GGUFs all
+ * expect this layout; ggml's standard mode-0 (interleaved (2i, 2i+1))
+ * would mismatch and produce garbage logits. */
 static void rope_head(float *x, size_t pos, size_t rot_dim, float theta_base)
 {
-    size_t pairs = rot_dim / 2;
-    for (size_t i = 0; i < pairs; i++) {
+    size_t half = rot_dim / 2;
+    for (size_t i = 0; i < half; i++) {
         float inv_freq = 1.0f /
             powf(theta_base, (2.0f * (float)i) / (float)rot_dim);
         float angle = (float)pos * inv_freq;
         float c = cosf(angle), s = sinf(angle);
-        float x0 = x[2*i], x1 = x[2*i + 1];
-        x[2*i]     = x0 * c - x1 * s;
-        x[2*i + 1] = x0 * s + x1 * c;
+        float x0 = x[i], x1 = x[i + half];
+        x[i]        = x0 * c - x1 * s;
+        x[i + half] = x0 * s + x1 * c;
     }
 }
 
@@ -911,6 +943,145 @@ static void attention_f32(float *y,
         }
     }
     memcpy(y, staging, (size_t)q_dim * sizeof(float));
+}
+
+static void rmsnorm_dispatch(float *out, const float *x, const float *w,
+                             size_t n, float eps)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (n <= UINT32_MAX && active_backend(&be, &ctx) && be->rmsnorm) {
+        qw36_gpu_buf *xb = be->upload(ctx, x, n * sizeof(float), QW36_DTYPE_F32);
+        qw36_gpu_buf *wb = be->upload(ctx, w, n * sizeof(float), QW36_DTYPE_F32);
+        qw36_gpu_buf *yb = be->alloc(ctx, n * sizeof(float), QW36_DTYPE_F32);
+        if (xb && wb && yb) {
+            be->rmsnorm(ctx, yb, xb, wb, (uint32_t)n, eps);
+            be->download(ctx, yb, out, n * sizeof(float));
+            be->free(ctx, xb);
+            be->free(ctx, wb);
+            be->free(ctx, yb);
+            return;
+        }
+        if (xb) be->free(ctx, xb);
+        if (wb) be->free(ctx, wb);
+        if (yb) be->free(ctx, yb);
+    }
+    rmsnorm_f32(out, x, w, n, eps);
+}
+
+static void residual_add_dispatch(float *x, const float *y, size_t n)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (n <= UINT32_MAX && active_backend(&be, &ctx) && be->residual_add) {
+        qw36_gpu_buf *xb = be->upload(ctx, x, n * sizeof(float), QW36_DTYPE_F32);
+        qw36_gpu_buf *yb = be->upload(ctx, y, n * sizeof(float), QW36_DTYPE_F32);
+        if (xb && yb) {
+            be->residual_add(ctx, xb, yb, (uint32_t)n);
+            be->download(ctx, xb, x, n * sizeof(float));
+            be->free(ctx, xb);
+            be->free(ctx, yb);
+            return;
+        }
+        if (xb) be->free(ctx, xb);
+        if (yb) be->free(ctx, yb);
+    }
+    for (size_t i = 0; i < n; i++) x[i] += y[i];
+}
+
+static int swiglu_dispatch(float *y, const float *x,
+                           const qw36_lazy_w *w_gate,
+                           const qw36_lazy_w *w_up,
+                           const qw36_lazy_w *w_down,
+                           uint32_t hidden, uint32_t inter,
+                           float *scratch_gate, float *scratch_up,
+                           float *row_scratch)
+{
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (w_gate && w_up && w_down &&
+        w_gate->gpu_buf && w_up->gpu_buf && w_down->gpu_buf &&
+        active_backend(&be, &ctx) && be->swiglu_mlp)
+    {
+        qw36_gpu_buf *xb = be->upload(ctx, x, (size_t)hidden * sizeof(float),
+                                      QW36_DTYPE_F32);
+        qw36_gpu_buf *yb = be->alloc(ctx, (size_t)hidden * sizeof(float),
+                                     QW36_DTYPE_F32);
+        if (xb && yb) {
+            be->swiglu_mlp(ctx, yb, xb, w_gate->gpu_buf, w_up->gpu_buf,
+                           w_down->gpu_buf, hidden, inter);
+            be->download(ctx, yb, y, (size_t)hidden * sizeof(float));
+            be->free(ctx, xb);
+            be->free(ctx, yb);
+            return 0;
+        }
+        if (xb) be->free(ctx, xb);
+        if (yb) be->free(ctx, yb);
+    }
+
+    if (matmul_lazy(scratch_gate, x, w_gate, row_scratch)) return -1;
+    if (matmul_lazy(scratch_up,   x, w_up,   row_scratch)) return -1;
+    for (uint32_t i = 0; i < inter; i++)
+        scratch_gate[i] = silu(scratch_gate[i]) * scratch_up[i];
+    if (matmul_lazy(y, scratch_gate, w_down, row_scratch)) return -1;
+    return 0;
+}
+
+static int attention_dispatch(float *y, const float *x,
+                              const qw36_layer_weights *L,
+                              float *k_cache, float *v_cache,
+                              const qw36_config *c,
+                              uint32_t seq_pos, uint32_t seq_capacity)
+{
+    const qw36_lazy_w *wq = (const qw36_lazy_w *)L->q_proj;
+    const qw36_lazy_w *wk = (const qw36_lazy_w *)L->k_proj;
+    const qw36_lazy_w *wv = (const qw36_lazy_w *)L->v_proj;
+    qw36_gpu_backend *be;
+    qw36_gpu_ctx *ctx;
+    if (!wq || !wk || !wv || !wq->gpu_buf || !wk->gpu_buf || !wv->gpu_buf ||
+        !L->q_norm || !L->k_norm ||
+        !active_backend(&be, &ctx) || !be->attention)
+        return 0;
+
+    const size_t hidden = c->hidden_size;
+    const size_t kv_dim = (size_t)c->num_key_value_heads * c->head_dim;
+    const size_t cache_bytes = (size_t)seq_capacity * kv_dim * sizeof(float);
+
+    qw36_gpu_buf *xb = be->upload(ctx, x, hidden * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *yb = be->alloc(ctx, hidden * sizeof(float), QW36_DTYPE_F32);
+    qw36_gpu_buf *qnb = be->upload(ctx, L->q_norm,
+                                   (size_t)c->head_dim * sizeof(float),
+                                   QW36_DTYPE_F32);
+    qw36_gpu_buf *knb = be->upload(ctx, L->k_norm,
+                                   (size_t)c->head_dim * sizeof(float),
+                                   QW36_DTYPE_F32);
+    qw36_gpu_buf *kb = be->upload(ctx, k_cache, cache_bytes, QW36_DTYPE_F32);
+    qw36_gpu_buf *vb = be->upload(ctx, v_cache, cache_bytes, QW36_DTYPE_F32);
+    if (xb && yb && qnb && knb && kb && vb) {
+        be->attention(ctx, yb, xb, wq->gpu_buf, wk->gpu_buf, wv->gpu_buf,
+                      qnb, knb, kb, vb,
+                      c->hidden_size, c->num_attention_heads,
+                      c->num_key_value_heads, c->head_dim,
+                      seq_pos, seq_capacity,
+                      c->rope_theta, c->partial_rotary_factor);
+        be->download(ctx, yb, y, hidden * sizeof(float));
+        be->download(ctx, kb, k_cache, cache_bytes);
+        be->download(ctx, vb, v_cache, cache_bytes);
+        be->free(ctx, xb);
+        be->free(ctx, yb);
+        be->free(ctx, qnb);
+        be->free(ctx, knb);
+        be->free(ctx, kb);
+        be->free(ctx, vb);
+        return 1;
+    }
+    if (xb) be->free(ctx, xb);
+    if (yb) be->free(ctx, yb);
+    if (qnb) be->free(ctx, qnb);
+    if (knb) be->free(ctx, knb);
+    if (kb) be->free(ctx, kb);
+    if (vb) be->free(ctx, vb);
+    return 0;
 }
 
 /* --------------------------------------------------------------------- */
@@ -1519,8 +1690,8 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             const uint32_t q_dim = n_k * kd, k_dim_t = n_k * kd, v_dim = n_v * vd;
             const uint32_t qkv_dim = q_dim + k_dim_t + v_dim;
 
-            rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
-                        hidden, c->rms_norm_eps);
+            rmsnorm_dispatch(st->x_rms, x, (const float *)L->input_layernorm,
+                             hidden, c->rms_norm_eps);
 
             /* Projections.  Heap-allocate to keep the stack frame small. */
             const size_t need = (size_t)2 * qkv_dim   /* qkv + qkv_act */
@@ -1585,7 +1756,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             for (uint32_t v = 0; v < n_v; v++) {
                 float *go = gout   + (size_t)v * vd;
                 float *zp = z_proj + (size_t)v * vd;
-                rmsnorm_f32(go, go, dn_norm_w, vd, c->rms_norm_eps);
+                rmsnorm_dispatch(go, go, dn_norm_w, vd, c->rms_norm_eps);
                 for (uint32_t d = 0; d < vd; d++) go[d] = silu(zp[d]) * go[d];
             }
 
@@ -1606,7 +1777,7 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                 skip_dn = e && atoi(e) ? 1 : 0;
             }
             if (!skip_dn) {
-                for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+                residual_add_dispatch(x, st->x_rms, hidden);
             }
             free(blk);
 
@@ -1620,8 +1791,8 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         }
 
         /* --- vanilla full-attention block --- */
-        rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
-                    hidden, c->rms_norm_eps);
+        rmsnorm_dispatch(st->x_rms, x, (const float *)L->input_layernorm,
+                         hidden, c->rms_norm_eps);
         if (debug_layer) {
             double ss = 0.0;
             for (size_t i = 0; i < hidden; i++) ss += (double)st->x_rms[i] * st->x_rms[i];
@@ -1635,83 +1806,89 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         const uint32_t kv_dim = c->num_key_value_heads * c->head_dim;
         const uint32_t rot_dim = (uint32_t)((float)c->head_dim *
                                             c->partial_rotary_factor);
-
-        /* QKV projections via lazy matmul. */
-        int v_rc = 0;
-        v_rc |= matmul_lazy(st->q, st->x_rms,
-                            (const qw36_lazy_w *)L->q_proj, row_scratch);
-        float *k_row = (float *)st->k_cache[l] + (size_t)st->seq_pos * kv_dim;
-        float *v_row = (float *)st->v_cache[l] + (size_t)st->seq_pos * kv_dim;
-        v_rc |= matmul_lazy(k_row, st->x_rms,
-                            (const qw36_lazy_w *)L->k_proj, row_scratch);
-        v_rc |= matmul_lazy(v_row, st->x_rms,
-                            (const qw36_lazy_w *)L->v_proj, row_scratch);
-        if (v_rc) {
-            fprintf(stderr, "qw36: vanilla QKV failed at layer %u "
-                    "(ggml types %d/%d/%d)\n", l,
-                    ((const qw36_lazy_w *)L->q_proj)->ggml_type,
-                    ((const qw36_lazy_w *)L->k_proj)->ggml_type,
-                    ((const qw36_lazy_w *)L->v_proj)->ggml_type);
-            return -6;
-        }
-
-        /* Per-head q_norm/k_norm + RoPE. */
-        for (uint32_t h = 0; h < c->num_attention_heads; h++) {
-            float *qh = st->q + h * c->head_dim;
-            rmsnorm_f32(qh, qh, (const float *)L->q_norm,
-                        c->head_dim, c->rms_norm_eps);
-            rope_head(qh, st->seq_pos, rot_dim, c->rope_theta);
-        }
-        for (uint32_t h = 0; h < c->num_key_value_heads; h++) {
-            float *kh = k_row + h * c->head_dim;
-            rmsnorm_f32(kh, kh, (const float *)L->k_norm,
-                        c->head_dim, c->rms_norm_eps);
-            rope_head(kh, st->seq_pos, rot_dim, c->rope_theta);
-        }
-
-        /* Attention: for each head h, score against k_cache[0..=seq_pos]
-         * of kv_head (h * n_kv / n_heads, GQA group-replicate), softmax,
-         * weighted sum of v_cache. */
-        const float inv_sqrt_d = 1.0f / sqrtf((float)c->head_dim);
         float *staging = st->attn_scores
                        + (size_t)c->num_attention_heads * (st->seq_capacity + 1);
-        for (uint32_t h = 0; h < c->num_attention_heads; h++) {
-            const uint32_t kvh = h * c->num_key_value_heads
-                               / c->num_attention_heads;
-            const float *qh = st->q + h * c->head_dim;
-            float *scores = st->attn_scores
-                          + (size_t)h * (st->seq_capacity + 1);
-            float maxv = -INFINITY;
-            for (uint32_t t = 0; t <= st->seq_pos; t++) {
-                const float *kh = (float *)st->k_cache[l]
-                                + (size_t)t * kv_dim + kvh * c->head_dim;
-                double dot = 0.0;
-                for (uint32_t d = 0; d < c->head_dim; d++)
-                    dot += (double)qh[d] * kh[d];
-                scores[t] = (float)dot * inv_sqrt_d;
-                if (scores[t] > maxv) maxv = scores[t];
+
+        if (!attention_dispatch(staging, st->x_rms, L,
+                                (float *)st->k_cache[l],
+                                (float *)st->v_cache[l],
+                                c, st->seq_pos, st->seq_capacity))
+        {
+            /* QKV projections via lazy matmul. */
+            int v_rc = 0;
+            v_rc |= matmul_lazy(st->q, st->x_rms,
+                                (const qw36_lazy_w *)L->q_proj, row_scratch);
+            float *k_row = (float *)st->k_cache[l] + (size_t)st->seq_pos * kv_dim;
+            float *v_row = (float *)st->v_cache[l] + (size_t)st->seq_pos * kv_dim;
+            v_rc |= matmul_lazy(k_row, st->x_rms,
+                                (const qw36_lazy_w *)L->k_proj, row_scratch);
+            v_rc |= matmul_lazy(v_row, st->x_rms,
+                                (const qw36_lazy_w *)L->v_proj, row_scratch);
+            if (v_rc) {
+                fprintf(stderr, "qw36: vanilla QKV failed at layer %u "
+                        "(ggml types %d/%d/%d)\n", l,
+                        ((const qw36_lazy_w *)L->q_proj)->ggml_type,
+                        ((const qw36_lazy_w *)L->k_proj)->ggml_type,
+                        ((const qw36_lazy_w *)L->v_proj)->ggml_type);
+                return -6;
             }
-            double sum = 0.0;
-            for (uint32_t t = 0; t <= st->seq_pos; t++) {
-                scores[t] = expf(scores[t] - maxv);
-                sum += scores[t];
+
+            /* Per-head q_norm/k_norm + RoPE. */
+            for (uint32_t h = 0; h < c->num_attention_heads; h++) {
+                float *qh = st->q + h * c->head_dim;
+                rmsnorm_dispatch(qh, qh, (const float *)L->q_norm,
+                                 c->head_dim, c->rms_norm_eps);
+                rope_head(qh, st->seq_pos, rot_dim, c->rope_theta);
             }
-            float inv_sum = (float)(1.0 / sum);
-            float *head_out = staging + h * c->head_dim;
-            for (uint32_t d = 0; d < c->head_dim; d++) {
-                double acc = 0.0;
+            for (uint32_t h = 0; h < c->num_key_value_heads; h++) {
+                float *kh = k_row + h * c->head_dim;
+                rmsnorm_dispatch(kh, kh, (const float *)L->k_norm,
+                                 c->head_dim, c->rms_norm_eps);
+                rope_head(kh, st->seq_pos, rot_dim, c->rope_theta);
+            }
+
+            /* Attention: for each head h, score against k_cache[0..=seq_pos]
+             * of kv_head (h * n_kv / n_heads, GQA group-replicate), softmax,
+             * weighted sum of v_cache. */
+            const float inv_sqrt_d = 1.0f / sqrtf((float)c->head_dim);
+            for (uint32_t h = 0; h < c->num_attention_heads; h++) {
+                const uint32_t kvh = h * c->num_key_value_heads
+                                   / c->num_attention_heads;
+                const float *qh = st->q + h * c->head_dim;
+                float *scores = st->attn_scores
+                              + (size_t)h * (st->seq_capacity + 1);
+                float maxv = -INFINITY;
                 for (uint32_t t = 0; t <= st->seq_pos; t++) {
-                    const float *vh = (float *)st->v_cache[l]
+                    const float *kh = (float *)st->k_cache[l]
                                     + (size_t)t * kv_dim + kvh * c->head_dim;
-                    acc += (double)(scores[t] * inv_sum) * vh[d];
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < c->head_dim; d++)
+                        dot += (double)qh[d] * kh[d];
+                    scores[t] = (float)dot * inv_sqrt_d;
+                    if (scores[t] > maxv) maxv = scores[t];
                 }
-                head_out[d] = (float)acc;
+                double sum = 0.0;
+                for (uint32_t t = 0; t <= st->seq_pos; t++) {
+                    scores[t] = expf(scores[t] - maxv);
+                    sum += scores[t];
+                }
+                float inv_sum = (float)(1.0 / sum);
+                float *head_out = staging + h * c->head_dim;
+                for (uint32_t d = 0; d < c->head_dim; d++) {
+                    double acc = 0.0;
+                    for (uint32_t t = 0; t <= st->seq_pos; t++) {
+                        const float *vh = (float *)st->v_cache[l]
+                                        + (size_t)t * kv_dim + kvh * c->head_dim;
+                        acc += (double)(scores[t] * inv_sum) * vh[d];
+                    }
+                    head_out[d] = (float)acc;
+                }
             }
         }
         /* o_proj */
         matmul_lazy(st->x_rms, staging,
                     (const qw36_lazy_w *)L->o_proj, row_scratch);
-        for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+        residual_add_dispatch(x, st->x_rms, hidden);
 
 mlp_block:
         if (debug_layer) {
@@ -1720,8 +1897,8 @@ mlp_block:
             fprintf(stderr, "[L%u post-attn] ||x||=%.4f\n", l, sqrt(ss));
         }
         /* --- mlp block (shared by vanilla and DeltaNet branches) --- */
-        rmsnorm_f32(st->x_rms, x, (const float *)L->post_attn_layernorm,
-                    hidden, c->rms_norm_eps);
+        rmsnorm_dispatch(st->x_rms, x, (const float *)L->post_attn_layernorm,
+                         hidden, c->rms_norm_eps);
 
         if (L->moe_router) {
             /* MoE path. Expert intermediate may be smaller than dense
@@ -1751,18 +1928,18 @@ mlp_block:
                                 c->moe_norm_topk_prob,
                                 moe_scratch, row_scratch) == 0)
             {
-                for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+                residual_add_dispatch(x, st->x_rms, hidden);
             }
         } else if (L->gate_proj && L->up_proj && L->down_proj) {
-            matmul_lazy(st->gate, st->x_rms,
-                        (const qw36_lazy_w *)L->gate_proj, row_scratch);
-            matmul_lazy(st->up,   st->x_rms,
-                        (const qw36_lazy_w *)L->up_proj,   row_scratch);
-            for (size_t i = 0; i < inter; i++)
-                st->gate[i] = silu(st->gate[i]) * st->up[i];
-            matmul_lazy(st->x_rms, st->gate,
-                        (const qw36_lazy_w *)L->down_proj, row_scratch);
-            for (size_t i = 0; i < hidden; i++) x[i] += st->x_rms[i];
+            if (swiglu_dispatch(st->x_rms, st->x_rms,
+                                (const qw36_lazy_w *)L->gate_proj,
+                                (const qw36_lazy_w *)L->up_proj,
+                                (const qw36_lazy_w *)L->down_proj,
+                                (uint32_t)hidden, (uint32_t)inter,
+                                st->gate, st->up, row_scratch) == 0)
+            {
+                residual_add_dispatch(x, st->x_rms, hidden);
+            }
         }
         if (debug_layer) {
             double ss = 0.0;
@@ -1772,8 +1949,8 @@ mlp_block:
     }
 
     /* Final norm + lm_head (lazy). */
-    rmsnorm_f32(st->x_rms, st->x, (const float *)w->final_norm,
-                hidden, c->rms_norm_eps);
+    rmsnorm_dispatch(st->x_rms, st->x, (const float *)w->final_norm,
+                     hidden, c->rms_norm_eps);
     matmul_lazy(st->logits, st->x_rms,
                 (const qw36_lazy_w *)w->lm_head, row_scratch);
 
