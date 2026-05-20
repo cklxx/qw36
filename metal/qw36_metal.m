@@ -994,9 +994,13 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
          * the same buffer + cols that we converted on the last fp16
          * matmul (no intervening compute dispatch invalidated it).
          * Only needed when x came in as F32. */
-        if (!x_is_f16 &&
-            (ctx->matmul_xh_src != x->mtl ||
-             ctx->matmul_xh_cols != (NSUInteger)cols))
+        if (x_is_f16) {
+            /* Direct fp16 input — the previous xh scratch is irrelevant
+             * to anything that follows. Invalidate so the next f32-input
+             * matmul re-converts instead of trusting stale cache. */
+            metal_invalidate_matmul_xh(ctx);
+        } else if (ctx->matmul_xh_src != x->mtl ||
+                   ctx->matmul_xh_cols != (NSUInteger)cols)
         {
             metal_dispatch_1d(ctx, ctx->f32_to_f16, cols, ^(id<MTLComputeCommandEncoder> enc) {
                 [enc setBuffer:xh->mtl offset:0 atIndex:0];
