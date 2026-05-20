@@ -91,6 +91,10 @@ typedef struct {
 
     /* Head */
     uint8_t  tie_word_embeddings;
+    /* Qwen3.5/3.6 vanilla attention has a Q-gate: q_proj output is
+     * n_heads * head_dim * 2, and attn_out is multiplied by sigmoid(gate)
+     * before o_proj. */
+    uint8_t  has_q_gate;
 
     /* Per-layer flavor (length = num_hidden_layers, owned by config). NULL
      * means "all FULL". */
@@ -182,6 +186,11 @@ typedef struct {
     float *x;               /* [hidden] residual */
     float *x_rms;
     float *q;               /* [n_heads * head_dim] */
+    /* Qwen3.5/3.6 Q-gate scratch. Only allocated when config.has_q_gate.
+     * q_full holds the raw q_proj output (size = 2 * q_dim), and q_gate
+     * holds the de-interleaved per-head gate (size = q_dim). */
+    float *q_full;
+    float *q_gate;
     float *k;
     float *v;
     float *attn_scores;     /* [n_heads, seq_capacity] */

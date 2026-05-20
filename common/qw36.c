@@ -1390,27 +1390,43 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         }
     }
 
-    /* Qwen3.5/3.6 hybrid checkpoints sometimes report a head_count in
-     * metadata that disagrees with the actual attn_q.weight output dim
-     * (e.g. metadata says 8 but the tensor is [hidden, 16*head_dim]).
-     * Trust the tensor: scan for the first vanilla layer and derive
-     * num_attention_heads from its q_proj rows. Same for num_key_value_heads
-     * via k_proj. */
+    /* Qwen3.5 vanilla attention has a *Q-gate*: q_proj output is
+     *   n_heads * head_dim * 2  =  Q concat with a per-head gate.
+     * (See agent-infer mlx_qwen35_model.cpp:789 has_qk_gate branch.)
+     * That means the GGUF tensor `blk.X.attn_q.weight` has dim_1 =
+     * n_heads * head_dim * 2, not n_heads * head_dim. The previous
+     * 'override n_heads to dim_1/head_dim' fix mis-counted heads by 2×
+     * for Qwen3.5 — keep the metadata head_count and detect the gate
+     * separately. */
+    c->has_q_gate = 0;
     {
         char nm[128];
         qw36_gguf_tensor t;
         for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
             snprintf(nm, sizeof(nm), "blk.%u.attn_q.weight", l);
             if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
-                /* dims[1] = output dim of the projection = n_heads * head_dim */
-                uint32_t real_q = (uint32_t)(t.dims[1] / c->head_dim);
-                if (real_q && real_q != c->num_attention_heads) {
+                uint64_t out_dim = t.dims[1];
+                if (out_dim == (uint64_t)c->num_attention_heads * c->head_dim * 2) {
+                    c->has_q_gate = 1;
                     fprintf(stderr,
-                        "qw36: overriding num_attention_heads %u -> %u "
-                        "(from blk.%u.attn_q.weight shape)\n",
-                        c->num_attention_heads, real_q, l);
-                    c->num_attention_heads = real_q;
+                        "qw36: detected Q-gate (q_proj out = %llu = "
+                        "n_heads %u * head_dim %u * 2)\n",
+                        (unsigned long long)out_dim,
+                        c->num_attention_heads, c->head_dim);
+                } else if (out_dim == (uint64_t)c->num_attention_heads * c->head_dim) {
+                    /* Standard Qwen3 vanilla: no gate. */
+                } else {
+                    /* Metadata mismatch — try to recover. */
+                    uint32_t real_q = (uint32_t)(out_dim / c->head_dim);
+                    if (real_q && real_q != c->num_attention_heads) {
+                        fprintf(stderr,
+                            "qw36: overriding num_attention_heads %u -> %u "
+                            "(from blk.%u.attn_q shape; no gate assumed)\n",
+                            c->num_attention_heads, real_q, l);
+                        c->num_attention_heads = real_q;
+                    }
                 }
+                /* K projection (no gate, just GQA factor). */
                 snprintf(nm, sizeof(nm), "blk.%u.attn_k.weight", l);
                 if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
                     uint32_t real_kv = (uint32_t)(t.dims[1] / c->head_dim);
@@ -1734,6 +1750,11 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
     st->x           = (float *)calloc(hidden,        sizeof(float));
     st->x_rms       = (float *)calloc(hidden,        sizeof(float));
     st->q           = (float *)calloc(q_dim,         sizeof(float));
+    if (c->has_q_gate) {
+        st->q_full = (float *)calloc(q_dim * 2,      sizeof(float));
+        st->q_gate = (float *)calloc(q_dim,          sizeof(float));
+        if (!st->q_full || !st->q_gate) goto fail;
+    }
     st->k           = (float *)calloc(kv_dim,        sizeof(float));
     st->v           = (float *)calloc(kv_dim,        sizeof(float));
     st->attn_scores = (float *)calloc(attn_scratch_n, sizeof(float));
@@ -1901,7 +1922,8 @@ void qw36_state_free(qw36_state *st)
         for (uint32_t l = 0; l < st->num_layers; l++) free(st->delta_state[l]);
         free(st->delta_state);
     }
-    free(st->x); free(st->x_rms); free(st->q); free(st->k); free(st->v);
+    free(st->x); free(st->x_rms); free(st->q); free(st->q_full);
+    free(st->q_gate); free(st->k); free(st->v);
     free(st->attn_scores); free(st->gate); free(st->up); free(st->logits);
     free(st);
 }

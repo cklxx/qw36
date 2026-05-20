@@ -2,12 +2,12 @@
  *
  * This module owns the full-attention branch of a single-token forward step:
  * input RMSNorm, Q/K/V projection, per-head q/k RMSNorm, RoPE, KV cache
- * append, causal GQA score/softmax/combine, output projection, and residual
- * add.
+ * append, causal GQA score/softmax/combine, optional Q-gate application,
+ * output projection, and residual add.
  *
- * Backends may run the path through their fused attention vtable. The CPU
- * fallback remains the reference implementation used for backend parity and
- * debugging.
+ * Backends may run the no-gate path through their fused attention vtable.
+ * Qwen3.5/3.6 Q-gate layers intentionally fall back to the CPU reference
+ * path until the backend attention kernels grow an explicit gate input.
  */
 
 #include "qw36_internal.h"
@@ -15,6 +15,13 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static float sigmoid_f32(float x)
+{
+    return 1.0f / (1.0f + expf(-x));
+}
 
 int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                                const qw36_layer_weights *L,
@@ -29,7 +36,8 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     const size_t hidden = fc->hidden;
     float *x = st->x;
 
-    if (fc->gpu_state && eng->backend && eng->backend->rmsnorm &&
+    if (!c->has_q_gate &&
+        fc->gpu_state && eng->backend && eng->backend->rmsnorm &&
         eng->backend->matmul && eng->backend->attention &&
         eng->backend->residual_add &&
         L->q_proj && L->k_proj && L->v_proj && L->o_proj &&
@@ -85,15 +93,32 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     float *staging = st->attn_scores
                    + (size_t)c->num_attention_heads * (st->seq_capacity + 1);
 
-    int used_backend_attention = qw36__attention_dispatch(staging, st->x_rms, L,
-        (float *)st->k_cache[layer_idx], (float *)st->v_cache[layer_idx],
-        c, st->seq_pos, st->seq_capacity);
+    int used_backend_attention = 0;
+    if (!c->has_q_gate) {
+        used_backend_attention = qw36__attention_dispatch(staging, st->x_rms, L,
+            (float *)st->k_cache[layer_idx], (float *)st->v_cache[layer_idx],
+            c, st->seq_pos, st->seq_capacity);
+    }
 
     if (!used_backend_attention) {
         int v_rc = 0;
-        v_rc |= qw36__matmul_lazy(st->q, st->x_rms,
-                                  (const qw36_lazy_w *)L->q_proj,
-                                  fc->row_scratch);
+        if (c->has_q_gate) {
+            if (!st->q_full || !st->q_gate) return -3;
+            v_rc |= qw36__matmul_lazy(st->q_full, st->x_rms,
+                                      (const qw36_lazy_w *)L->q_proj,
+                                      fc->row_scratch);
+            for (uint32_t h = 0; h < c->num_attention_heads; h++) {
+                const float *src = st->q_full + (size_t)h * 2 * c->head_dim;
+                float *qd = st->q + (size_t)h * c->head_dim;
+                float *gd = st->q_gate + (size_t)h * c->head_dim;
+                memcpy(qd, src, c->head_dim * sizeof(float));
+                memcpy(gd, src + c->head_dim, c->head_dim * sizeof(float));
+            }
+        } else {
+            v_rc |= qw36__matmul_lazy(st->q, st->x_rms,
+                                      (const qw36_lazy_w *)L->q_proj,
+                                      fc->row_scratch);
+        }
 
         float *k_row = (float *)st->k_cache[layer_idx]
                      + (size_t)st->seq_pos * kv_dim;
@@ -171,6 +196,11 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
                 head_out[d] = (float)acc;
             }
         }
+    }
+
+    if (c->has_q_gate) {
+        for (uint32_t i = 0; i < q_dim; i++)
+            staging[i] *= sigmoid_f32(st->q_gate[i]);
     }
 
     if (qw36__matmul_lazy(st->x_rms, staging,
