@@ -24,14 +24,19 @@ const char *qw36_version(void) { return QW36_VERSION_STR; }
 /* Lazy weight descriptor: a pointer into the mmap'd GGUF, plus the dtype
  * and shape so matmul/embed can dequantize per-block on the fly. We avoid
  * materializing huge tensors up-front (lm_head, expert mats, qkv, mlp)
- * because a 35B Q4_K_XL model decompresses to ~140GB fp32. */
+ * because a 35B Q4_K_XL model decompresses to ~140GB fp32.
+ *
+ * After engine_open with backend != NULL we may flip `data` to point at a
+ * materialized fp32 buffer (host-side) and set `gpu_buf` to a backend-owned
+ * device view of the same memory (zero-copy on Apple unified memory). */
 typedef struct {
-    const void *data;
-    qw36_dtype  dtype;
-    uint32_t    ggml_type;   /* informational */
-    uint64_t    rows;        /* GGUF dim[1] (outer) */
-    uint64_t    cols;        /* GGUF dim[0] (inner) */
-    uint64_t    n_extra;     /* dim[2] (used for MoE expert stacks) */
+    const void   *data;
+    qw36_dtype    dtype;       /* current dtype; flips to F32 after eager dequant */
+    uint32_t      ggml_type;   /* original ggml type — informational */
+    uint64_t      rows;        /* GGUF dim[1] (outer) */
+    uint64_t      cols;        /* GGUF dim[0] (inner) */
+    uint64_t      n_extra;     /* dim[2] (used for MoE expert stacks) */
+    qw36_gpu_buf *gpu_buf;     /* non-NULL after upload to GPU backend */
 } qw36_lazy_w;
 
 struct qw36_engine {
@@ -425,12 +430,43 @@ static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
     }
 }
 
-/* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c]. */
+/* Set/cleared by qw36_forward so matmul_lazy can locate the backend
+ * without threading the engine pointer through every helper signature.
+ * Single-threaded today; promote to __thread when batched/multi-stream. */
+static qw36_engine *qw36_active_engine = NULL;
+
+/* matmul against a lazy quantized weight: y[r] = sum_c W[r,c] * x[c].
+ * Dispatches to the GPU backend when one is attached and the weight has
+ * an uploaded gpu_buf; otherwise falls back to per-row CPU dequant + dot. */
 static int matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
                        float *row_scratch)
 {
     const size_t rows = (size_t)w->rows;
     const size_t cols = (size_t)w->cols;
+
+    qw36_engine *eng = qw36_active_engine;
+    if (eng && eng->backend && eng->backend->matmul &&
+        eng->backend->upload && eng->backend->download &&
+        eng->backend->alloc && eng->backend->free &&
+        w->gpu_buf)
+    {
+        qw36_gpu_backend *be = eng->backend;
+        qw36_gpu_ctx     *ctx = eng->ctx;
+        qw36_gpu_buf *xb = be->upload(ctx, x, cols * sizeof(float), QW36_DTYPE_F32);
+        qw36_gpu_buf *yb = be->alloc(ctx, rows * sizeof(float),   QW36_DTYPE_F32);
+        if (!xb || !yb) {
+            if (xb) be->free(ctx, xb);
+            if (yb) be->free(ctx, yb);
+            goto cpu_path;
+        }
+        be->matmul(ctx, yb, xb, w->gpu_buf, 1, (uint32_t)rows, (uint32_t)cols);
+        be->download(ctx, yb, y, rows * sizeof(float));
+        be->free(ctx, xb);
+        be->free(ctx, yb);
+        return 0;
+    }
+
+cpu_path:
     for (size_t r = 0; r < rows; r++) {
         if (dequant_row(w, r, row_scratch)) return -1;
         double acc = 0.0;
@@ -910,6 +946,21 @@ static float *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
     return bind_tensor_f32(eng, name);
 }
 
+/* Materialize a lazy_w's quantized weight to a fresh fp32 host buffer
+ * and flip the descriptor to point at it. Memory is registered on the
+ * engine for free-on-close. Returns 0 on success, -1 on OOM/unsupported. */
+static int lazy_materialize_f32(qw36_engine *eng, qw36_lazy_w *lw) {
+    if (!lw || lw->dtype == QW36_DTYPE_F32) return 0;
+    size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1);
+    if (lw->n_extra) numel *= (size_t)lw->n_extra;
+    float *p = materialize_f32(lw->data, lw->dtype, numel);
+    if (!p) return -1;
+    if (!eng_own_(eng, p)) { free(p); return -1; }
+    lw->data  = p;
+    lw->dtype = QW36_DTYPE_F32;
+    return 0;
+}
+
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
@@ -1191,9 +1242,94 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         #undef BIND_W
     }
 
-    /* TODO(Claude): if backend is non-NULL, upload weights and switch the
-     * forward path to use the backend vtable. For v0 we always run CPU. */
-    (void)backend;
+    /* When a GPU backend is provided, eagerly materialize every lazy_w
+     * tensor to fp32 in host memory and (on Apple Silicon / unified memory
+     * backends) ask the backend to wrap that buffer as a device view.
+     *
+     * Memory budget: a 0.8B model materializes to ~3 GB fp32, fits easily.
+     * A 35B-A3B materializes to ~140 GB — caller must use the CPU build
+     * for that until streaming dequant is added. */
+    if (backend) {
+        eng->ctx = backend->init(err, err_cap);
+        if (!eng->ctx) { qw36_engine_close(eng); return NULL; }
+
+        qw36_lazy_w *lws[] = {
+            (qw36_lazy_w *)w->embed_tokens,
+            (qw36_lazy_w *)w->lm_head,
+            NULL
+        };
+        for (size_t i = 0; lws[i]; i++) {
+            if (lazy_materialize_f32(eng, lws[i])) {
+                if (err && err_cap) snprintf(err, err_cap,
+                    "%s: backend materialize failed (unsupported dtype %d)",
+                    backend->name, lws[i]->ggml_type);
+                qw36_engine_close(eng); return NULL;
+            }
+        }
+        /* lm_head usually aliases embed_tokens — avoid double-binding. */
+        if (w->lm_head == w->embed_tokens) ((qw36_lazy_w *)w->lm_head)->gpu_buf =
+            ((qw36_lazy_w *)w->embed_tokens)->gpu_buf;
+
+        #define MAT(field) do { \
+            qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
+            if (lw && lazy_materialize_f32(eng, lw)) { \
+                if (err && err_cap) snprintf(err, err_cap, \
+                    "%s: backend materialize failed at blk.%u." #field, \
+                    backend->name, l); \
+                qw36_engine_close(eng); return NULL; \
+            } \
+        } while (0)
+        for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+            qw36_layer_weights *L = &eng->weights.layers[l];
+            MAT(q_proj); MAT(k_proj); MAT(v_proj); MAT(o_proj);
+            MAT(dn_qkv); MAT(dn_gate); MAT(dn_alpha); MAT(dn_beta); MAT(dn_out);
+            MAT(gate_proj); MAT(up_proj); MAT(down_proj);
+            MAT(moe_router);
+            MAT(moe_expert_gate); MAT(moe_expert_up); MAT(moe_expert_down);
+            MAT(moe_shared_gate); MAT(moe_shared_up); MAT(moe_shared_down);
+        }
+        #undef MAT
+
+        /* Now wrap every materialized buffer as a device-visible view.
+         * For Apple Metal this is zero-copy via MTLBuffer NoCopy; for
+         * CUDA/HIP this does an actual device copy. */
+        #define UPLOAD(field) do { \
+            qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
+            if (lw && lw->data && !lw->gpu_buf) { \
+                size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1); \
+                if (lw->n_extra) numel *= (size_t)lw->n_extra; \
+                lw->gpu_buf = backend->upload(eng->ctx, lw->data, \
+                    numel * sizeof(float), QW36_DTYPE_F32); \
+            } \
+        } while (0)
+        for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+            qw36_layer_weights *L = &eng->weights.layers[l];
+            UPLOAD(q_proj); UPLOAD(k_proj); UPLOAD(v_proj); UPLOAD(o_proj);
+            UPLOAD(dn_qkv); UPLOAD(dn_gate); UPLOAD(dn_alpha);
+            UPLOAD(dn_beta); UPLOAD(dn_out);
+            UPLOAD(gate_proj); UPLOAD(up_proj); UPLOAD(down_proj);
+            UPLOAD(moe_router);
+            UPLOAD(moe_expert_gate); UPLOAD(moe_expert_up); UPLOAD(moe_expert_down);
+            UPLOAD(moe_shared_gate); UPLOAD(moe_shared_up); UPLOAD(moe_shared_down);
+        }
+        #undef UPLOAD
+        /* Globals. */
+        if (w->embed_tokens) {
+            qw36_lazy_w *lw = (qw36_lazy_w *)w->embed_tokens;
+            size_t numel = (size_t)lw->cols * lw->rows;
+            lw->gpu_buf = backend->upload(eng->ctx, lw->data,
+                numel * sizeof(float), QW36_DTYPE_F32);
+        }
+        if (w->lm_head && w->lm_head != w->embed_tokens) {
+            qw36_lazy_w *lw = (qw36_lazy_w *)w->lm_head;
+            size_t numel = (size_t)lw->cols * lw->rows;
+            lw->gpu_buf = backend->upload(eng->ctx, lw->data,
+                numel * sizeof(float), QW36_DTYPE_F32);
+        } else if (w->lm_head == w->embed_tokens) {
+            ((qw36_lazy_w *)w->lm_head)->gpu_buf =
+                ((qw36_lazy_w *)w->embed_tokens)->gpu_buf;
+        }
+    }
     return eng;
 }
 
@@ -1338,6 +1474,11 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     const qw36_weights *w = &eng->weights;
     if (token >= c->vocab_size) return -1;
     if (st->seq_pos >= st->seq_capacity) return -1;
+
+    /* Publish the engine pointer so matmul_lazy and friends can locate the
+     * GPU backend without explicit parameter threading. Restored on exit. */
+    qw36_engine *prev_active = qw36_active_engine;
+    qw36_active_engine = eng;
 
     const size_t hidden = c->hidden_size;
     const size_t inter  = c->intermediate_size;
@@ -1637,6 +1778,7 @@ mlp_block:
                 (const qw36_lazy_w *)w->lm_head, row_scratch);
 
     st->seq_pos++;
+    qw36_active_engine = prev_active;
     return 0;
 }
 

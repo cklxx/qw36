@@ -207,7 +207,7 @@ kernel void qw36_attn_scores_f32(
     if (gid >= total || count > seq_capacity) return;
     uint h = gid / count;
     uint pos = gid - h * count;
-    uint kv_h = h % n_kv;
+    uint kv_h = h * n_kv / n_heads;
     uint kv_len = n_kv * head_dim;
     device const float *qh = q + h * head_dim;
     device const float *kh = k_cache + pos * kv_len + kv_h * head_dim;
@@ -258,7 +258,7 @@ kernel void qw36_attn_combine_f32(
     if (gid >= hidden || seq_pos >= seq_capacity) return;
     uint h = gid / head_dim;
     uint d = gid - h * head_dim;
-    uint kv_h = h % n_kv;
+    uint kv_h = h * n_kv / n_heads;
     uint count = seq_pos + 1;
     uint kv_len = n_kv * head_dim;
     device const float *score_row = scores + h * count;

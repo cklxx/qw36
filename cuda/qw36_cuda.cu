@@ -42,7 +42,10 @@ struct qw36_gpu_buf {
 
 static int cuda_dtype_is_host_dequant(qw36_dtype dtype)
 {
-    return dtype == QW36_DTYPE_Q4_K ||
+    return dtype == QW36_DTYPE_Q2_K ||
+           dtype == QW36_DTYPE_Q3_K ||
+           dtype == QW36_DTYPE_Q4_K ||
+           dtype == QW36_DTYPE_Q5_K ||
            dtype == QW36_DTYPE_Q6_K ||
            dtype == QW36_DTYPE_Q8_0;
 }
@@ -124,6 +127,112 @@ static void cuda_dq_q4_K(const uint8_t *blocks, float *out, size_t n)
     }
 }
 
+static void cuda_dq_q2_K(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 84;
+        const uint8_t *scales = b;
+        const uint8_t *qs = b + 16;
+        uint16_t dh, dmh;
+        std::memcpy(&dh,  b + 80, sizeof(dh));
+        std::memcpy(&dmh, b + 82, sizeof(dmh));
+        const float d = cuda_host_f16_to_f32(dh);
+        const float dmn = cuda_host_f16_to_f32(dmh);
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (float)(sc & 0xF);
+                float ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l] >> shift) & 3)) - ml;
+                sc = scales[is++];
+                dl = d * (float)(sc & 0xF);
+                ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            qs += 32;
+        }
+    }
+}
+
+static void cuda_dq_q3_K(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    static const uint32_t kmask1 = 0x03030303;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 110;
+        const uint8_t *hm = b;
+        const uint8_t *qs = b + 32;
+        uint16_t dh;
+        std::memcpy(&dh, b + 32 + 64 + 12, sizeof(dh));
+        const float d_all = cuda_host_f16_to_f32(dh);
+
+        uint32_t aux[4] = {0, 0, 0, 0};
+        std::memcpy(aux, b + 32 + 64, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t *scales = (const int8_t *)aux;
+
+        uint8_t mask = 1;
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                const float dl = d_all * (float)((int)scales[is++] - 32);
+                for (int l = 0; l < 32; l++) {
+                    int q = ((qs[l] >> shift) & 3) - ((hm[l] & mask) ? 0 : 4);
+                    *out++ = dl * (float)q;
+                }
+                shift += 2;
+                mask <<= 1;
+            }
+            qs += 32;
+        }
+    }
+}
+
+static void cuda_dq_q5_K(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 176;
+        uint16_t dh, dmh;
+        std::memcpy(&dh,  b,     sizeof(dh));
+        std::memcpy(&dmh, b + 2, sizeof(dmh));
+        const float d = cuda_host_f16_to_f32(dh);
+        const float dmn = cuda_host_f16_to_f32(dmh);
+        const uint8_t *scales = b + 4;
+        const uint8_t *qh = b + 16;
+        const uint8_t *ql = b + 48;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QW36_QK_K; j += 64) {
+            uint8_t sc, m;
+            cuda_q4_K_get_scale_min(is + 0, scales, &sc, &m);
+            const float d1 = d * (float)sc, m1 = dmn * (float)m;
+            cuda_q4_K_get_scale_min(is + 1, scales, &sc, &m);
+            const float d2 = d * (float)sc, m2 = dmn * (float)m;
+            for (int l = 0; l < 32; l++)
+                *out++ = d1 * (float)((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; l++)
+                *out++ = d2 * (float)((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
 static void cuda_dq_q6_K(const uint8_t *blocks, float *out, size_t n)
 {
     const size_t nb = n / QW36_QK_K;
@@ -158,7 +267,10 @@ static void cuda_dq_q6_K(const uint8_t *blocks, float *out, size_t n)
 static int cuda_quant_geom(qw36_dtype dtype, size_t *qk, size_t *bytes_per_block)
 {
     switch (dtype) {
+        case QW36_DTYPE_Q2_K: *qk = 256; *bytes_per_block = 84;  return 0;
+        case QW36_DTYPE_Q3_K: *qk = 256; *bytes_per_block = 110; return 0;
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
         case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
         default: *qk = 0; *bytes_per_block = 0; return -1;
@@ -206,7 +318,10 @@ static int cuda_dequant_row(const qw36_gpu_buf *buf, size_t row_idx,
     const uint8_t *row = (const uint8_t *)buf->host_copy
                        + row_idx * blocks_per_row * bpb;
     switch (buf->dtype) {
+        case QW36_DTYPE_Q2_K: cuda_dq_q2_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q3_K: cuda_dq_q3_K(row, out, cols); return 0;
         case QW36_DTYPE_Q4_K: cuda_dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q5_K: cuda_dq_q5_K(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: cuda_dq_q6_K(row, out, cols); return 0;
         case QW36_DTYPE_Q8_0: cuda_dq_q8_0(row, out, cols); return 0;
         default: return -1;
@@ -486,7 +601,7 @@ __global__ static void qw36_attn_scores_kernel(float *scores, const float *q,
     if (gid >= total || count > seq_capacity) return;
     uint32_t h = gid / count;
     uint32_t pos = gid - h * count;
-    uint32_t kv_h = h % n_kv;
+    uint32_t kv_h = h * n_kv / n_heads;
     uint32_t kv_len = n_kv * head_dim;
     const float *qh = q + (size_t)h * head_dim;
     const float *kh = k_cache + (size_t)pos * kv_len + (size_t)kv_h * head_dim;
@@ -528,7 +643,7 @@ __global__ static void qw36_attn_combine_kernel(float *y, const float *scores,
     if (gid >= hidden || seq_pos >= seq_capacity) return;
     uint32_t h = gid / head_dim;
     uint32_t d = gid - h * head_dim;
-    uint32_t kv_h = h % n_kv;
+    uint32_t kv_h = h * n_kv / n_heads;
     uint32_t count = seq_pos + 1;
     uint32_t kv_len = n_kv * head_dim;
     const float *row = scores + (size_t)h * count;
@@ -550,6 +665,15 @@ static void cuda_sync(qw36_gpu_ctx *ctx)
     if (ctx) cudaStreamSynchronize(ctx->stream);
 }
 
+static void cuda_zero_output(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf, size_t bytes)
+{
+    if (!ctx || !buf || !buf->dptr) return;
+    if (bytes > buf->bytes) bytes = buf->bytes;
+    if (!bytes) return;
+    cudaMemsetAsync(buf->dptr, 0, bytes, ctx->stream);
+    cuda_sync(ctx);
+}
+
 static void cuda_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
                          qw36_gpu_buf *w, uint32_t hidden, float eps)
 {
@@ -565,12 +689,18 @@ static void cuda_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
     if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return;
     if (cuda_dtype_is_host_dequant(w->dtype)) {
         float *w_f32 = cuda_dequant_matrix(w, rows, cols);
-        if (!w_f32) return;
+        if (!w_f32) {
+            cuda_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
+            return;
+        }
         qw36_gpu_buf *w_tmp = cuda_upload(ctx, w_f32,
                                           (size_t)rows * cols * sizeof(float),
                                           QW36_DTYPE_F32);
         std::free(w_f32);
-        if (!w_tmp) return;
+        if (!w_tmp) {
+            cuda_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
+            return;
+        }
         cuda_matmul(ctx, y, x, w_tmp, batch, rows, cols);
         cuda_free(ctx, w_tmp);
         return;
@@ -697,11 +827,16 @@ static void cuda_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_b
     if (!ctx || !y || !embed || hidden == 0) return;
     if (cuda_dtype_is_host_dequant(embed->dtype)) {
         float *row = (float *)std::malloc((size_t)hidden * sizeof(float));
-        if (!row) return;
+        if (!row) {
+            cuda_zero_output(ctx, y, (size_t)hidden * sizeof(float));
+            return;
+        }
         if (cuda_dequant_row(embed, token, hidden, row) == 0) {
             cudaMemcpyAsync(y->dptr, row, (size_t)hidden * sizeof(float),
                             cudaMemcpyHostToDevice, ctx->stream);
             cuda_sync(ctx);
+        } else {
+            cuda_zero_output(ctx, y, (size_t)hidden * sizeof(float));
         }
         std::free(row);
         return;
