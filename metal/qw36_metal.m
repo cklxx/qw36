@@ -1182,12 +1182,15 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&q_w_dtype length:sizeof(q_w_dtype) atIndex:16];
         [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:17];
         [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:18];
+        uint32_t y_dtype = (uint32_t)y->dtype;
         if (!f16_kv) {
             [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:19];
             [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:21];
+            [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:22];
         } else {
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:19];
+            [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:20];
         }
         [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
                                 atIndex:0];

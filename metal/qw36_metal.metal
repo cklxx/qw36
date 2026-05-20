@@ -760,7 +760,7 @@ kernel void qw36_attn_score_combine_tg_f32(
 }
 
 kernel void qw36_attn_decode_fused_f32(
-    device float       *y            [[buffer(0)]],
+    device uchar       *y            [[buffer(0)]],
     device const float *q_raw        [[buffer(1)]],
     device const float *k_raw        [[buffer(2)]],
     device const float *v_raw        [[buffer(3)]],
@@ -782,6 +782,7 @@ kernel void qw36_attn_decode_fused_f32(
     constant uint      &k_cache_dtype [[buffer(19)]],
     constant uint      &v_cache_dtype [[buffer(20)]],
     constant uint      &q_has_gate    [[buffer(21)]],
+    constant uint      &y_dtype       [[buffer(22)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -900,12 +901,12 @@ kernel void qw36_attn_decode_fused_f32(
             float g = gate_base[lane];
             acc *= 1.0f / (1.0f + exp(-g));
         }
-        y[h * head_dim + lane] = acc;
+        qw36_store_scalar(y, y_dtype, h * head_dim + lane, acc);
     }
 }
 
 kernel void qw36_attn_decode_fused_f16kv_f32(
-    device float       *y            [[buffer(0)]],
+    device uchar       *y            [[buffer(0)]],
     device const float *q_raw        [[buffer(1)]],
     device const float *k_raw        [[buffer(2)]],
     device const float *v_raw        [[buffer(3)]],
@@ -925,6 +926,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     constant uint      &k_w_dtype    [[buffer(17)]],
     constant uint      &tg_size      [[buffer(18)]],
     constant uint      &q_has_gate   [[buffer(19)]],
+    constant uint      &y_dtype      [[buffer(20)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1041,7 +1043,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
             float g = gate_base[lane];
             acc *= 1.0f / (1.0f + exp(-g));
         }
-        y[h * head_dim + lane] = acc;
+        qw36_store_scalar(y, y_dtype, h * head_dim + lane, acc);
     }
 }
 
