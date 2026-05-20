@@ -166,9 +166,30 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
         grc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
                                      (qw36_gpu_buf *)st->q_dev,
                                      (const qw36_lazy_w *)L->o_proj);
-        grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
-                                               (qw36_gpu_buf *)st->x_rms_dev,
-                                               hidden);
+        /* If the backend has the fused residual+rmsnorm kernel, do it
+         * here and mark the post-attn rmsnorm done so qw36__mlp_forward
+         * skips its own rmsnorm dispatch. Saves one dispatch per layer. */
+        const int try_fused = eng->backend && eng->backend->residual_rmsnorm &&
+                              L->post_attn_layernorm;
+        if (try_fused) {
+            int rrc = qw36__residual_rmsnorm_dispatch_dev(
+                (qw36_gpu_buf *)st->x_dev,
+                (qw36_gpu_buf *)st->x_rms_dev,
+                (qw36_gpu_buf *)st->x_rms_dev,
+                (const float *)L->post_attn_layernorm,
+                hidden, c->rms_norm_eps);
+            if (rrc == 0) {
+                fc->post_attn_rmsnorm_done = 1;
+            } else {
+                grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                                       (qw36_gpu_buf *)st->x_rms_dev,
+                                                       hidden);
+            }
+        } else {
+            grc |= qw36__residual_add_dispatch_dev((qw36_gpu_buf *)st->x_dev,
+                                                   (qw36_gpu_buf *)st->x_rms_dev,
+                                                   hidden);
+        }
         if (grc == 0) {
             *fc->x_dev_valid = 1;
             *fc->x_host_valid = 0;

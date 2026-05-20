@@ -60,6 +60,11 @@ typedef struct qw36_forward_ctx {
     int *x_dev_valid;
     int *x_host_valid;
     int debug_layer;
+    /* When non-zero, the attn sub-block already wrote x_rms_dev =
+     * rmsnorm(x_dev + attn_out) via the fused residual+rmsnorm kernel,
+     * and qw36__mlp_forward must skip its own post_attn_layernorm
+     * dispatch. Reset to 0 at the start of every layer in qw36_forward. */
+    int post_attn_rmsnorm_done;
 } qw36_forward_ctx;
 
 extern qw36_engine *qw36__active_engine;

@@ -1106,6 +1106,11 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
         if ((int)l >= max_layers) break;
         const qw36_layer_weights *L = &w->layers[l];
 
+        /* attn submodule may set this to 1 if it folded residual_add
+         * with the next post-attn rmsnorm into one dispatch. Reset
+         * per layer. */
+        fc.post_attn_rmsnorm_done = 0;
+
         int rc = 0;
         if (!L->q_proj && L->dn_qkv) {
             rc = qw36__attn_deltanet_forward(&fc, L, l);

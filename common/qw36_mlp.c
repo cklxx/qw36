@@ -45,10 +45,15 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
         int erc = qw36__ensure_x_dev(fc);
         if (erc) return erc;
         int grc = 0;
-        grc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
-                                          (qw36_gpu_buf *)st->x_dev,
-                                          (const float *)L->post_attn_layernorm,
-                                          hidden, c->rms_norm_eps);
+        /* attn_vanilla / attn_deltanet may have already done the
+         * post-attn rmsnorm fused with their residual_add — skip it
+         * here when fc->post_attn_rmsnorm_done is set. */
+        if (!fc->post_attn_rmsnorm_done) {
+            grc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
+                                              (qw36_gpu_buf *)st->x_dev,
+                                              (const float *)L->post_attn_layernorm,
+                                              hidden, c->rms_norm_eps);
+        }
         grc |= qw36__swiglu_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
                                          (qw36_gpu_buf *)st->x_rms_dev,
                                          (const qw36_lazy_w *)L->gate_proj,
@@ -86,6 +91,7 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
             int erc = qw36__ensure_x_dev(fc);
             if (erc) return erc;
             int grc = 0;
+            if (!fc->post_attn_rmsnorm_done)
             grc |= qw36__rmsnorm_dispatch_dev((qw36_gpu_buf *)st->x_rms_dev,
                                               (qw36_gpu_buf *)st->x_dev,
                                               (const float *)L->post_attn_layernorm,
