@@ -169,6 +169,85 @@ static void dq_q4_K(const uint8_t *blocks, float *out, size_t n) {
     }
 }
 
+/* Q2_K: 84 bytes/block. Layout:
+ *   u8 scales[16]
+ *   u8 qs[64]      (2-bit quants)
+ *   fp16 d, fp16 dmin
+ * Mirrors dequantize_row_q2_K in ggml-quants.c. */
+static void dq_q2_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b      = blocks + i * 84;
+        const uint8_t *scales = b;
+        const uint8_t *qs     = b + 16;
+        uint16_t dh, dmh;
+        memcpy(&dh,  b + 80, 2);
+        memcpy(&dmh, b + 82, 2);
+        const float d   = f16_to_f32(dh);
+        const float dmn = f16_to_f32(dmh);
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                uint8_t sc = scales[is++];
+                float dl = d * (float)(sc & 0xF), ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l] >> shift) & 3)) - ml;
+                sc = scales[is++];
+                dl = d * (float)(sc & 0xF); ml = dmn * (float)(sc >> 4);
+                for (int l = 0; l < 16; l++)
+                    *out++ = dl * (float)((int8_t)((qs[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            qs += 32;
+        }
+    }
+}
+
+/* Q3_K: 110 bytes/block. Layout:
+ *   u8 hmask[32]   — high bit per element
+ *   u8 qs[64]      — low 2 bits per element
+ *   u8 scales[12]  — 6-bit packed scales
+ *   fp16 d
+ * Mirrors dequantize_row_q3_K in ggml-quants.c. */
+static void dq_q3_K(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    static const uint32_t kmask1 = 0x03030303;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b  = blocks + i * 110;
+        const uint8_t *hm = b;
+        const uint8_t *qs = b + 32;
+        uint16_t dh;
+        memcpy(&dh, b + 32 + 64 + 12, 2);
+        const float d_all = f16_to_f32(dh);
+
+        uint32_t aux[4];
+        memcpy(aux, b + 32 + 64, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0]      & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1]      & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t *scales = (const int8_t *)aux;
+
+        uint8_t mask = 1;
+        int is = 0;
+        for (int nblk = 0; nblk < QW36_QK_K; nblk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                const float dl = d_all * (float)((int)scales[is++] - 32);
+                for (int l = 0; l < 32; l++) {
+                    int q = ((qs[l] >> shift) & 3) - ((hm[l] & mask) ? 0 : 4);
+                    *out++ = dl * (float)q;
+                }
+                shift += 2; mask <<= 1;
+            }
+            qs += 32;
+        }
+    }
+}
+
 /* Q5_K: 176 bytes/block. Layout:
  *   fp16 d, fp16 dmin
  *   u8 scales[12]   — same 6-bit packing as Q4_K
@@ -267,6 +346,12 @@ static float *materialize_f32(const void *data, qw36_dtype dt, size_t n) {
         case QW36_DTYPE_Q8_0:
             dq_q8_0((const uint8_t *)data, out, n);
             return out;
+        case QW36_DTYPE_Q2_K:
+            dq_q2_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q3_K:
+            dq_q3_K((const uint8_t *)data, out, n);
+            return out;
         case QW36_DTYPE_Q4_K:
             dq_q4_K((const uint8_t *)data, out, n);
             return out;
@@ -292,6 +377,8 @@ static inline float silu(float x);
 
 static int dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
     switch (dt) {
+        case QW36_DTYPE_Q2_K: *qk = 256; *bytes_per_block =  84; return 0;
+        case QW36_DTYPE_Q3_K: *qk = 256; *bytes_per_block = 110; return 0;
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
         case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
@@ -328,6 +415,8 @@ static int dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
     const uint8_t *row = (const uint8_t *)w->data
                        + row_idx * blocks_per_row * bpb;
     switch (w->dtype) {
+        case QW36_DTYPE_Q2_K: dq_q2_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q3_K: dq_q3_K(row, out, cols); return 0;
         case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
         case QW36_DTYPE_Q5_K: dq_q5_K(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
@@ -1309,10 +1398,22 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             float *qb      = gout + v_dim;
             float *kb      = qb + kd;
 
-            matmul_lazy(qkv,    st->x_rms, (const qw36_lazy_w *)L->dn_qkv,   row_scratch);
-            matmul_lazy(z_proj, st->x_rms, (const qw36_lazy_w *)L->dn_gate,  row_scratch);
-            matmul_lazy(alpha,  st->x_rms, (const qw36_lazy_w *)L->dn_alpha, row_scratch);
-            matmul_lazy(beta,   st->x_rms, (const qw36_lazy_w *)L->dn_beta,  row_scratch);
+            int dn_rc = 0;
+            dn_rc |= matmul_lazy(qkv,    st->x_rms, (const qw36_lazy_w *)L->dn_qkv,   row_scratch);
+            dn_rc |= matmul_lazy(z_proj, st->x_rms, (const qw36_lazy_w *)L->dn_gate,  row_scratch);
+            dn_rc |= matmul_lazy(alpha,  st->x_rms, (const qw36_lazy_w *)L->dn_alpha, row_scratch);
+            dn_rc |= matmul_lazy(beta,   st->x_rms, (const qw36_lazy_w *)L->dn_beta,  row_scratch);
+            if (dn_rc) {
+                fprintf(stderr, "qw36: DN projection failed at layer %u "
+                        "(unsupported dtype in attn_qkv/gate/alpha/beta — "
+                        "ggml types %d/%d/%d/%d)\n", l,
+                        ((const qw36_lazy_w *)L->dn_qkv)->ggml_type,
+                        ((const qw36_lazy_w *)L->dn_gate)->ggml_type,
+                        ((const qw36_lazy_w *)L->dn_alpha)->ggml_type,
+                        ((const qw36_lazy_w *)L->dn_beta)->ggml_type);
+                free(blk);
+                return -4;
+            }
 
             /* Conv1d + SiLU on the QKV channels (depthwise causal).
              * QW36_SKIP_CONV1D=1 forwards qkv directly (just silu, no conv).*/
@@ -1348,8 +1449,14 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             }
 
             /* Out projection: hidden = ssm_out @ gout. */
-            matmul_lazy(st->x_rms, gout,
-                        (const qw36_lazy_w *)L->dn_out, row_scratch);
+            if (matmul_lazy(st->x_rms, gout,
+                        (const qw36_lazy_w *)L->dn_out, row_scratch)) {
+                fprintf(stderr, "qw36: DN out projection failed at layer %u "
+                        "(unsupported dtype in ssm_out — ggml type %d)\n",
+                        l, ((const qw36_lazy_w *)L->dn_out)->ggml_type);
+                free(blk);
+                return -5;
+            }
             /* Debug knob: QW36_SKIP_DN=1 zeroes the DN contribution to
              * isolate whether the bug is in the DeltaNet path. */
             static int skip_dn = -1;
@@ -1389,18 +1496,23 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
                                             c->partial_rotary_factor);
 
         /* QKV projections via lazy matmul. */
-        matmul_lazy(st->q, st->x_rms, (const qw36_lazy_w *)L->q_proj, row_scratch);
-        if (debug_layer) {
-            double ss = 0.0;
-            for (size_t i = 0; i < c->num_attention_heads * c->head_dim; i++)
-                ss += (double)st->q[i] * st->q[i];
-            fprintf(stderr, "[L%u q ||=%.4f] q[0..2]=%.4f %.4f %.4f\n",
-                    l, sqrt(ss), st->q[0], st->q[1], st->q[2]);
-        }
+        int v_rc = 0;
+        v_rc |= matmul_lazy(st->q, st->x_rms,
+                            (const qw36_lazy_w *)L->q_proj, row_scratch);
         float *k_row = (float *)st->k_cache[l] + (size_t)st->seq_pos * kv_dim;
         float *v_row = (float *)st->v_cache[l] + (size_t)st->seq_pos * kv_dim;
-        matmul_lazy(k_row, st->x_rms, (const qw36_lazy_w *)L->k_proj, row_scratch);
-        matmul_lazy(v_row, st->x_rms, (const qw36_lazy_w *)L->v_proj, row_scratch);
+        v_rc |= matmul_lazy(k_row, st->x_rms,
+                            (const qw36_lazy_w *)L->k_proj, row_scratch);
+        v_rc |= matmul_lazy(v_row, st->x_rms,
+                            (const qw36_lazy_w *)L->v_proj, row_scratch);
+        if (v_rc) {
+            fprintf(stderr, "qw36: vanilla QKV failed at layer %u "
+                    "(ggml types %d/%d/%d)\n", l,
+                    ((const qw36_lazy_w *)L->q_proj)->ggml_type,
+                    ((const qw36_lazy_w *)L->k_proj)->ggml_type,
+                    ((const qw36_lazy_w *)L->v_proj)->ggml_type);
+            return -6;
+        }
 
         /* Per-head q_norm/k_norm + RoPE. */
         for (uint32_t h = 0; h < c->num_attention_heads; h++) {
