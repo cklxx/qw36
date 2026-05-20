@@ -122,6 +122,17 @@ typedef struct qw36_gpu_backend {
                              /* element offset into z */
                              uint32_t z_offset, float eps);
 
+    /* Fused DeltaNet tail: y = dn_out(gated_rmsnorm(x, z, weight)).
+     * Optional fast path for fp16 dn_out weights. z_offset is an element
+     * offset into z when z is a fused projection buffer. */
+    void (*dn_gated_rmsnorm_matmul)(qw36_gpu_ctx *ctx,
+                                    qw36_gpu_buf *y, qw36_gpu_buf *x,
+                                    qw36_gpu_buf *z, qw36_gpu_buf *weight,
+                                    qw36_gpu_buf *w_out,
+                                    uint32_t n_value, uint32_t val_dim,
+                                    uint32_t out_rows, uint32_t z_offset,
+                                    float eps);
+
     /* MoE forward (optional — set to NULL on dense-only builds). */
     void (*moe_forward)(qw36_gpu_ctx *ctx,
                         qw36_gpu_buf *y, qw36_gpu_buf *x,

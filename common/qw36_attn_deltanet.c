@@ -282,14 +282,37 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
                        dt_bias, a_log,
                        (qw36_gpu_buf *)st->delta_state_dev[layer_idx],
                        n_k, n_v, kd, vd, alpha_offset, beta_offset);
-    be->dn_gated_rmsnorm(ctx, (qw36_gpu_buf *)st->dn_qkv_dev,
-                         (qw36_gpu_buf *)st->dn_gout_dev,
-                         fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
-                                    : (qw36_gpu_buf *)st->dn_z_dev,
-                         dn_norm, n_v, vd, z_offset, c->rms_norm_eps);
-    rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
-                          (qw36_gpu_buf *)st->dn_qkv_dev,
-                          (const qw36_lazy_w *)L->dn_out);
+    static int fuse_dn_tail = -1;
+    if (fuse_dn_tail < 0) {
+        const char *e = getenv("QW36_METAL_FUSE_DN_TAIL");
+        fuse_dn_tail = (!e || atoi(e) != 0) ? 1 : 0;
+    }
+    const qw36_lazy_w *dn_out_w = (const qw36_lazy_w *)L->dn_out;
+    const int fused_tail =
+        fuse_dn_tail &&
+        be->dn_gated_rmsnorm_matmul &&
+        dn_out_w && dn_out_w->gpu_buf &&
+        dn_out_w->dtype == QW36_DTYPE_F16 &&
+        dn_out_w->cols == (uint64_t)z_dim &&
+        dn_out_w->rows <= UINT32_MAX;
+    if (fused_tail) {
+        be->dn_gated_rmsnorm_matmul(ctx, (qw36_gpu_buf *)st->x_rms_dev,
+                                    (qw36_gpu_buf *)st->dn_gout_dev,
+                                    fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                               : (qw36_gpu_buf *)st->dn_z_dev,
+                                    dn_norm, dn_out_w->gpu_buf,
+                                    n_v, vd, (uint32_t)dn_out_w->rows,
+                                    z_offset, c->rms_norm_eps);
+    } else {
+        be->dn_gated_rmsnorm(ctx, (qw36_gpu_buf *)st->dn_qkv_dev,
+                             (qw36_gpu_buf *)st->dn_gout_dev,
+                             fused_proj ? (qw36_gpu_buf *)st->dn_qkv_dev
+                                        : (qw36_gpu_buf *)st->dn_z_dev,
+                             dn_norm, n_v, vd, z_offset, c->rms_norm_eps);
+        rc |= qw36__matmul_lazy_dev((qw36_gpu_buf *)st->x_rms_dev,
+                              (qw36_gpu_buf *)st->dn_qkv_dev,
+                              dn_out_w);
+    }
     /* Same fused residual_add + post-attn rmsnorm trick as the vanilla
      * attention path. dn dispatch_dev doesn't carry a forward_ctx so we
      * cannot set post_attn_rmsnorm_done from here; that flag is wired

@@ -37,6 +37,8 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> dn_gated_delta;
     id<MTLComputePipelineState> dn_reorder_gdr_y;
     id<MTLComputePipelineState> dn_gated_rmsnorm;
+    id<MTLComputePipelineState> dn_gated_rmsnorm_f16;
+    id<MTLComputePipelineState> dn_gated_rmsnorm_matmul;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> embedding_lookup;
     id<MTLComputePipelineState> head_norm_rope;
@@ -530,6 +532,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->dn_gated_delta   = metal_make_pipeline(ctx, @"qw36_gated_delta_step_f32", err, err_cap);
     ctx->dn_reorder_gdr_y = metal_make_pipeline(ctx, @"qw36_dn_reorder_grouped_y_to_raw_f32", err, err_cap);
     ctx->dn_gated_rmsnorm = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f32", err, err_cap);
+    ctx->dn_gated_rmsnorm_f16 = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_f16_f32", err, err_cap);
+    ctx->dn_gated_rmsnorm_matmul = metal_make_pipeline(ctx, @"qw36_dn_gated_rmsnorm_matmul_f32", err, err_cap);
     ctx->residual_add     = metal_make_pipeline(ctx, @"qw36_residual_add_f32", err, err_cap);
     ctx->residual_rmsnorm = metal_make_pipeline(ctx, @"qw36_residual_rmsnorm_f32", err, err_cap);
     ctx->embedding_lookup = metal_make_pipeline(ctx, @"qw36_embedding_lookup_f32", err, err_cap);
@@ -553,7 +557,9 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         !ctx->moe_route || !ctx->moe_gate_up || !ctx->moe_down_combine ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
         !ctx->dn_prep_gdr || !ctx->dn_reorder_gdr_y ||
-        !ctx->dn_gated_rmsnorm || !ctx->residual_add ||
+        !ctx->dn_gated_rmsnorm || !ctx->dn_gated_rmsnorm_f16 ||
+        !ctx->dn_gated_rmsnorm_matmul ||
+        !ctx->residual_add ||
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine ||
         !ctx->attn_prep_decode || !ctx->attn_score_combine_tg ||
@@ -569,6 +575,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->head_norm_rope = nil;
         ctx->embedding_lookup = nil;
         ctx->residual_add = nil;
+        ctx->dn_gated_rmsnorm_matmul = nil;
+        ctx->dn_gated_rmsnorm_f16 = nil;
         ctx->dn_gated_rmsnorm = nil;
         ctx->dn_reorder_gdr_y = nil;
         ctx->dn_gated_delta = nil;
@@ -633,6 +641,8 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->head_norm_rope = nil;
     ctx->embedding_lookup = nil;
     ctx->residual_add = nil;
+    ctx->dn_gated_rmsnorm_matmul = nil;
+    ctx->dn_gated_rmsnorm_f16 = nil;
     ctx->dn_gated_rmsnorm = nil;
     ctx->dn_reorder_gdr_y = nil;
     ctx->dn_gated_delta = nil;
@@ -1536,6 +1546,77 @@ static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     });
 }
 
+static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
+                                          qw36_gpu_buf *y,
+                                          qw36_gpu_buf *x,
+                                          qw36_gpu_buf *z,
+                                          qw36_gpu_buf *weight,
+                                          qw36_gpu_buf *w_out,
+                                          uint32_t n_value,
+                                          uint32_t val_dim,
+                                          uint32_t out_rows,
+                                          uint32_t z_offset,
+                                          float eps)
+{
+    if (!ctx || !ctx->dn_gated_rmsnorm_matmul || !y || !x || !z ||
+        !weight || !w_out || !n_value || !val_dim || !out_rows)
+        return;
+    const uint32_t in_cols = n_value * val_dim;
+    if (w_out->dtype != QW36_DTYPE_F16 && w_out->dtype != QW36_DTYPE_F32)
+        return;
+    static int direct_matmul = -1;
+    if (direct_matmul < 0) {
+        const char *e = getenv("QW36_METAL_DN_TAIL_DIRECT");
+        direct_matmul = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    if (!direct_matmul && w_out->dtype == QW36_DTYPE_F16 &&
+        ctx->dn_gated_rmsnorm_f16) {
+        qw36_gpu_buf *xh = metal_scratch(ctx, &ctx->matmul_x_f16_scratch,
+            (size_t)in_cols * sizeof(uint16_t), QW36_DTYPE_F16);
+        if (!xh) return;
+        metal_invalidate_matmul_xh(ctx);
+        metal_dispatch_1d(ctx, ctx->dn_gated_rmsnorm_f16, in_cols,
+            ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:xh->mtl     offset:0 atIndex:0];
+                [enc setBuffer:x->mtl      offset:0 atIndex:1];
+                [enc setBuffer:z->mtl      offset:(NSUInteger)z_offset * sizeof(float) atIndex:2];
+                [enc setBuffer:weight->mtl offset:0 atIndex:3];
+                [enc setBytes:&n_value length:sizeof(n_value) atIndex:4];
+                [enc setBytes:&val_dim length:sizeof(val_dim) atIndex:5];
+                [enc setBytes:&eps     length:sizeof(eps)     atIndex:6];
+            });
+        metal_matmul(ctx, y, xh, w_out, 1, out_rows, in_cols);
+        return;
+    }
+    metal_invalidate_matmul_xh(ctx);
+    const uint32_t tg_size = 256;
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->dn_gated_rmsnorm_matmul];
+    uint32_t y_dtype = (uint32_t)y->dtype;
+    uint32_t w_dtype = (uint32_t)w_out->dtype;
+    [enc setBuffer:y->mtl      offset:0 atIndex:0];
+    [enc setBuffer:x->mtl      offset:0 atIndex:1];
+    [enc setBuffer:z->mtl      offset:(NSUInteger)z_offset * sizeof(float) atIndex:2];
+    [enc setBuffer:weight->mtl offset:0 atIndex:3];
+    [enc setBuffer:w_out->mtl  offset:0 atIndex:4];
+    [enc setBytes:&n_value length:sizeof(n_value) atIndex:5];
+    [enc setBytes:&val_dim length:sizeof(val_dim) atIndex:6];
+    [enc setBytes:&out_rows length:sizeof(out_rows) atIndex:7];
+    [enc setBytes:&in_cols length:sizeof(in_cols) atIndex:8];
+    [enc setBytes:&eps length:sizeof(eps) atIndex:9];
+    [enc setBytes:&w_dtype length:sizeof(w_dtype) atIndex:10];
+    [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:11];
+    [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:12];
+    [enc setThreadgroupMemoryLength:((NSUInteger)n_value + tg_size) * sizeof(float)
+                            atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(out_rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    [enc endEncoding];
+    if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
+}
+
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x,
                                qw36_gpu_buf *y, uint32_t n);
 
@@ -1725,6 +1806,7 @@ static qw36_gpu_backend g_metal_backend = {
     .dn_conv1d_silu    = metal_dn_conv1d_silu,
     .dn_gated_delta    = metal_dn_gated_delta,
     .dn_gated_rmsnorm  = metal_dn_gated_rmsnorm,
+    .dn_gated_rmsnorm_matmul = metal_dn_gated_rmsnorm_matmul,
     .moe_forward       = metal_moe_forward,
     .residual_add      = metal_residual_add,
     .residual_rmsnorm  = metal_residual_rmsnorm,

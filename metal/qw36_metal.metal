@@ -358,6 +358,83 @@ kernel void qw36_dn_gated_rmsnorm_f32(
     y[gid] = gate * x[gid] * scale * w[d];
 }
 
+kernel void qw36_dn_gated_rmsnorm_f16_f32(
+    device half        *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const float *z        [[buffer(2)]],
+    device const float *w        [[buffer(3)]],
+    constant uint      &n_value  [[buffer(4)]],
+    constant uint      &val_dim  [[buffer(5)]],
+    constant float     &eps      [[buffer(6)]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    uint total = n_value * val_dim;
+    if (gid >= total || val_dim == 0) return;
+    uint v = gid / val_dim;
+    uint d = gid - v * val_dim;
+    device const float *xh = x + v * val_dim;
+    float ss = 0.0f;
+    for (uint i = 0; i < val_dim; ++i) ss += xh[i] * xh[i];
+    float scale = rsqrt(ss / float(val_dim) + eps);
+    float zg = z[gid];
+    float gate = zg / (1.0f + exp(-zg));
+    y[gid] = half(gate * x[gid] * scale * w[d]);
+}
+
+kernel void qw36_dn_gated_rmsnorm_matmul_f32(
+    device uchar       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const float *z        [[buffer(2)]],
+    device const float *norm_w   [[buffer(3)]],
+    device const uchar *out_w    [[buffer(4)]],
+    constant uint      &n_value  [[buffer(5)]],
+    constant uint      &val_dim  [[buffer(6)]],
+    constant uint      &out_rows [[buffer(7)]],
+    constant uint      &in_cols  [[buffer(8)]],
+    constant float     &eps      [[buffer(9)]],
+    constant uint      &w_dtype  [[buffer(10)]],
+    constant uint      &y_dtype  [[buffer(11)]],
+    constant uint      &tg_size  [[buffer(12)]],
+    threadgroup float  *scratch  [[threadgroup(0)]],
+    uint                tid      [[thread_index_in_threadgroup]],
+    uint3               tg       [[threadgroup_position_in_grid]])
+{
+    uint row = tg.x;
+    if (row >= out_rows || n_value == 0 || val_dim == 0 ||
+        in_cols != n_value * val_dim)
+        return;
+
+    threadgroup float *scale = scratch;
+    threadgroup float *partial = scratch + n_value;
+
+    for (uint h = tid; h < n_value; h += tg_size) {
+        device const float *xh = x + h * val_dim;
+        float ss = 0.0f;
+        for (uint d = 0; d < val_dim; ++d) ss += xh[d] * xh[d];
+        scale[h] = rsqrt(ss / float(val_dim) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc = 0.0f;
+    for (uint k = tid; k < in_cols; k += tg_size) {
+        uint h = k / val_dim;
+        uint d = k - h * val_dim;
+        float zg = z[k];
+        float gate = zg / (1.0f + exp(-zg));
+        float xv = gate * x[k] * scale[h] * norm_w[d];
+        float wv = qw36_load_scalar(out_w, w_dtype, row * in_cols + k);
+        acc += xv * wv;
+    }
+
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) qw36_store_scalar(y, y_dtype, row, partial[0]);
+}
+
 kernel void qw36_compute_g_beta_norm_qk(
     device float       *q_out     [[buffer(0)]],
     device float       *k_out     [[buffer(1)]],

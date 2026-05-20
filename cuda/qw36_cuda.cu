@@ -966,10 +966,12 @@ static qw36_gpu_backend g_cuda_backend = {
     /* dn_conv1d_silu    */ nullptr,
     /* dn_gated_delta    */ nullptr,
     /* dn_gated_rmsnorm  */ nullptr,
+    /* dn_gated_rmsnorm_matmul */ nullptr,
     /* (cuda_gdr_step is built but the vtable slot uses a different
      *  signature; codex will wrap it from common/.)  */
     /* moe_forward       */ nullptr,
     /* residual_add      */ cuda_residual_add,
+    /* residual_rmsnorm  */ nullptr,
     /* embedding_lookup  */ cuda_embedding_lookup,
 };
 
