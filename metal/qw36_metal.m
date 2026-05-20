@@ -51,6 +51,14 @@ struct qw36_gpu_ctx {
      * gguf_q*_k_matmul). One threadgroup per output row, on-the-fly
      * dequant per element — replaces the f32→f16 MPS round-trip when the
      * weight is kept as Q4_K / Q5_K / Q6_K / Q8_0. */
+    /* Cache for the f32→f16 input conversion that prefaces every MPS
+     * fp16 gemv. Within a layer the same x_rms feeds q/k/v (and gate/up),
+     * so converting once + reusing saves 2-3 dispatches per layer. The
+     * cache is invalidated by every non-matmul compute kernel
+     * (metal_dispatch_1d) since those may have written to x. */
+    id<MTLBuffer> matmul_xh_src;
+    NSUInteger    matmul_xh_cols;
+
     id<MTLComputePipelineState> matmul_q4_k;
     id<MTLComputePipelineState> matmul_q5_k;
     id<MTLComputePipelineState> matmul_q6_k;
@@ -61,6 +69,7 @@ struct qw36_gpu_ctx {
      * by 2-3x and is essential to get past ~10 tok/s on this kind of
      * decode workload. */
     NSMutableDictionary<NSString *, MPSMatrixVectorMultiplication *> *mps_cache;
+    NSMutableDictionary<NSString *, MPSMatrix *> *mps_matrix_cache;
     NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *buf_pool;
 
     /* When non-nil, every metal op encodes into this command buffer
@@ -496,6 +505,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         return NULL;
     }
     ctx->mps_cache = [[NSMutableDictionary alloc] init];
+    ctx->mps_matrix_cache = [[NSMutableDictionary alloc] init];
 
     ctx->library = metal_load_library(ctx->device, err, err_cap);
     if (!ctx->library) {
@@ -606,6 +616,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     metal_release_buf(ctx->moe_probs_scratch);
     metal_release_buf(ctx->moe_router_scratch);
     ctx->mps_cache = nil;
+    ctx->mps_matrix_cache = nil;
     ctx->buf_pool  = nil;
     ctx->attn_combine = nil;
     ctx->attn_prep_decode = nil;
@@ -816,6 +827,13 @@ static void metal_zero_output(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf, size_t bytes
 /* Kernels. Encoders dispatch shaders from qw36_metal.metal. */
 /* --------------------------------------------------------------------- */
 
+static void metal_invalidate_matmul_xh(qw36_gpu_ctx *ctx)
+{
+    if (!ctx) return;
+    ctx->matmul_xh_src = nil;
+    ctx->matmul_xh_cols = 0;
+}
+
 static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
                               id<MTLComputePipelineState> pipe,
                               NSUInteger n,
@@ -836,10 +854,16 @@ static void metal_dispatch_1d(qw36_gpu_ctx *ctx,
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
 }
 
+static void metal_invalidate_matmul_xh(qw36_gpu_ctx *ctx);
+
 static void metal_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
                           qw36_gpu_buf *w, uint32_t hidden, float eps)
 {
     if (!out || !x || !w) return;
+    /* rmsnorm writes to `out`, which is fed directly into the next matmul
+     * — drop any cached fp16 input that was derived from a previous
+     * residual stream snapshot. */
+    metal_invalidate_matmul_xh(ctx);
     metal_dispatch_1d(ctx, ctx->rmsnorm, hidden, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t x_dtype = (uint32_t)x->dtype;
         uint32_t w_dtype = (uint32_t)w->dtype;
@@ -929,11 +953,21 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             metal_zero_output(ctx, y, (size_t)rows * sizeof(float));
             return;
         }
-        metal_dispatch_1d(ctx, ctx->f32_to_f16, cols, ^(id<MTLComputeCommandEncoder> enc) {
-            [enc setBuffer:xh->mtl offset:0 atIndex:0];
-            [enc setBuffer:x->mtl  offset:0 atIndex:1];
-            [enc setBytes:&cols length:sizeof(cols) atIndex:2];
-        });
+        /* Skip the f32→f16 conversion when this matmul's x is the same
+         * buffer + cols that we converted on the last fp16 matmul (no
+         * intervening compute dispatch invalidated it). Saves 2-3
+         * dispatches per layer's q/k/v + gate/up triplets. */
+        if (ctx->matmul_xh_src != x->mtl ||
+            ctx->matmul_xh_cols != (NSUInteger)cols)
+        {
+            metal_dispatch_1d(ctx, ctx->f32_to_f16, cols, ^(id<MTLComputeCommandEncoder> enc) {
+                [enc setBuffer:xh->mtl offset:0 atIndex:0];
+                [enc setBuffer:x->mtl  offset:0 atIndex:1];
+                [enc setBytes:&cols length:sizeof(cols) atIndex:2];
+            });
+            ctx->matmul_xh_src = x->mtl;
+            ctx->matmul_xh_cols = (NSUInteger)cols;
+        }
 
         NSString *key = [NSString stringWithFormat:@"%ux%u:h",
                          (unsigned)rows, (unsigned)cols];
@@ -1422,6 +1456,9 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x, qw36_gpu_buf *y, uint32_t n)
 {
     if (!x || !y) return;
+    /* residual_add writes to x, which is also the typical x source for
+     * the next matmul — drop the cached fp16 input copy. */
+    metal_invalidate_matmul_xh(ctx);
     metal_dispatch_1d(ctx, ctx->residual_add, n, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:x->mtl offset:0 atIndex:0];
         [enc setBuffer:y->mtl offset:0 atIndex:1];
