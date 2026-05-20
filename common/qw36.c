@@ -879,12 +879,44 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             c->dn_num_value_heads = (uint32_t)t.dims[0];
         if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_norm.weight", &t) == 0)
             c->dn_value_head_dim = (uint32_t)t.dims[0];
-        /* Number of key heads = (q_dim + k_dim) / key_head_dim / 2.
-         * In Qwen3.5 the Q/K dim equals the V dim — i.e. q_dim = k_dim =
-         * n_v_heads * val_head_dim — so set num_key_heads = num_value_heads
-         * and key_head_dim = value_head_dim. */
         c->dn_num_key_heads = c->dn_num_value_heads;
         c->dn_key_head_dim  = c->dn_value_head_dim;
+    }
+
+    /* Qwen3.5/3.6 hybrid checkpoints sometimes report a head_count in
+     * metadata that disagrees with the actual attn_q.weight output dim
+     * (e.g. metadata says 8 but the tensor is [hidden, 16*head_dim]).
+     * Trust the tensor: scan for the first vanilla layer and derive
+     * num_attention_heads from its q_proj rows. Same for num_key_value_heads
+     * via k_proj. */
+    {
+        char nm[128];
+        qw36_gguf_tensor t;
+        for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+            snprintf(nm, sizeof(nm), "blk.%u.attn_q.weight", l);
+            if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
+                /* dims[1] = output dim of the projection = n_heads * head_dim */
+                uint32_t real_q = (uint32_t)(t.dims[1] / c->head_dim);
+                if (real_q && real_q != c->num_attention_heads) {
+                    fprintf(stderr,
+                        "qw36: overriding num_attention_heads %u -> %u "
+                        "(from blk.%u.attn_q.weight shape)\n",
+                        c->num_attention_heads, real_q, l);
+                    c->num_attention_heads = real_q;
+                }
+                snprintf(nm, sizeof(nm), "blk.%u.attn_k.weight", l);
+                if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
+                    uint32_t real_kv = (uint32_t)(t.dims[1] / c->head_dim);
+                    if (real_kv && real_kv != c->num_key_value_heads) {
+                        fprintf(stderr,
+                            "qw36: overriding num_key_value_heads %u -> %u\n",
+                            c->num_key_value_heads, real_kv);
+                        c->num_key_value_heads = real_kv;
+                    }
+                }
+                break;
+            }
+        }
     }
 
     /* Bind global tensors. Small (norm) → fp32; big (embed/lm_head) → lazy. */
@@ -1137,8 +1169,6 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
     for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
         const qw36_layer_weights *L = &w->layers[l];
         float *x = st->x;
-        fprintf(stderr, "[fwd] L%u q=%p dn=%p moe=%p\n",
-                l, L->q_proj, L->dn_qkv, L->moe_router);
 
         if (!L->q_proj && L->dn_qkv) {
             /* === Gated DeltaNet branch === */
@@ -1148,13 +1178,6 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
             const uint32_t vd    = c->dn_value_head_dim;
             const uint32_t q_dim = n_k * kd, k_dim_t = n_k * kd, v_dim = n_v * vd;
             const uint32_t qkv_dim = q_dim + k_dim_t + v_dim;
-            const qw36_lazy_w *qkv_w = (const qw36_lazy_w *)L->dn_qkv;
-            fprintf(stderr, "[dn] L%u n_v=%u n_k=%u kd=%u vd=%u qkv_dim=%u, "
-                            "dn_qkv rows=%llu cols=%llu k=%u\n",
-                    l, n_v, n_k, kd, vd, qkv_dim,
-                    (unsigned long long)qkv_w->rows,
-                    (unsigned long long)qkv_w->cols,
-                    c->dn_conv_kernel_size);
 
             rmsnorm_f32(st->x_rms, x, (const float *)L->input_layernorm,
                         hidden, c->rms_norm_eps);
@@ -1339,19 +1362,12 @@ mlp_block:
     }
 
     /* Final norm + lm_head (lazy). */
-    fprintf(stderr, "[fwd] post-loop, final_norm=%p lm_head=%p\n",
-            w->final_norm, w->lm_head);
     rmsnorm_f32(st->x_rms, st->x, (const float *)w->final_norm,
                 hidden, c->rms_norm_eps);
-    fprintf(stderr, "[fwd] final rmsnorm done, calling lm_head matmul\n");
     matmul_lazy(st->logits, st->x_rms,
                 (const qw36_lazy_w *)w->lm_head, row_scratch);
-    fprintf(stderr, "[fwd] lm_head matmul done, logits[0]=%g\n", st->logits[0]);
-    fflush(stderr);
 
     st->seq_pos++;
-    fprintf(stderr, "[fwd] returning, seq_pos=%u\n", st->seq_pos);
-    fflush(stderr);
     return 0;
 }
 
