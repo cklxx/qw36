@@ -131,6 +131,7 @@ Runtime and debug knobs are read at startup unless noted otherwise:
 | `QW36_METAL_FP16_EDGES=1`    | Metal diagnostic. Store `x_rms_dev` and `q_dev` as fp16 when fp16 weights are enabled. Currently reproduces the #46 step-0 divergence, so it is off by default. |
 | `QW36_METAL_FP16_XRMS=1` / `QW36_METAL_FP16_Q=1` | Metal diagnostics. Flip only the RMSNorm-output edge or only the attention-output edge to fp16 for #46 bisection. |
 | `QW36_METAL_F16_GEMV_QUAD=1` | Metal diagnostic. Route fp16-weight GEMV through a qmv_quad-style MSL kernel for rows up to `QW36_METAL_F16_GEMV_QUAD_MAX_ROWS` (default 512). Correct but slower than MPS on this host, so off by default. |
+| `QW36_METAL_MMA_GEMV=1`      | Metal diagnostic. Route fp16-weight GEMV through an 8x8 `simdgroup_matrix` MMA kernel, optionally bounded by `QW36_METAL_MMA_GEMV_MIN_ROWS` / `QW36_METAL_MMA_GEMV_MAX_ROWS`. Correct but slower than MPS for M=1 decode on this host. |
 | `QW36_METAL_QUANT_GPU=1`     | Metal only. Use GPU-native quant matmul instead of host fp32/fp16 materialization. This saves roughly 1 GB RAM on the 0.8B model and currently runs around 40 tok/s, so it is an opt-in low-memory path. |
 | `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `||x||` and the first residual components before/after each block. Useful for bisecting the first divergent layer. |
 | `QW36_MAX_LAYERS=<n>`        | Stop forward after the first `n` layers. Used with layer traces for range bisection. |

@@ -27,6 +27,12 @@ so the issue is not just an MPS half-input quirk; fp16 attention-output
 storage itself is too lossy or the writer/reader layout still needs a
 separate diff.
 
+`QW36_METAL_MMA_GEMV=1` adds an experimental 8x8 `simdgroup_matrix`
+fp16 GEMV. It is correct, but M=1 only uses one row of the MMA tile, so
+the extra tensor-core work loses to MPS on this host. Profiling on
+Qwen3.5-0.8B showed lm_head `248320x1024` at ~4.16 ms with MMA versus
+~2.0 ms with MPS; all-matmul MMA dropped sustained decode to ~47 tok/s.
+
 ## MLX vs qw36 perf analysis (session 2026-05-20)
 
 | model + path                          | tok/s | notes |

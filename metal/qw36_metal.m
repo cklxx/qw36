@@ -72,6 +72,7 @@ struct qw36_gpu_ctx {
     NSUInteger    matmul_xh_cols;
 
     id<MTLComputePipelineState> matmul_qmv_quad_f16;
+    id<MTLComputePipelineState> matmul_mma_f16;
     id<MTLComputePipelineState> matmul_q4_k;
     id<MTLComputePipelineState> matmul_q5_k;
     id<MTLComputePipelineState> matmul_q6_k;
@@ -689,6 +690,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
     ctx->attn_decode_fused_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_f32", err, err_cap);
     ctx->matmul_qmv_quad_f16 = metal_make_pipeline(ctx, @"qw36_matmul_qmv_quad_f16", err, err_cap);
+    ctx->matmul_mma_f16 = metal_make_pipeline(ctx, @"qw36_matmul_mma_f16_f32", err, err_cap);
     ctx->matmul_q4_k = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_f32", err, err_cap);
     ctx->matmul_q5_k = metal_make_pipeline(ctx, @"qw36_matmul_q5_k_f32", err, err_cap);
     ctx->matmul_q6_k = metal_make_pipeline(ctx, @"qw36_matmul_q6_k_f32", err, err_cap);
@@ -706,10 +708,12 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         !ctx->embedding_lookup || !ctx->head_norm_rope || !ctx->kv_append ||
         !ctx->attn_scores || !ctx->attn_softmax || !ctx->attn_combine ||
         !ctx->attn_prep_decode || !ctx->attn_score_combine_tg ||
-        !ctx->attn_decode_fused || !ctx->attn_decode_fused_f16kv) {
+        !ctx->attn_decode_fused || !ctx->attn_decode_fused_f16kv ||
+        !ctx->matmul_mma_f16) {
         ctx->attn_decode_fused_f16kv = nil;
         ctx->attn_decode_fused = nil;
         ctx->attn_score_combine_tg = nil;
+        ctx->matmul_mma_f16 = nil;
         ctx->attn_prep_decode = nil;
         ctx->attn_combine = nil;
         ctx->attn_softmax = nil;
@@ -784,6 +788,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->attn_score_combine_tg = nil;
     ctx->attn_decode_fused = nil;
     ctx->attn_decode_fused_f16kv = nil;
+    ctx->matmul_mma_f16 = nil;
     ctx->attn_softmax = nil;
     ctx->attn_scores = nil;
     ctx->kv_append = nil;
@@ -1206,6 +1211,51 @@ static void metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         (x->dtype == QW36_DTYPE_F32 || x->dtype == QW36_DTYPE_F16) &&
         (y->dtype == QW36_DTYPE_F32 || y->dtype == QW36_DTYPE_F16))
     {
+        static int mma_f16gemv = -1;
+        static uint32_t mma_min_rows = 0;
+        static uint32_t mma_max_rows = UINT32_MAX;
+        if (mma_f16gemv < 0) {
+            const char *e = getenv("QW36_METAL_MMA_GEMV");
+            mma_f16gemv = (e && atoi(e)) ? 1 : 0;
+            const char *mn = getenv("QW36_METAL_MMA_GEMV_MIN_ROWS");
+            const char *mx = getenv("QW36_METAL_MMA_GEMV_MAX_ROWS");
+            int parsed_min = mn ? atoi(mn) : 0;
+            int parsed_max = mx ? atoi(mx) : 0;
+            mma_min_rows = parsed_min > 0 ? (uint32_t)parsed_min : 0u;
+            mma_max_rows = parsed_max > 0 ? (uint32_t)parsed_max : UINT32_MAX;
+        }
+        if (mma_f16gemv && rows >= mma_min_rows && rows <= mma_max_rows &&
+            ctx->matmul_mma_f16 && w->mtl && (cols % 8u) == 0) {
+            double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+            NSString *perf_label = ctx->perf_enabled
+                ? [NSString stringWithFormat:@"mma_f16_gemv_%ux%u",
+                   (unsigned)rows, (unsigned)cols]
+                : nil;
+            int owns_cb = 0;
+            id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+            id<MTLComputeCommandEncoder> enc =
+                metal_compute_encoder_for_op(ctx, cb, owns_cb);
+            [enc setComputePipelineState:ctx->matmul_mma_f16];
+            uint32_t x_dtype = (uint32_t)x->dtype;
+            uint32_t y_dtype = (uint32_t)y->dtype;
+            [enc setBuffer:y->mtl offset:0 atIndex:0];
+            [enc setBuffer:x->mtl offset:0 atIndex:1];
+            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBytes:&cols length:sizeof(cols) atIndex:3];
+            [enc setBytes:&rows length:sizeof(rows) atIndex:4];
+            [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
+            [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:6];
+            [enc setThreadgroupMemoryLength:(NSUInteger)(8u * 128u * sizeof(uint16_t))
+                                    atIndex:0];
+            [enc setThreadgroupMemoryLength:(NSUInteger)(8u * 64u * sizeof(float))
+                                    atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((rows + 63u) / 64u, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            metal_finish_compute_encoder(ctx, enc, owns_cb);
+            metal_commit_wait_profile(ctx, cb, owns_cb, perf_label, start_us);
+            return;
+        }
+
         /* Opt-in qmv_quad-style GEMV: one SIMD threadgroup produces up to
          * 64 output rows using 8 quadgroups. This avoids MPS GEMV object
          * encoding overhead on the fp16 weight path while retaining fp32

@@ -11,6 +11,7 @@
  */
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 constant uint QW36_DTYPE_F32  = 0;
@@ -1708,6 +1709,72 @@ kernel void qw36_matmul_qmv_quad_f16(
         float v = quad_sum(acc[r]);
         uint row = out0 + r * quads_per_simd;
         if (quad_lid == 0u && row < N) qw36_store_scalar(y, y_dtype, row, v);
+    }
+}
+
+/* ----------------------------------------------------------------- *
+ * Experimental simdgroup_matrix fp16 GEMV for M=1 decode.
+ *
+ * One threadgroup has 8 SIMD groups and emits up to 64 output rows.
+ * Each SIMD group owns an 8-row output tile and uses 8x8 half MMA along K.
+ * Since the input has one row, only row 0 of A is populated; the remaining
+ * rows are zero. This intentionally trades extra tensor-core arithmetic for
+ * lower per-row overhead and is opt-in from the host.
+ * ----------------------------------------------------------------- */
+kernel void qw36_matmul_mma_f16_f32(
+    device uchar       *y        [[buffer(0)]],
+    device const uchar *x        [[buffer(1)]],
+    device const half  *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    constant uint      &x_dtype  [[buffer(5)]],
+    constant uint      &y_dtype  [[buffer(6)]],
+    threadgroup half   *ab_smem  [[threadgroup(0)]],
+    threadgroup float  *c_smem   [[threadgroup(1)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 8u;
+    constexpr uint tile_n = 8u;
+    constexpr uint tile_k = 8u;
+    uint row0 = tg.x * simdgroups_per_tg * tile_n + simd_gid * tile_n;
+
+    threadgroup half *a_tile = ab_smem + simd_gid * (tile_k * tile_k * 2u);
+    threadgroup half *b_tile = a_tile + tile_k * tile_k;
+    threadgroup float *c_tile = c_smem + simd_gid * tile_k * tile_n;
+
+    simdgroup_matrix<half, 8, 8> a_mat;
+    simdgroup_matrix<half, 8, 8> b_mat;
+    simdgroup_matrix<float, 8, 8> c_mat(0.0f);
+
+    for (uint k0 = 0; k0 < K; k0 += tile_k) {
+        for (uint e = simd_lid; e < tile_k * tile_k; e += 32u) {
+            uint r = e / tile_k;
+            uint c = e - r * tile_k;
+            uint k = k0 + c;
+            a_tile[e] = (r == 0u && k < K)
+                ? half(qw36_load_scalar(x, x_dtype, k))
+                : half(0.0);
+
+            uint out_row = row0 + c;
+            uint wk = k0 + r;
+            b_tile[e] = (out_row < N && wk < K)
+                ? w[out_row * K + wk]
+                : half(0.0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_load(a_mat, a_tile, 8);
+        simdgroup_load(b_mat, b_tile, 8);
+        simdgroup_multiply_accumulate(c_mat, a_mat, b_mat, c_mat);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    simdgroup_store(c_mat, c_tile, 8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lid < tile_n) {
+        uint row = row0 + simd_lid;
+        if (row < N) qw36_store_scalar(y, y_dtype, row, c_tile[simd_lid]);
     }
 }
 
