@@ -1515,11 +1515,13 @@ static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_
 
     metal_dispatch_1d(ctx, ctx->embedding_lookup, hidden, ^(id<MTLComputeCommandEncoder> enc) {
         uint32_t embed_dtype = (uint32_t)embed->dtype;
+        uint32_t y_dtype = (uint32_t)y->dtype;
         [enc setBuffer:y->mtl     offset:0 atIndex:0];
         [enc setBuffer:embed->mtl offset:0 atIndex:1];
         [enc setBytes:&token  length:sizeof(token)  atIndex:2];
         [enc setBytes:&hidden length:sizeof(hidden) atIndex:3];
         [enc setBytes:&embed_dtype length:sizeof(embed_dtype) atIndex:4];
+        [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:5];
     });
 }
 

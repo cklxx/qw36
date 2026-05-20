@@ -448,15 +448,17 @@ kernel void qw36_residual_add_f32(
 /* Embedding lookup                                                  */
 /* ---------------------------------------------------------------- */
 kernel void qw36_embedding_lookup_f32(
-    device float       *y        [[buffer(0)]],
+    device uchar       *y        [[buffer(0)]],
     device const uchar *embed    [[buffer(1)]],
     constant uint      &token    [[buffer(2)]],
     constant uint      &hidden   [[buffer(3)]],
     constant uint      &dtype    [[buffer(4)]],
+    constant uint      &y_dtype  [[buffer(5)]],
     uint                tid      [[thread_position_in_grid]])
 {
     if (tid < hidden)
-        y[tid] = qw36_load_scalar(embed, dtype, token * hidden + tid);
+        qw36_store_scalar(y, y_dtype, tid,
+            qw36_load_scalar(embed, dtype, token * hidden + tid));
 }
 
 /* ---------------------------------------------------------------- */
