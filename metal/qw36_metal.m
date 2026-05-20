@@ -1199,9 +1199,7 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
         (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
     qw36_gpu_buf *beta = metal_scratch(ctx, &ctx->dn_beta_scratch,
         (size_t)n_value * sizeof(float), QW36_DTYPE_F32);
-    qw36_gpu_buf *y_grouped = metal_scratch(ctx, &ctx->dn_y_grouped_scratch,
-        (size_t)n_value * val_dim * sizeof(float), QW36_DTYPE_F32);
-    if (!q || !k || !v || !g || !beta || !y_grouped) return;
+    if (!q || !k || !v || !g || !beta) return;
 
     NSUInteger prep_n = (NSUInteger)n_key * key_dim;
     NSUInteger v_n = (NSUInteger)n_value * val_dim;
@@ -1234,7 +1232,7 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
     [enc setBuffer:g->mtl         offset:0 atIndex:3];
     [enc setBuffer:beta->mtl      offset:0 atIndex:4];
     [enc setBuffer:state->mtl     offset:0 atIndex:5];
-    [enc setBuffer:y_grouped->mtl offset:0 atIndex:6];
+    [enc setBuffer:y->mtl         offset:0 atIndex:6];
     [enc setBuffer:state->mtl     offset:0 atIndex:7];
     [enc setBytes:&T        length:sizeof(T)        atIndex:8];
     [enc setBytes:&n_key    length:sizeof(n_key)    atIndex:9];
@@ -1245,14 +1243,6 @@ static void metal_dn_gated_delta(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,
   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     [enc endEncoding];
     if (owns_cb) { [cb commit]; [cb waitUntilCompleted]; }
-
-    metal_dispatch_1d(ctx, ctx->dn_reorder_gdr_y, v_n, ^(id<MTLComputeCommandEncoder> renc) {
-        [renc setBuffer:y->mtl         offset:0 atIndex:0];
-        [renc setBuffer:y_grouped->mtl offset:0 atIndex:1];
-        [renc setBytes:&n_key   length:sizeof(n_key)   atIndex:2];
-        [renc setBytes:&n_value length:sizeof(n_value) atIndex:3];
-        [renc setBytes:&val_dim length:sizeof(val_dim) atIndex:4];
-    });
 }
 
 static void metal_dn_gated_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *y,

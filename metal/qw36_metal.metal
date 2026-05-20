@@ -366,20 +366,14 @@ kernel void qw36_compute_g_beta_norm_qk(
     uint                gid       [[thread_position_in_grid]])
 {
     uint q_total = Hk * Dk;
+    uint k_total = q_total;
     uint v_total = Hv * Dv;
-    uint group = (Hk == 0) ? 1 : (Hv / Hk);
-    if (group == 0) group = 1;
-
-    /* Qwen3.5/3.6 attn_qkv layout is per-head interleaved
-     * [Qh0(Dk), Kh0(Dk), Vh0(Dv), Qh1, Kh1, Vh1, ...]. Confirmed by
-     * CPU layer-0 bisection on Qwen3.5-0.8B (commit b25b124). */
-    uint head_stride = 2 * Dk + Dv;
 
     if (gid < q_total) {
         uint h = gid / Dk;
         uint d = gid - h * Dk;
-        device const float *qh = qkv + h * head_stride;
-        device const float *kh = qkv + h * head_stride + Dk;
+        device const float *qh = qkv + h * Dk;
+        device const float *kh = qkv + q_total + h * Dk;
         float qss = 0.0f;
         float kss = 0.0f;
         for (uint i = 0; i < Dk; ++i) {
@@ -393,23 +387,17 @@ kernel void qw36_compute_g_beta_norm_qk(
     }
 
     if (gid < v_total) {
-        uint raw_v = gid / Dv;
-        uint d = gid - raw_v * Dv;
-        uint grouped_v = raw_v;
-        if (Hk != 0 && Hv % Hk == 0)
-            grouped_v = (raw_v % Hk) * group + raw_v / Hk;
-        v_out[grouped_v * Dv + d] = qkv[raw_v * head_stride + 2 * Dk + d];
+        uint v = gid / Dv;
+        uint d = gid - v * Dv;
+        v_out[v * Dv + d] = qkv[q_total + k_total + v * Dv + d];
     }
 
     if (gid < Hv) {
-        uint raw_v = gid;
-        uint grouped_v = raw_v;
-        if (Hk != 0 && Hv % Hk == 0)
-            grouped_v = (raw_v % Hk) * group + raw_v / Hk;
-        float av = alpha_raw[raw_v] + dt_bias[raw_v];
+        uint v = gid;
+        float av = alpha_raw[v] + dt_bias[v];
         float softplus = av > 20.0f ? av : log(1.0f + exp(av));
-        g_out[grouped_v] = exp(-exp(a_log[raw_v]) * softplus);
-        beta_out[grouped_v] = 1.0f / (1.0f + exp(-beta_raw[raw_v]));
+        g_out[v] = exp(-exp(a_log[v]) * softplus);
+        beta_out[v] = 1.0f / (1.0f + exp(-beta_raw[v]));
     }
 }
 
