@@ -16,3 +16,6 @@ models/
 # Claude Code runtime state
 .claude/
 qw36_cpu_ubsan
+qw36_gen_goldens
+qw36_check_goldens
+tests/goldens/

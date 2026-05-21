@@ -65,6 +65,9 @@ jobs:
       - name: Build Metal backend
         run: make metal
 
+      - name: Kernel goldens (CPU primitives, deterministic seed)
+        run: tests/golden_kernels.sh
+
       - name: Precision CPU vs Metal (step 0)
         shell: bash
         env:

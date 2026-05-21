@@ -68,6 +68,7 @@ check: cpu
 	fi
 	tests/cli_smoke.sh
 	tests/kvcache_smoke.sh
+	tests/golden_kernels.sh
 
 # Full perf bench. Slower; intended for "I think this is ready to land".
 perf: cpu

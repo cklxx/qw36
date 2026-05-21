@@ -1,0 +1,181 @@
+/* tools/gen_goldens.c — deterministic kernel golden vector generator.
+ *
+ * Why: Metal / CUDA / AMD ports of the same kernel can drift; we need
+ * a backend-agnostic reference and a way to diff against it. CPU's
+ * reference forward is the ground truth (see common/qw36_ops.c and
+ * the per-kernel files); this tool exercises those same primitives
+ * with a deterministic seeded input and writes binary fixtures that
+ * tests/golden_*.sh consume from any backend.
+ *
+ * Fixture file format (little-endian, host arch — v0 is single-machine):
+ *
+ *   uint32 magic    = 'GLDQ' = 0x51444C47
+ *   uint32 version  = 1
+ *   uint32 kernel   (see qw36_golden_kernel enum below)
+ *   uint32 n_inputs
+ *   uint32 n_outputs
+ *   uint32 input_dims[n_inputs]   each dim is a single uint32 length
+ *   uint32 output_dims[n_outputs]
+ *   uint64 seed
+ *   float  inputs[ sum(input_dims) ]
+ *   float  outputs[ sum(output_dims) ]
+ *
+ * Kernels covered in v0:
+ *   - rmsnorm: in (n=2048), w (n=2048), eps → out (n=2048)
+ *   - swiglu:  gate (n=8192), up (n=8192) → out (n=8192)
+ *   - silu:    in (n=2048) → out (n=2048)
+ *
+ * More kernels (rope, qgate, decode-attn, dn-step, moe-route) are
+ * additive — each gets its own kernel id + harness shell script.
+ * See tests/golden_*.sh.
+ *
+ * Build: cc -O2 -std=c11 -I common tools/gen_goldens.c -o qw36_gen_goldens
+ * (no engine link needed; we use the CPU primitives directly via
+ *  #include of common/qw36_ops.c's deterministic helpers).
+ */
+
+#include <math.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define QW36_GOLDEN_MAGIC   0x51444C47u  /* 'GLDQ' */
+#define QW36_GOLDEN_VERSION 1u
+
+typedef enum {
+    QW36_GOLDEN_RMSNORM = 1,
+    QW36_GOLDEN_SWIGLU  = 2,
+    QW36_GOLDEN_SILU    = 3,
+} qw36_golden_kernel;
+
+/* xorshift64 — deterministic, fast, no deps. */
+static uint64_t xorshift64(uint64_t *s) {
+    uint64_t x = *s;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *s = x;
+    return x;
+}
+
+/* uniform [-1, 1) float, seeded. */
+static float frand(uint64_t *s) {
+    return (float)((int32_t)(xorshift64(s) >> 33) - (int32_t)(1 << 30)) /
+           (float)(1 << 30);
+}
+
+static float silu_f32(float x) { return x / (1.0f + expf(-x)); }
+
+static void rmsnorm_f32(float *out, const float *x, const float *w,
+                        size_t n, float eps) {
+    double ss = 0.0;
+    for (size_t i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    float scale = (float)(1.0 / sqrt(ss / (double)n + (double)eps));
+    for (size_t i = 0; i < n; i++) out[i] = x[i] * scale * w[i];
+}
+
+/* Header + payload writer. inputs/outputs are flat float arrays; dims
+ * are stored as separate uint32 lengths. */
+static int write_golden(const char *path,
+                        qw36_golden_kernel kernel,
+                        uint64_t seed,
+                        uint32_t n_inputs,  const uint32_t *in_dims,
+                        const float **inputs,
+                        uint32_t n_outputs, const uint32_t *out_dims,
+                        const float **outputs) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror(path); return -1; }
+    uint32_t hdr[5] = {
+        QW36_GOLDEN_MAGIC, QW36_GOLDEN_VERSION,
+        (uint32_t)kernel, n_inputs, n_outputs
+    };
+    fwrite(hdr, sizeof(hdr), 1, f);
+    fwrite(in_dims,  sizeof(uint32_t), n_inputs,  f);
+    fwrite(out_dims, sizeof(uint32_t), n_outputs, f);
+    fwrite(&seed, sizeof(seed), 1, f);
+    for (uint32_t i = 0; i < n_inputs; i++)  fwrite(inputs[i],  sizeof(float), in_dims[i],  f);
+    for (uint32_t i = 0; i < n_outputs; i++) fwrite(outputs[i], sizeof(float), out_dims[i], f);
+    fclose(f);
+    return 0;
+}
+
+/* Per-kernel generators. */
+
+static int gen_rmsnorm(const char *out_path) {
+    const uint32_t n = 2048;
+    float *x = (float *)malloc(n * sizeof(float));
+    float *w = (float *)malloc(n * sizeof(float));
+    float *y = (float *)malloc(n * sizeof(float));
+    if (!x || !w || !y) return -1;
+    uint64_t seed = 0xC0FFEEull;
+    uint64_t s = seed;
+    for (uint32_t i = 0; i < n; i++) x[i] = frand(&s);
+    s = seed ^ 0xAAAAAAAAull;
+    for (uint32_t i = 0; i < n; i++) w[i] = 0.5f + 0.5f * frand(&s);
+    rmsnorm_f32(y, x, w, n, 1e-6f);
+    const float *ins[2]  = { x, w };
+    const float *outs[1] = { y };
+    uint32_t in_dims[2]  = { n, n };
+    uint32_t out_dims[1] = { n };
+    int rc = write_golden(out_path, QW36_GOLDEN_RMSNORM, seed,
+                          2, in_dims, ins, 1, out_dims, outs);
+    free(x); free(w); free(y);
+    return rc;
+}
+
+static int gen_silu(const char *out_path) {
+    const uint32_t n = 2048;
+    float *x = (float *)malloc(n * sizeof(float));
+    float *y = (float *)malloc(n * sizeof(float));
+    if (!x || !y) return -1;
+    uint64_t seed = 0xFEEDBACCull;
+    uint64_t s = seed;
+    for (uint32_t i = 0; i < n; i++) x[i] = frand(&s) * 4.0f;
+    for (uint32_t i = 0; i < n; i++) y[i] = silu_f32(x[i]);
+    const float *ins[1]  = { x };
+    const float *outs[1] = { y };
+    uint32_t in_dims[1]  = { n };
+    uint32_t out_dims[1] = { n };
+    int rc = write_golden(out_path, QW36_GOLDEN_SILU, seed,
+                          1, in_dims, ins, 1, out_dims, outs);
+    free(x); free(y);
+    return rc;
+}
+
+static int gen_swiglu(const char *out_path) {
+    const uint32_t n = 8192;
+    float *gate = (float *)malloc(n * sizeof(float));
+    float *up   = (float *)malloc(n * sizeof(float));
+    float *y    = (float *)malloc(n * sizeof(float));
+    if (!gate || !up || !y) return -1;
+    uint64_t seed = 0xDEADBEEFull;
+    uint64_t s = seed;
+    for (uint32_t i = 0; i < n; i++) gate[i] = frand(&s);
+    s = seed ^ 0x55555555ull;
+    for (uint32_t i = 0; i < n; i++) up[i] = frand(&s);
+    for (uint32_t i = 0; i < n; i++) y[i] = silu_f32(gate[i]) * up[i];
+    const float *ins[2]  = { gate, up };
+    const float *outs[1] = { y };
+    uint32_t in_dims[2]  = { n, n };
+    uint32_t out_dims[1] = { n };
+    int rc = write_golden(out_path, QW36_GOLDEN_SWIGLU, seed,
+                          2, in_dims, ins, 1, out_dims, outs);
+    free(gate); free(up); free(y);
+    return rc;
+}
+
+int main(int argc, char **argv) {
+    const char *dir = (argc > 1) ? argv[1] : "tests/goldens";
+    char path[512];
+    int rc = 0;
+    snprintf(path, sizeof(path), "%s/rmsnorm.bin", dir);
+    if (gen_rmsnorm(path)) { fprintf(stderr, "fail rmsnorm\n"); rc = 1; }
+    snprintf(path, sizeof(path), "%s/silu.bin", dir);
+    if (gen_silu(path))    { fprintf(stderr, "fail silu\n");    rc = 1; }
+    snprintf(path, sizeof(path), "%s/swiglu.bin", dir);
+    if (gen_swiglu(path))  { fprintf(stderr, "fail swiglu\n");  rc = 1; }
+    if (!rc) fprintf(stderr, "[gen_goldens] wrote rmsnorm.bin silu.bin swiglu.bin under %s\n", dir);
+    return rc;
+}
