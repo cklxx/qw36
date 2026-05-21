@@ -21,6 +21,7 @@ future contributors.
 
 | file | what it is |
 |------|------------|
+| [`architecture.md`](architecture.md) | engine deep-dive — vtable contract, lazy weight materialization, per-token forward, fusion flags, persistent encoder, KV layouts; the "read for an afternoon" doc |
 | [`kvcache_design.md`](kvcache_design.md) | tier-composing KV prefix cache (vtable per medium; ram_lru + disk on Mac, future vram + redis) |
 | [`q4k_kernel_design_v2.md`](q4k_kernel_design_v2.md) | Q4_K affine32 + qmv_fast kernel design, the lever that unlocked >170 tok/s |
 | [`q4k_qmv_quad_design.md`](q4k_qmv_quad_design.md) | early qmv_quad-style Q4_K design notes (predecessor to v2) |
