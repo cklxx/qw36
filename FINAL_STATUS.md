@@ -44,6 +44,7 @@ CPU baseline 1.7 tok/s.
 | 2464023 (Q6K_MLX default) | **~204 stable short / 176 sustained / 92 at n=2048** | + MLX bit-trick qdot for Q6K (lm_head + ffn_down). +3-4% short, +6% at n=2048 |
 | 77653bd (quant gate_up fused) | **~213 hello / ~205 essay / 182 sustained** | + extended `lazy_fuse_dense_gate_up` to Q4K/Q5K/Q6K + AFFINE32 variants. Halves MLP matmul dispatches per vanilla layer. +5% across the board. |
 | b4bb6f6 (KV transposed, opt-in) | **n=1024 +15% / n=2048 +24%** | + transposed K/V cache layout `QW36_METAL_KV_TRANSPOSED=1` (codex). Adjacent-t reads contiguous along the lane. n=2048: 92→114 tok/s. Short-context regresses 10% (transposed write cost), so opt-in only. |
+| aa293f7 (Q4K_MLX default-on) | **~207 short / ~175 sustained** | + MLX bit-trick qdot for Q4K_AFFINE32 (opposite-sign result to 8d45cca under load: +5% sustained essay at quiet load). Opt-out `QW36_METAL_Q4K_AFFINE32_MLX=0`. |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -90,7 +91,7 @@ geometry (4-lane simdgroup quad) didn't help — see `docs/q4k_qmv_quad_failed.m
 | fp16 residual state (x_dev / x_rms fp16) | step-0 logit drift; left as opt-in |
 | persistent compute encoder (codex O)    | minimal — CPU encode already <0.1% of budget |
 | Q4K → affine32 + qmv_fast kernel (S2)   | +45% over native Q4_K quant_gpu (57→85 tok/s) but still under fp16 MPS ceiling (115). Kept as opt-in: `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1`. Sanity passes (max_abs 1e-4 vs Q4_K original). |
-| MLX-style qmv variant for Q4K affine32 (8d45cca) | Slower than codex's variant on n=256 (78 vs 87 tok/s). MLX pre-scales x_thread but TG geometry (4×4 rows × 16 vpt) loses to codex's per-row TG on our shape. Kept as `QW36_METAL_Q4K_AFFINE32_MLX=1` opt-in for future revisit. |
+| MLX-style qmv variant for Q4K affine32 (8d45cca) | Slower than codex's variant on n=256 (78 vs 87 tok/s) **under load 5+**. Re-tested 2026-05-21 under load 3.0 with 5-rep medians: now wins +5% sustained essay. Promoted default-on in aa293f7 (`QW36_METAL_Q4K_AFFINE32_MLX=0` to opt out). Lesson: machine-load-skewed early results need a 5-rep retest before discarding. |
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
