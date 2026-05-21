@@ -684,9 +684,10 @@ static int amd_blocks(size_t n)
     return (int)((n + 255) / 256);
 }
 
-static void amd_sync(qw36_gpu_ctx *ctx)
+static int amd_sync(qw36_gpu_ctx *ctx)
 {
-    if (ctx) hipStreamSynchronize(ctx->stream);
+    if (!ctx) return -1;
+    return hipStreamSynchronize(ctx->stream) == hipSuccess ? 0 : -1;
 }
 
 static void amd_zero_output(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf, size_t bytes)
@@ -708,27 +709,21 @@ static void amd_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
     amd_sync(ctx);
 }
 
-static void amd_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
-                       qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
+static int amd_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
+                      qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
-    if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return;
+    if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return -1;
     if (amd_dtype_is_host_dequant(w->dtype)) {
         float *w_f32 = amd_dequant_matrix(w, rows, cols);
-        if (!w_f32) {
-            amd_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
-            return;
-        }
+        if (!w_f32) return -1;
         qw36_gpu_buf *w_tmp = amd_upload(ctx, w_f32,
                                          (size_t)rows * cols * sizeof(float),
                                          QW36_DTYPE_F32);
         std::free(w_f32);
-        if (!w_tmp) {
-            amd_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
-            return;
-        }
-        amd_matmul(ctx, y, x, w_tmp, batch, rows, cols);
+        if (!w_tmp) return -1;
+        int rc = amd_matmul(ctx, y, x, w_tmp, batch, rows, cols);
         amd_free(ctx, w_tmp);
-        return;
+        return rc;
     }
 
     if (ctx->blas && y->dtype == QW36_DTYPE_F32 &&
@@ -745,8 +740,7 @@ static void amd_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                                           &beta,
                                           (float *)y->dptr, (int)rows);
         if (bs == rocblas_status_success) {
-            amd_sync(ctx);
-            return;
+            return amd_sync(ctx);
         }
     }
 
@@ -754,7 +748,8 @@ static void amd_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
     hipLaunchKernelGGL(qw36_matmul_kernel, dim3(amd_blocks(n)), dim3(256),
                        0, ctx->stream, (float *)y->dptr, x->dptr, w->dptr,
                        x->dtype, w->dtype, batch, rows, cols);
-    amd_sync(ctx);
+    if (hipGetLastError() != hipSuccess) return -1;
+    return amd_sync(ctx);
 }
 
 static void amd_attention(qw36_gpu_ctx *ctx,

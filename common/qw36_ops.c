@@ -118,7 +118,12 @@ int qw36__matmul_lazy(float *y, const float *x, const qw36_lazy_w *w,
             if (yb) be->free(ctx, yb);
             goto cpu_path;
         }
-        be->matmul(ctx, yb, xb, w->gpu_buf, 1, (uint32_t)rows, (uint32_t)cols);
+        if (be->matmul(ctx, yb, xb, w->gpu_buf, 1,
+                       (uint32_t)rows, (uint32_t)cols)) {
+            be->free(ctx, xb);
+            be->free(ctx, yb);
+            goto cpu_path;
+        }
         be->download(ctx, yb, y, y_bytes);
         be->free(ctx, xb);
         be->free(ctx, yb);
@@ -144,9 +149,8 @@ int qw36__matmul_lazy_dev(qw36_gpu_buf *y, qw36_gpu_buf *x,
         w->rows > UINT32_MAX || w->cols > UINT32_MAX ||
         !qw36__active_backend(&be, &ctx) || !be->matmul)
         return -1;
-    be->matmul(ctx, y, x, w->gpu_buf, 1,
-               (uint32_t)w->rows, (uint32_t)w->cols);
-    return 0;
+    return be->matmul(ctx, y, x, w->gpu_buf, 1,
+                      (uint32_t)w->rows, (uint32_t)w->cols);
 }
 
 /* Same as qw36__matmul_lazy but operates on a single slice of a 3D stack

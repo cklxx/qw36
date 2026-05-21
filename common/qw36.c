@@ -24,7 +24,7 @@ void *qw36__eng_own(qw36_engine *eng, void *p) {
     if (eng->owned_n >= eng->owned_cap) {
         size_t nc = eng->owned_cap ? eng->owned_cap * 2 : 64;
         void **arr = (void **)realloc(eng->owned, nc * sizeof(void *));
-        if (!arr) return p; /* will leak but won't crash; debug later */
+        if (!arr) return NULL;
         eng->owned = arr;
         eng->owned_cap = nc;
     }
@@ -137,7 +137,8 @@ static float *bind_tensor_f32(qw36_engine *eng, const char *name) {
     for (uint32_t d = 0; d < t.n_dims; d++) numel *= (size_t)t.dims[d];
     float *p = qw36__materialize_f32(t.data, t.dtype, numel);
     if (!p) return NULL;
-    return (float *)qw36__eng_own(eng, p);
+    if (!qw36__eng_own(eng, p)) { free(p); return NULL; }
+    return p;
 }
 
 static float *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
@@ -385,8 +386,15 @@ static int lazy_fuse_dense_gate_up(qw36_engine *eng, qw36_layer_weights *L) {
     fused->data = buf;
     fused->rows = gate->rows * 2;
     fused->gpu_buf = NULL;
-    qw36__eng_own(eng, buf);
-    qw36__eng_own(eng, fused);
+    if (!qw36__eng_own(eng, buf)) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    if (!qw36__eng_own(eng, fused)) {
+        free(fused);
+        return -1;
+    }
     L->gate_proj = fused;
     L->up_proj = NULL;
     return 0;
@@ -445,8 +453,15 @@ static int lazy_fuse_vanilla_qkv(qw36_engine *eng, qw36_layer_weights *L,
     fused->data = buf;
     fused->rows = rows64;
     fused->gpu_buf = NULL;
-    qw36__eng_own(eng, buf);
-    qw36__eng_own(eng, fused);
+    if (!qw36__eng_own(eng, buf)) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    if (!qw36__eng_own(eng, fused)) {
+        free(fused);
+        return -1;
+    }
     L->q_proj = fused;
     L->k_proj = NULL;
     L->v_proj = NULL;
@@ -514,8 +529,15 @@ static int lazy_fuse_dn_qkvzab(qw36_engine *eng, qw36_layer_weights *L,
     fused->data = buf;
     fused->rows = rows64;
     fused->gpu_buf = NULL;
-    qw36__eng_own(eng, buf);
-    qw36__eng_own(eng, fused);
+    if (!qw36__eng_own(eng, buf)) {
+        free(buf);
+        free(fused);
+        return -1;
+    }
+    if (!qw36__eng_own(eng, fused)) {
+        free(fused);
+        return -1;
+    }
     L->dn_qkv = fused;
     L->dn_gate = NULL;
     L->dn_alpha = NULL;
@@ -536,7 +558,8 @@ static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
     lw->cols      = t.n_dims >= 1 ? t.dims[0] : 0;
     lw->rows      = t.n_dims >= 2 ? t.dims[1] : 0;
     lw->n_extra   = t.n_dims >= 3 ? t.dims[2] : 0;
-    return (qw36_lazy_w *)qw36__eng_own(eng, lw);
+    if (!qw36__eng_own(eng, lw)) { free(lw); return NULL; }
+    return lw;
 }
 
 /* --------------------------------------------------------------------- */
@@ -882,25 +905,31 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             quant_gpu_weights &&
             ((qk_repack_env && atoi(qk_repack_env) != 0) ||
              (qk_affine32_env && atoi(qk_affine32_env) != 0));
+        /* QW36_METAL_FAST=1 turns on the full affine-repack + lm_head quant
+         * path under quant-GPU mode. Individual flags still win when set
+         * explicitly to 0 so users can isolate one component for debugging. */
+        const char *fast_env = getenv("QW36_METAL_FAST");
+        const int fast_path =
+            quant_gpu_weights && fast_env && atoi(fast_env) != 0;
         const char *q4k_affine32_env = getenv("QW36_METAL_Q4K_AFFINE32");
         const int q4k_affine32_weights =
             qk_repack_weights ||
-            (quant_gpu_weights && q4k_affine32_env &&
-             atoi(q4k_affine32_env) != 0);
+            (quant_gpu_weights &&
+             (q4k_affine32_env ? atoi(q4k_affine32_env) != 0 : fast_path));
         const char *q5k_affine32_env = getenv("QW36_METAL_Q5K_AFFINE32");
         const int q5k_affine32_weights =
             qk_repack_weights ||
-            (quant_gpu_weights && q5k_affine32_env &&
-             atoi(q5k_affine32_env) != 0);
+            (quant_gpu_weights &&
+             (q5k_affine32_env ? atoi(q5k_affine32_env) != 0 : fast_path));
         const char *q6k_scale16_env = getenv("QW36_METAL_Q6K_SCALE16");
         const int q6k_scale16_weights =
-            quant_gpu_weights && q6k_scale16_env &&
-            atoi(q6k_scale16_env) != 0;
+            quant_gpu_weights &&
+            (q6k_scale16_env ? atoi(q6k_scale16_env) != 0 : fast_path);
         const char *quant_lm_head_env =
             getenv("QW36_METAL_QUANT_GPU_LM_HEAD");
         const int quant_gpu_lm_head =
-            quant_gpu_weights && quant_lm_head_env &&
-            atoi(quant_lm_head_env) != 0;
+            quant_gpu_weights &&
+            (quant_lm_head_env ? atoi(quant_lm_head_env) != 0 : fast_path);
         const int fuse_dense_gate_up =
             backend->name && strcmp(backend->name, "metal") == 0;
         const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
@@ -927,7 +956,13 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 }
                 *lm_head = *src;
                 lm_head->gpu_buf = NULL;
-                qw36__eng_own(eng, lm_head);
+                if (!qw36__eng_own(eng, lm_head)) {
+                    free(lm_head);
+                    if (err && err_cap) snprintf(err, err_cap,
+                        "%s: tied lm_head lazy clone ownership failed",
+                        backend->name);
+                    qw36_engine_close(eng); return NULL;
+                }
                 w->lm_head = lm_head;
             }
         }

@@ -67,10 +67,12 @@ typedef struct qw36_gpu_backend {
                     qw36_gpu_buf *weight,
                     uint32_t hidden, float eps);
 
-    /* y = x @ W^T,  W is [rows, cols], x is [batch, cols], y is [batch, rows] */
-    void (*matmul)(qw36_gpu_ctx *ctx,
-                   qw36_gpu_buf *y, qw36_gpu_buf *x, qw36_gpu_buf *w,
-                   uint32_t batch, uint32_t rows, uint32_t cols);
+    /* y = x @ W^T,  W is [rows, cols], x is [batch, cols], y is [batch, rows].
+     * Returns 0 on successful enqueue/completion, negative on setup or backend
+     * execution failure. */
+    int (*matmul)(qw36_gpu_ctx *ctx,
+                  qw36_gpu_buf *y, qw36_gpu_buf *x, qw36_gpu_buf *w,
+                  uint32_t batch, uint32_t rows, uint32_t cols);
 
     /* Fused QKV + rope + GQA attention against the KV cache up to seq_pos.
      * On entry: x is [hidden]. On exit: y is [hidden] (attn output, before

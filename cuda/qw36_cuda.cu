@@ -671,9 +671,10 @@ static int cuda_blocks(size_t n)
     return (int)((n + 255) / 256);
 }
 
-static void cuda_sync(qw36_gpu_ctx *ctx)
+static int cuda_sync(qw36_gpu_ctx *ctx)
 {
-    if (ctx) cudaStreamSynchronize(ctx->stream);
+    if (!ctx) return -1;
+    return cudaStreamSynchronize(ctx->stream) == cudaSuccess ? 0 : -1;
 }
 
 static void cuda_zero_output(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf, size_t bytes)
@@ -694,27 +695,21 @@ static void cuda_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
     cuda_sync(ctx);
 }
 
-static void cuda_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
-                        qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
+static int cuda_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
+                       qw36_gpu_buf *w, uint32_t batch, uint32_t rows, uint32_t cols)
 {
-    if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return;
+    if (!ctx || !y || !x || !w || batch == 0 || rows == 0 || cols == 0) return -1;
     if (cuda_dtype_is_host_dequant(w->dtype)) {
         float *w_f32 = cuda_dequant_matrix(w, rows, cols);
-        if (!w_f32) {
-            cuda_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
-            return;
-        }
+        if (!w_f32) return -1;
         qw36_gpu_buf *w_tmp = cuda_upload(ctx, w_f32,
                                           (size_t)rows * cols * sizeof(float),
                                           QW36_DTYPE_F32);
         std::free(w_f32);
-        if (!w_tmp) {
-            cuda_zero_output(ctx, y, (size_t)batch * rows * sizeof(float));
-            return;
-        }
-        cuda_matmul(ctx, y, x, w_tmp, batch, rows, cols);
+        if (!w_tmp) return -1;
+        int rc = cuda_matmul(ctx, y, x, w_tmp, batch, rows, cols);
         cuda_free(ctx, w_tmp);
-        return;
+        return rc;
     }
 
     if (ctx->blas && y->dtype == QW36_DTYPE_F32 &&
@@ -730,15 +725,15 @@ static void cuda_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                                         &beta,
                                         (float *)y->dptr, (int)rows);
         if (bs == CUBLAS_STATUS_SUCCESS) {
-            cuda_sync(ctx);
-            return;
+            return cuda_sync(ctx);
         }
     }
 
     size_t n = (size_t)batch * rows;
     qw36_matmul_kernel<<<cuda_blocks(n), 256, 0, ctx->stream>>>(
         (float *)y->dptr, x->dptr, w->dptr, x->dtype, w->dtype, batch, rows, cols);
-    cuda_sync(ctx);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    return cuda_sync(ctx);
 }
 
 static void cuda_attention(qw36_gpu_ctx *ctx,

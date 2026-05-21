@@ -5,9 +5,11 @@
 Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **208 tok/s peak
 short / 176 tok/s sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal under
 `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1 QW36_METAL_QUANT_GPU_LM_HEAD=1`
-(vs llama.cpp 170 tok/s reference, MLX 244 tok/s reference). Hit the
-200 tok/s target. The fp16 MPS path tops out at 119/103 tok/s — quant-path
-wins because we halve bandwidth via affine repack on layers AND lm_head.
+(vs llama.cpp 170 tok/s reference, MLX 244 tok/s reference). This fastest
+path is opt-in and smoke-gated by `tests/quant_fastest_smoke.sh`, not fp32
+bit-equal. Hit the 200 tok/s target. The fp16 MPS path tops out at 119/103
+tok/s — quant-path wins because we halve bandwidth via affine repack on layers
+AND lm_head.
 CPU baseline 1.7 tok/s.
 
 ## Decode throughput ladder (Metal, M-class GPU, Qwen3.5-0.8B-Q4_K_M)
@@ -90,7 +92,7 @@ geometry (4-lane simdgroup quad) didn't help — see `docs/q4k_qmv_quad_failed.m
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
 
-**Fastest path today:**
+**Fastest path today (opt-in, smoke-gated):**
 ```
 QW36_METAL_QUANT_GPU=1 \
 QW36_METAL_Q4K_AFFINE32=1 \
@@ -100,6 +102,11 @@ QW36_METAL_QUANT_GPU_LM_HEAD=1 \
 ./qw36_metal -m <gguf> -p "Hello"
 ```
 → 208 tok/s peak short / 176 sustained.
+
+Correctness gate:
+```sh
+./tests/quant_fastest_smoke.sh <gguf>
+```
 
 **Long-context scaling (full quant + lm_head Q6K + fp16 KV):**
 
