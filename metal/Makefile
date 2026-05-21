@@ -18,6 +18,7 @@ COMMON_SRC := \
     $(COMMON)/qw36_attn_deltanet.c \
     $(COMMON)/qw36_mlp.c \
     $(COMMON)/qw36_moe.c \
+    $(COMMON)/qw36_kvcache.c \
     $(COMMON)/qw36_gguf.c \
     $(COMMON)/qw36_tokenizer.c \
     $(COMMON)/qw36_cli.c
