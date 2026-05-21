@@ -1258,10 +1258,14 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
          w->dtype == QW36_DTYPE_Q6K_SCALE16) &&
         w->mtl && (cols % 512u) == 0)
     {
+        /* Q4K MLX-style qmv is faster than the bit-shift fast variant on
+         * sustained essay benches (~+5% at n=256 in 2026-05-21 5-rep
+         * median). Wash on short EOS-bounded prompts. Default it on; opt
+         * out via QW36_METAL_Q4K_AFFINE32_MLX=0. */
         static int q4k_mlx_env_cached = -1;
         if (q4k_mlx_env_cached < 0) {
             const char *e = getenv("QW36_METAL_Q4K_AFFINE32_MLX");
-            q4k_mlx_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+            q4k_mlx_env_cached = e ? (atoi(e) != 0 ? 1 : 0) : 1;
         }
         /* Q6K MLX-style qmv is faster than the bit-shift fast variant on
          * this host (+3-4% e2e, see commit 7550375). Default it on; opt out
