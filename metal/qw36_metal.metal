@@ -1744,6 +1744,52 @@ static inline float qw36_qdot6_scale16_16(device const uchar *qbytes,
     return scale * qacc;
 }
 
+/* MLX-style Q6 qdot — uses masked-byte * pre-scaled x_thread to skip shifts.
+ * x_thread layout (set by caller via qw36_load_x_for_q6_scale16_16):
+ *   x_thread[4i + 0] = x[4i + 0]
+ *   x_thread[4i + 1] = x[4i + 1] / 64
+ *   x_thread[4i + 2] = x[4i + 2] / 16
+ *   x_thread[4i + 3] = x[4i + 3] / 4
+ * For Q6K_SCALE16 our value is (q - 32) * scale so we return
+ *     scale * accum - 32 * scale * sum_x .  Caller passes sum_x.  */
+static inline float qw36_qdot6_scale16_16_mlx(device const uchar *qbytes,
+                                              const thread float *x_thread,
+                                              float scale,
+                                              float sum_x)
+{
+    float accum = 0.0f;
+    for (uint i = 0; i < 4u; ++i) {
+        device const uchar *w = qbytes + 3u * i;
+        const thread float *xt = x_thread + 4u * i;
+        accum += float(w[0] & 0x3fu) * xt[0]
+              +  float(w[0] & 0xc0u) * xt[1]
+              +  float(w[1] & 0x0fu) * (xt[1] * 256.0f)
+              +  float(w[1] & 0xf0u) * xt[2]
+              +  float(w[2] & 0x03u) * (xt[2] * 256.0f)
+              +  float(w[2] & 0xfcu) * xt[3];
+    }
+    return scale * accum - 32.0f * scale * sum_x;
+}
+
+static inline float qw36_load_x_for_q6_scale16_16(device const float *x,
+                                                  uint k,
+                                                  thread float *x_thread)
+{
+    float sum_x = 0.0f;
+    for (uint i = 0; i < 16u; i += 4u) {
+        float x0 = x[k + i + 0u];
+        float x1 = x[k + i + 1u];
+        float x2 = x[k + i + 2u];
+        float x3 = x[k + i + 3u];
+        sum_x += x0 + x1 + x2 + x3;
+        x_thread[i + 0u] = x0;
+        x_thread[i + 1u] = x1 * (1.0f / 64.0f);
+        x_thread[i + 2u] = x2 * (1.0f / 16.0f);
+        x_thread[i + 3u] = x3 * (1.0f / 4.0f);
+    }
+    return sum_x;
+}
+
 /* Q4K_AFFINE32 qmv_fast-style matmul.
  *
  * Layout per 256 elements:
@@ -1990,6 +2036,68 @@ kernel void qw36_matmul_q6k_scale16_qmv_fast_f32(
             float scale = qw36_affine32_half(blk, sub);
             device const uchar *qbytes = blk + 32u + sub * 12u;
             acc[r] += qw36_qdot6_scale16_16(qbytes, x, k, scale);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
+/* MLX-style Q6K_SCALE16 matmul. Same layout + threadgroup geometry as
+ * qw36_matmul_q6k_scale16_qmv_fast_f32 but uses masked-byte * pre-scaled
+ * x_thread (the MLX qdot trick) to cut per-element ops ~2-3×. Opt-in via
+ * QW36_METAL_Q6K_SCALE16_MLX=1 — see metal_matmul dispatch.
+ *
+ * For lm_head (rows ≈ 248K) this is the single biggest gpu_ms line in PERF,
+ * so the throughput-vs-shifts ratio matters more here than elsewhere. */
+kernel void qw36_matmul_q6k_scale16_qmv_mlx_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 224u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+        uint group = k >> 4;
+        uint block = group >> 4;
+        uint sub = group & 15u;
+
+        float sum_x = qw36_load_x_for_q6_scale16_16(x, k, x_thread);
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 224u;
+            float scale = qw36_affine32_half(blk, sub);
+            device const uchar *qbytes = blk + 32u + sub * 12u;
+            acc[r] += qw36_qdot6_scale16_16_mlx(qbytes, x_thread, scale, sum_x);
         }
     }
 
