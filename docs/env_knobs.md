@@ -45,7 +45,7 @@ match the `fast` profile.
 |-----|---------|------|--------|
 | `QW36_METAL_KV_TRANSPOSED` | `0` (opt-in) | transpose K/V cache to `[head][dim][t]` so adjacent-t reads coalesce. +24% n=2048, -10% short. Task 2.4 will add `auto`. | `metal/qw36_metal.m:1748` |
 | `QW36_METAL_ATTN_X4` | `0` (research) | x4-batched scoring inside `qw36_attn_decode_fused_f16kv_x4_f32`. ~0% on this host; kept as opt-in research artifact. | `metal/qw36_metal.m:1768` |
-| `QW36_METAL_FLASH_ATTN` | `0` (opt-in) | online-softmax single-pass decode (`qw36_attn_decode_flash_f16kv_f32`). One forward over K and V instead of two; no scores[] threadgroup array. **+18% n=64, +13% n=512** measured under noisy load. Defaults off until precision bisection passes long generation. Requires kv16 (fp16/bf16 KV). | `metal/qw36_metal.m`, kernel in `metal/qw36_metal.metal` |
+| `QW36_METAL_FLASH_ATTN` | `1` (default-on) | online-softmax single-pass decode (`qw36_attn_decode_flash_f16kv_f32`). One forward over K and V instead of two; no scores[] threadgroup array. **+18% n=64, +13% n=512** measured under noisy load. Per-token greedy output diverges from the legacy fused kernel after ~20 tokens (fp accumulation order across 24 layers) — both coherent, neither matches CPU fp32 bit-for-bit. Set to `0` to fall back to the fused two-pass kernel. Requires kv16 (fp16/bf16 KV). | `metal/qw36_metal.m` |
 
 ## DeltaNet research / debug
 

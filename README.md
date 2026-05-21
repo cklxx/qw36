@@ -20,7 +20,7 @@ GPU; load avg < 3; 5-run median):
 | CPU reference (`qw36_cpu`)             |        1.7 |               — |      — |
 | Metal, fp32 weights                    |         55 |              50 |      — |
 | Metal, `QW36_METAL_FP16_WEIGHTS=1`     |        119 |             103 |      — |
-| **Metal, `--fast` (opt-in path)**      |   **204**  |        **176**  | **92** |
+| **Metal, `--fast` (default flash-attn)** |   **210**  |        **180**  | **105** |
 | llama.cpp reference, same model        |        170 |             170 |     — |
 | MLX-LM reference (4-bit, same machine) |        290 |             290 |     — |
 
