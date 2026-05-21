@@ -130,6 +130,39 @@ Three compound levers got us here:
 Attention is still O(seq). Flash-attention-style streaming pass is the next
 lever for n >= 2048.
 
+**Side-by-side vs MLX (commit 7e07bc7, `tests/compare_mlx.sh long`, load 5.6):**
+
+Same prompts, same n, both greedy + `--ignore-chat-template`. Median of 3.
+
+| prompt          | n    | qw36 (Q4_K_M) | MLX (4-bit) | qw36/MLX |
+|-----------------|-----:|--------------:|------------:|---------:|
+| hello           | 64   | 190.2 | 298.3 | 64% |
+| hello           | 256  | 189.7 | 290.0 | 65% |
+| hello           | 512  | 191.0 | 291.4 | 66% |
+| hello           | 1024 | 190.4 | 289.7 | 66% |
+| long_essay      | 64   | 185.7 | 299.6 | 62% |
+| long_essay      | 256  | 167.3 | 319.1 | 52% |
+| long_essay      | 512  | 157.6 | 255.6 | 62% |
+| long_essay      | 1024 |  97.7 | 320.2 | **31%** |
+| detailed_essay  | 64   | 197.1 | 334.5 | 59% |
+| detailed_essay  | 256  | 170.1 | 326.6 | 52% |
+| detailed_essay  | 512  | 154.8 | 283.5 | 55% |
+| detailed_essay  | 1024 |  99.6 | 294.9 | **34%** |
+
+**Reading:**
+- On *hello* (short EOS-bounded outputs) qw36 stays flat at ~190 across all
+  n; MLX stays flat at ~290. The 64-66% ratio there is the pure kernel-
+  quality gap (our matmul/dispatch vs MLX's).
+- On *long_essay / detailed_essay* (full-length completions) MLX stays
+  almost flat ~290-320 across n=64..1024, while qw36 drops 197 → 100 as
+  seq grows. The widening ratio (62% → 31%) is attention scaling — we are
+  O(seq), MLX is effectively constant.
+- Two distinct levers to chase MLX:
+    1. **Short-context kernel quality** (close 34% gap on hello) — small
+       matmuls, dispatch overhead, MPS vs custom GEMV.
+    2. **Long-context attention** (close 69% gap at n=1024) — flash-style
+       streaming attention so K/V cache reads don't dominate.
+
 ## Coverage
 
 ### What works
