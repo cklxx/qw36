@@ -41,9 +41,13 @@ typedef enum {
     QW36_DTYPE_Q8_0 = 8,
     QW36_DTYPE_Q3_K = 11,
     QW36_DTYPE_Q2_K = 10,
-    /* Internal post-load layout: GGUF Q4_K repacked as per-32 affine
-     * groups for Metal qmv kernels. Not a GGML/GGUF on-disk dtype. */
+    /* Internal post-load layouts: GGUF K-quants repacked as per-32 affine
+     * groups for Metal qmv kernels. Not GGML/GGUF on-disk dtypes. */
     QW36_DTYPE_Q4K_AFFINE32 = 100,
+    QW36_DTYPE_Q5K_AFFINE32 = 101,
+    /* Q6_K is symmetric and uses 16-element scale groups, so its internal
+     * qmv layout stores fp16 scale[16] plus packed 6-bit values. */
+    QW36_DTYPE_Q6K_SCALE16 = 102,
     QW36_DTYPE_UNSUPPORTED = 0xFF
 } qw36_dtype;
 

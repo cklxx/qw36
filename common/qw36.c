@@ -177,9 +177,9 @@ static int lazy_materialize_f16(qw36_engine *eng, qw36_lazy_w *lw) {
     return 0;
 }
 
-static int lazy_q4k_affine32_sanity(const qw36_lazy_w *orig,
-                                    const qw36_lazy_w *repacked,
-                                    float *max_abs_out)
+static int lazy_affine32_repack_sanity(const qw36_lazy_w *orig,
+                                       const qw36_lazy_w *repacked,
+                                       float *max_abs_out)
 {
     if (!orig || !repacked || !max_abs_out || !orig->rows || !orig->cols)
         return -1;
@@ -238,7 +238,7 @@ static int lazy_repack_q4k_to_affine32(qw36_engine *eng, qw36_lazy_w *lw,
     repacked.dtype = QW36_DTYPE_Q4K_AFFINE32;
     repacked.gpu_buf = NULL;
     float max_abs = 0.0f;
-    if (lazy_q4k_affine32_sanity(lw, &repacked, &max_abs)) {
+    if (lazy_affine32_repack_sanity(lw, &repacked, &max_abs)) {
         free(p);
         return -1;
     }
@@ -253,6 +253,94 @@ static int lazy_repack_q4k_to_affine32(qw36_engine *eng, qw36_lazy_w *lw,
     if (!qw36__eng_own(eng, p)) { free(p); return -1; }
     lw->data = p;
     lw->dtype = QW36_DTYPE_Q4K_AFFINE32;
+    lw->gpu_buf = NULL;
+    return 0;
+}
+
+/* Runtime-only low-memory Metal path: convert GGUF Q5_K into a sibling
+ * affine per-32 layout:
+ *   [fp16 scale[8] | fp16 bias[8] | packed q5 groups[8][20]]
+ * per 256-element block. */
+static int lazy_repack_q5k_to_affine32(qw36_engine *eng, qw36_lazy_w *lw,
+                                       float *max_abs_out)
+{
+    if (!lw || lw->dtype != QW36_DTYPE_Q5_K) return 0;
+    if (!lw->cols || (lw->cols % 256u) != 0 || !lw->rows) return -1;
+    size_t numel = (size_t)lw->cols * (size_t)lw->rows;
+    if (lw->n_extra) {
+        if (numel > SIZE_MAX / (size_t)lw->n_extra) return -1;
+        numel *= (size_t)lw->n_extra;
+    }
+    size_t bytes = qw36__tensor_bytes(QW36_DTYPE_Q5K_AFFINE32, numel);
+    if (!bytes) return -1;
+    uint8_t *p = (uint8_t *)malloc(bytes);
+    if (!p) return -1;
+    if (qw36__repack_q5k_affine32(lw, p)) {
+        free(p);
+        return -1;
+    }
+
+    qw36_lazy_w repacked = *lw;
+    repacked.data = p;
+    repacked.dtype = QW36_DTYPE_Q5K_AFFINE32;
+    repacked.gpu_buf = NULL;
+    float max_abs = 0.0f;
+    if (lazy_affine32_repack_sanity(lw, &repacked, &max_abs)) {
+        free(p);
+        return -1;
+    }
+    if (max_abs > 0.25f) {
+        free(p);
+        return -1;
+    }
+    if (max_abs_out && max_abs > *max_abs_out) *max_abs_out = max_abs;
+    if (!qw36__eng_own(eng, p)) { free(p); return -1; }
+    lw->data = p;
+    lw->dtype = QW36_DTYPE_Q5K_AFFINE32;
+    lw->gpu_buf = NULL;
+    return 0;
+}
+
+/* Runtime-only low-memory Metal path for Q6_K. Q6_K is symmetric and has
+ * 16-element scale groups, so repack to:
+ *   [fp16 scale[16] | packed q6 groups[16][12]]
+ * per 256-element block. */
+static int lazy_repack_q6k_to_scale16(qw36_engine *eng, qw36_lazy_w *lw,
+                                      float *max_abs_out)
+{
+    if (!lw || lw->dtype != QW36_DTYPE_Q6_K) return 0;
+    if (!lw->cols || (lw->cols % 256u) != 0 || !lw->rows) return -1;
+    size_t numel = (size_t)lw->cols * (size_t)lw->rows;
+    if (lw->n_extra) {
+        if (numel > SIZE_MAX / (size_t)lw->n_extra) return -1;
+        numel *= (size_t)lw->n_extra;
+    }
+    size_t bytes = qw36__tensor_bytes(QW36_DTYPE_Q6K_SCALE16, numel);
+    if (!bytes) return -1;
+    uint8_t *p = (uint8_t *)malloc(bytes);
+    if (!p) return -1;
+    if (qw36__repack_q6k_scale16(lw, p)) {
+        free(p);
+        return -1;
+    }
+
+    qw36_lazy_w repacked = *lw;
+    repacked.data = p;
+    repacked.dtype = QW36_DTYPE_Q6K_SCALE16;
+    repacked.gpu_buf = NULL;
+    float max_abs = 0.0f;
+    if (lazy_affine32_repack_sanity(lw, &repacked, &max_abs)) {
+        free(p);
+        return -1;
+    }
+    if (max_abs > 0.25f) {
+        free(p);
+        return -1;
+    }
+    if (max_abs_out && max_abs > *max_abs_out) *max_abs_out = max_abs;
+    if (!qw36__eng_own(eng, p)) { free(p); return -1; }
+    lw->data = p;
+    lw->dtype = QW36_DTYPE_Q6K_SCALE16;
     lw->gpu_buf = NULL;
     return 0;
 }
@@ -788,10 +876,26 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         const int quant_gpu_weights =
             backend->name && strcmp(backend->name, "metal") == 0 &&
             qgpu_env && atoi(qgpu_env) != 0;
+        const char *qk_repack_env = getenv("QW36_METAL_QK_REPACK");
+        const char *qk_affine32_env = getenv("QW36_METAL_QK_AFFINE32");
+        const int qk_repack_weights =
+            quant_gpu_weights &&
+            ((qk_repack_env && atoi(qk_repack_env) != 0) ||
+             (qk_affine32_env && atoi(qk_affine32_env) != 0));
         const char *q4k_affine32_env = getenv("QW36_METAL_Q4K_AFFINE32");
         const int q4k_affine32_weights =
-            quant_gpu_weights && q4k_affine32_env &&
-            atoi(q4k_affine32_env) != 0;
+            qk_repack_weights ||
+            (quant_gpu_weights && q4k_affine32_env &&
+             atoi(q4k_affine32_env) != 0);
+        const char *q5k_affine32_env = getenv("QW36_METAL_Q5K_AFFINE32");
+        const int q5k_affine32_weights =
+            qk_repack_weights ||
+            (quant_gpu_weights && q5k_affine32_env &&
+             atoi(q5k_affine32_env) != 0);
+        const char *q6k_scale16_env = getenv("QW36_METAL_Q6K_SCALE16");
+        const int q6k_scale16_weights =
+            quant_gpu_weights && q6k_scale16_env &&
+            atoi(q6k_scale16_env) != 0;
         const int fuse_dense_gate_up =
             backend->name && strcmp(backend->name, "metal") == 0;
         const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
@@ -870,19 +974,46 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         }
         #undef MAT_AS
 
-        if (q4k_affine32_weights) {
-            size_t repacked_n = 0;
+        if (q4k_affine32_weights || q5k_affine32_weights ||
+            q6k_scale16_weights) {
+            size_t repacked_q4_n = 0;
+            size_t repacked_q5_n = 0;
+            size_t repacked_q6_n = 0;
             float repack_max_abs = 0.0f;
             #define REPACK_Q4K(field) do { \
                 qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
-                if (lw && lw->dtype == QW36_DTYPE_Q4_K) { \
+                if (q4k_affine32_weights && lw && lw->dtype == QW36_DTYPE_Q4_K) { \
                     if (lazy_repack_q4k_to_affine32(eng, lw, &repack_max_abs)) { \
                         if (err && err_cap) snprintf(err, err_cap, \
                             "%s: Q4_K affine32 repack failed at blk.%u." #field, \
                             backend->name, l); \
                         qw36_engine_close(eng); return NULL; \
                     } \
-                    repacked_n++; \
+                    repacked_q4_n++; \
+                } \
+            } while (0)
+            #define REPACK_Q5K(field) do { \
+                qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
+                if (q5k_affine32_weights && lw && lw->dtype == QW36_DTYPE_Q5_K) { \
+                    if (lazy_repack_q5k_to_affine32(eng, lw, &repack_max_abs)) { \
+                        if (err && err_cap) snprintf(err, err_cap, \
+                            "%s: Q5_K affine32 repack failed at blk.%u." #field, \
+                            backend->name, l); \
+                        qw36_engine_close(eng); return NULL; \
+                    } \
+                    repacked_q5_n++; \
+                } \
+            } while (0)
+            #define REPACK_Q6K(field) do { \
+                qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
+                if (q6k_scale16_weights && lw && lw->dtype == QW36_DTYPE_Q6_K) { \
+                    if (lazy_repack_q6k_to_scale16(eng, lw, &repack_max_abs)) { \
+                        if (err && err_cap) snprintf(err, err_cap, \
+                            "%s: Q6_K scale16 repack failed at blk.%u." #field, \
+                            backend->name, l); \
+                        qw36_engine_close(eng); return NULL; \
+                    } \
+                    repacked_q6_n++; \
                 } \
             } while (0)
             for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
@@ -899,12 +1030,40 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 REPACK_Q4K(moe_expert_down);
                 REPACK_Q4K(moe_shared_gate); REPACK_Q4K(moe_shared_up);
                 REPACK_Q4K(moe_shared_down);
+                REPACK_Q5K(q_proj); REPACK_Q5K(k_proj); REPACK_Q5K(v_proj);
+                REPACK_Q5K(o_proj);
+                REPACK_Q5K(dn_qkv); REPACK_Q5K(dn_gate);
+                REPACK_Q5K(dn_alpha); REPACK_Q5K(dn_beta);
+                REPACK_Q5K(dn_out);
+                REPACK_Q5K(gate_proj); REPACK_Q5K(up_proj);
+                REPACK_Q5K(down_proj);
+                REPACK_Q5K(moe_router);
+                REPACK_Q5K(moe_expert_gate); REPACK_Q5K(moe_expert_up);
+                REPACK_Q5K(moe_expert_down);
+                REPACK_Q5K(moe_shared_gate); REPACK_Q5K(moe_shared_up);
+                REPACK_Q5K(moe_shared_down);
+                REPACK_Q6K(q_proj); REPACK_Q6K(k_proj); REPACK_Q6K(v_proj);
+                REPACK_Q6K(o_proj);
+                REPACK_Q6K(dn_qkv); REPACK_Q6K(dn_gate);
+                REPACK_Q6K(dn_alpha); REPACK_Q6K(dn_beta);
+                REPACK_Q6K(dn_out);
+                REPACK_Q6K(gate_proj); REPACK_Q6K(up_proj);
+                REPACK_Q6K(down_proj);
+                REPACK_Q6K(moe_router);
+                REPACK_Q6K(moe_expert_gate); REPACK_Q6K(moe_expert_up);
+                REPACK_Q6K(moe_expert_down);
+                REPACK_Q6K(moe_shared_gate); REPACK_Q6K(moe_shared_up);
+                REPACK_Q6K(moe_shared_down);
             }
+            #undef REPACK_Q6K
+            #undef REPACK_Q5K
             #undef REPACK_Q4K
-            if (repacked_n) {
+            if (repacked_q4_n || repacked_q5_n || repacked_q6_n) {
                 fprintf(stderr,
-                    "qw36: Q4_K affine32 repacked %zu tensors (sanity max_abs %.6g)\n",
-                    repacked_n, repack_max_abs);
+                    "qw36: qk repacked Q4_K=%zu Q5_K=%zu Q6_K=%zu tensors "
+                    "(sanity max_abs %.6g)\n",
+                    repacked_q4_n, repacked_q5_n, repacked_q6_n,
+                    repack_max_abs);
             }
         }
 

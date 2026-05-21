@@ -33,6 +33,18 @@ for i in 1 2 3; do
 done
 
 echo
+echo "=== QUANT_GPU + QK_REPACK opt-in (Q4_K + Q5_K + Q6_K) ==="
+for i in 1 2 3; do
+  run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_QK_REPACK=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128
+done
+
+echo
+echo "=== QUANT_GPU + QK_REPACK + Q6K_SCALE16 experiment ==="
+for i in 1 2 3; do
+  run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_QK_REPACK=1 QW36_METAL_Q6K_SCALE16=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128
+done
+
+echo
 echo "=== QUANT_GPU + Q4K_QUAD opt-in (legacy experimental kernel) ==="
 for i in 1 2 3; do
   run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 ||
@@ -41,4 +53,4 @@ done
 
 echo
 echo "=== correctness check (Hello continuation, affine32) ==="
-QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 16 2>&1 | tail -3
+QW36_METAL_QUANT_GPU=1 QW36_METAL_QK_REPACK=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 16 2>&1 | tail -3

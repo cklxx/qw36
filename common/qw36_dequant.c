@@ -93,7 +93,9 @@ size_t qw36__tensor_bytes(qw36_dtype dtype, size_t numel) {
         case QW36_DTYPE_Q4_K: return (numel / 256u) * 144u;
         case QW36_DTYPE_Q4K_AFFINE32: return (numel / 256u) * 160u;
         case QW36_DTYPE_Q5_K: return (numel / 256u) * 176u;
+        case QW36_DTYPE_Q5K_AFFINE32: return (numel / 256u) * 192u;
         case QW36_DTYPE_Q6_K: return (numel / 256u) * 210u;
+        case QW36_DTYPE_Q6K_SCALE16: return (numel / 256u) * 224u;
         case QW36_DTYPE_Q8_0: return (numel /  32u) *  34u;
         default: return 0;
     }
@@ -104,7 +106,9 @@ int qw36__dtype_is_native_gpu_quant(qw36_dtype dt) {
      * matmul kernel. CUDA/AMD don't yet, so callers gate on backend name. */
     return dt == QW36_DTYPE_Q4_K || dt == QW36_DTYPE_Q5_K ||
            dt == QW36_DTYPE_Q6_K || dt == QW36_DTYPE_Q8_0 ||
-           dt == QW36_DTYPE_Q4K_AFFINE32;
+           dt == QW36_DTYPE_Q4K_AFFINE32 ||
+           dt == QW36_DTYPE_Q5K_AFFINE32 ||
+           dt == QW36_DTYPE_Q6K_SCALE16;
 }
 
 /* --------------------------------------------------------------------- */
@@ -203,6 +207,45 @@ static uint8_t q4_K_nibble(const uint8_t *block, int sub, int j) {
     return hi ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
 }
 
+static void pack_5bit8(uint8_t *dst, const uint8_t q[8]) {
+    uint64_t bits = 0;
+    for (int i = 0; i < 8; i++)
+        bits |= ((uint64_t)(q[i] & 31u)) << (5 * i);
+    for (int i = 0; i < 5; i++)
+        dst[i] = (uint8_t)((bits >> (8 * i)) & 0xFFu);
+}
+
+static uint8_t unpack_5bit8(const uint8_t *src, int idx) {
+    uint64_t bits = 0;
+    for (int i = 0; i < 5; i++)
+        bits |= ((uint64_t)src[i]) << (8 * i);
+    return (uint8_t)((bits >> (5 * idx)) & 31u);
+}
+
+static void pack_6bit16(uint8_t *dst, const uint8_t q[16]) {
+    memset(dst, 0, 12);
+    for (int i = 0; i < 16; i++) {
+        uint16_t v = (uint16_t)(q[i] & 63u);
+        int bit = 6 * i;
+        int byte = bit >> 3;
+        int shift = bit & 7;
+        uint16_t x = (uint16_t)(v << shift);
+        dst[byte] |= (uint8_t)(x & 0xFFu);
+        if (byte + 1 < 12)
+            dst[byte + 1] |= (uint8_t)(x >> 8);
+    }
+}
+
+static uint8_t unpack_6bit16(const uint8_t *src, int idx) {
+    int bit = 6 * idx;
+    int byte = bit >> 3;
+    int shift = bit & 7;
+    uint16_t x = (uint16_t)src[byte];
+    if (byte + 1 < 12)
+        x |= (uint16_t)src[byte + 1] << 8;
+    return (uint8_t)((x >> shift) & 63u);
+}
+
 int qw36__repack_q4k_affine32(const qw36_lazy_w *w, void *dst_void) {
     if (!w || !dst_void || w->dtype != QW36_DTYPE_Q4_K ||
         !w->cols || (w->cols % QW36_QK_K) != 0)
@@ -241,6 +284,161 @@ int qw36__repack_q4k_affine32(const qw36_lazy_w *w, void *dst_void) {
                     uint8_t q1 = q4_K_nibble(b, sub, j * 2 + 1);
                     qg[j] = (uint8_t)(q0 | (q1 << 4));
                 }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Q5K_AFFINE32: internal runtime layout produced from GGUF Q5_K.
+ * Per 256-element block:
+ *   fp16 scale[8]      (16B)  scale = d * sc[sub]
+ *   fp16 bias[8]       (16B)  bias  = -dmin * mn[sub]
+ *   u8 q[8][20]       (160B)  each 32-element sub-block packed 5-bit
+ * Total: 192 bytes. */
+static void dq_q5k_affine32(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 192;
+        const uint16_t *scales = (const uint16_t *)b;
+        const uint16_t *biases = (const uint16_t *)(b + 16);
+        const uint8_t *qs = b + 32;
+        for (int sub = 0; sub < 8; sub++) {
+            const float scale = f16_to_f32(scales[sub]);
+            const float bias = f16_to_f32(biases[sub]);
+            const uint8_t *qg = qs + sub * 20;
+            for (int p = 0; p < 4; p++) {
+                const uint8_t *pack = qg + p * 5;
+                for (int j = 0; j < 8; j++)
+                    *out++ = scale * (float)unpack_5bit8(pack, j) + bias;
+            }
+        }
+    }
+}
+
+static uint8_t q5_K_quant(const uint8_t *block, int sub, int j) {
+    const uint8_t *qh = block + 16;
+    const uint8_t *ql = block + 48;
+    int iter = sub >> 1;
+    int hi_nibble = sub & 1;
+    uint8_t byte = ql[iter * 32 + j];
+    uint8_t lo = hi_nibble ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
+    uint8_t hi = (uint8_t)((qh[j] >> sub) & 1u);
+    return (uint8_t)(lo | (hi << 4));
+}
+
+int qw36__repack_q5k_affine32(const qw36_lazy_w *w, void *dst_void) {
+    if (!w || !dst_void || w->dtype != QW36_DTYPE_Q5_K ||
+        !w->cols || (w->cols % QW36_QK_K) != 0)
+        return -1;
+    const size_t rows = (size_t)w->rows * (w->n_extra ? (size_t)w->n_extra : 1u);
+    const size_t blocks_per_row = (size_t)w->cols / QW36_QK_K;
+    const uint8_t *src = (const uint8_t *)w->data;
+    uint8_t *dst = (uint8_t *)dst_void;
+    const size_t src_row_bytes = blocks_per_row * 176u;
+    const size_t dst_row_bytes = blocks_per_row * 192u;
+
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t *src_row = src + r * src_row_bytes;
+        uint8_t *dst_row = dst + r * dst_row_bytes;
+        for (size_t bi = 0; bi < blocks_per_row; bi++) {
+            const uint8_t *b = src_row + bi * 176u;
+            uint8_t *o = dst_row + bi * 192u;
+            uint16_t dh, dmh;
+            memcpy(&dh,  b,     2);
+            memcpy(&dmh, b + 2, 2);
+            const float d = f16_to_f32(dh);
+            const float dmin = f16_to_f32(dmh);
+            const uint8_t *packed_scales = b + 4;
+            uint16_t *out_scales = (uint16_t *)o;
+            uint16_t *out_biases = (uint16_t *)(o + 16);
+            uint8_t *out_q = o + 32;
+
+            for (int sub = 0; sub < 8; sub++) {
+                uint8_t sc, mn;
+                q4_K_get_scale_min(sub, packed_scales, &sc, &mn);
+                out_scales[sub] = qw36__f32_to_f16(d * (float)sc);
+                out_biases[sub] = qw36__f32_to_f16(-dmin * (float)mn);
+                uint8_t *qg = out_q + sub * 20;
+                for (int p = 0; p < 4; p++) {
+                    uint8_t q[8];
+                    for (int j = 0; j < 8; j++)
+                        q[j] = q5_K_quant(b, sub, p * 8 + j);
+                    pack_5bit8(qg + p * 5, q);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* Q6K_SCALE16: internal runtime layout produced from GGUF Q6_K.
+ * Per 256-element block:
+ *   fp16 scale[16]    (32B)  scale = d * int8_sc[group]
+ *   u8 q[16][12]     (192B)  each 16-element scale group packed 6-bit
+ * Total: 224 bytes. */
+static void dq_q6k_scale16(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 224;
+        const uint16_t *scales = (const uint16_t *)b;
+        const uint8_t *qs = b + 32;
+        for (int group = 0; group < 16; group++) {
+            const float scale = f16_to_f32(scales[group]);
+            const uint8_t *qg = qs + group * 12;
+            for (int j = 0; j < 16; j++)
+                *out++ = scale * ((float)unpack_6bit16(qg, j) - 32.0f);
+        }
+    }
+}
+
+static uint8_t q6_K_quant(const uint8_t *block, int local) {
+    const uint8_t *ql_all = block;
+    const uint8_t *qh_all = block + 128;
+    int half = local >> 7;
+    int rem = local & 127;
+    int lane = rem & 31;
+    const uint8_t *ql = ql_all + half * 64;
+    const uint8_t *qh = qh_all + half * 32;
+    if (rem < 32)
+        return (uint8_t)((ql[lane] & 0x0F) | ((qh[lane] & 0x03) << 4));
+    if (rem < 64)
+        return (uint8_t)((ql[lane + 32] & 0x0F) | (((qh[lane] >> 2) & 0x03) << 4));
+    if (rem < 96)
+        return (uint8_t)((ql[lane] >> 4) | (((qh[lane] >> 4) & 0x03) << 4));
+    return (uint8_t)((ql[lane + 32] >> 4) | (((qh[lane] >> 6) & 0x03) << 4));
+}
+
+int qw36__repack_q6k_scale16(const qw36_lazy_w *w, void *dst_void) {
+    if (!w || !dst_void || w->dtype != QW36_DTYPE_Q6_K ||
+        !w->cols || (w->cols % QW36_QK_K) != 0)
+        return -1;
+    const size_t rows = (size_t)w->rows * (w->n_extra ? (size_t)w->n_extra : 1u);
+    const size_t blocks_per_row = (size_t)w->cols / QW36_QK_K;
+    const uint8_t *src = (const uint8_t *)w->data;
+    uint8_t *dst = (uint8_t *)dst_void;
+    const size_t src_row_bytes = blocks_per_row * 210u;
+    const size_t dst_row_bytes = blocks_per_row * 224u;
+
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t *src_row = src + r * src_row_bytes;
+        uint8_t *dst_row = dst + r * dst_row_bytes;
+        for (size_t bi = 0; bi < blocks_per_row; bi++) {
+            const uint8_t *b = src_row + bi * 210u;
+            uint8_t *o = dst_row + bi * 224u;
+            uint16_t dh;
+            memcpy(&dh, b + 208, 2);
+            const float d = f16_to_f32(dh);
+            const int8_t *src_scales = (const int8_t *)(b + 192);
+            uint16_t *out_scales = (uint16_t *)o;
+            uint8_t *out_q = o + 32;
+
+            for (int group = 0; group < 16; group++) {
+                out_scales[group] = qw36__f32_to_f16(d * (float)src_scales[group]);
+                uint8_t q[16];
+                for (int j = 0; j < 16; j++)
+                    q[j] = q6_K_quant(b, group * 16 + j);
+                pack_6bit16(out_q + group * 12, q);
             }
         }
     }
@@ -439,8 +637,14 @@ float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n) {
         case QW36_DTYPE_Q5_K:
             dq_q5_K((const uint8_t *)data, out, n);
             return out;
+        case QW36_DTYPE_Q5K_AFFINE32:
+            dq_q5k_affine32((const uint8_t *)data, out, n);
+            return out;
         case QW36_DTYPE_Q6_K:
             dq_q6_K((const uint8_t *)data, out, n);
+            return out;
+        case QW36_DTYPE_Q6K_SCALE16:
+            dq_q6k_scale16((const uint8_t *)data, out, n);
             return out;
         default:
             free(out);
@@ -459,7 +663,9 @@ int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
         case QW36_DTYPE_Q4K_AFFINE32: *qk = 256; *bytes_per_block = 160; return 0;
         case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
+        case QW36_DTYPE_Q5K_AFFINE32: *qk = 256; *bytes_per_block = 192; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
+        case QW36_DTYPE_Q6K_SCALE16: *qk = 256; *bytes_per_block = 224; return 0;
         case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
         default: *qk = 0; *bytes_per_block = 0; return -1;
     }
@@ -499,7 +705,9 @@ int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
         case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
         case QW36_DTYPE_Q4K_AFFINE32: dq_q4k_affine32(row, out, cols); return 0;
         case QW36_DTYPE_Q5_K: dq_q5_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q5K_AFFINE32: dq_q5k_affine32(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q6K_SCALE16: dq_q6k_scale16(row, out, cols); return 0;
         case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
         default: return -1;
     }
