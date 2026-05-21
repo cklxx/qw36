@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "host": "apple_m_class_unified_memory",
+  "model": "Qwen3.5-0.8B-Q4_K_M.gguf",
+  "comment": [
+    "Baselines for tests/perf_gate.sh. 5-run median wallclock decode tok/s.",
+    "Measured at uptime 1-min load < 3. CI runners get a slack multiplier",
+    "via PERF_GATE_TOLERANCE_PCT (default 5; CI bumps it to 10) so noise",
+    "doesn't bounce PRs. Refresh this file (with bench data in the commit)",
+    "when a real perf win lands; don't refresh it to mask a regression.",
+    "Profiles tested: fp16 (QW36_METAL_FP16_WEIGHTS), fast (--fast), quant",
+    "(QW36_METAL_QUANT_GPU). Short prompt 'Hello' n=64. The long-prompt",
+    "n=1024 cell uses tests/compare_mlx.sh's 'long' essay prompt.",
+    "Numbers from commit 27f64ec on 2026-05-21 (load 3.0)."
+  ],
+  "cells": [
+    { "profile": "fp16",  "prompt": "Hello",  "n":   64, "tok_per_s": 119.0 },
+    { "profile": "fp16",  "prompt": "Hello",  "n":  256, "tok_per_s": 103.0 },
+    { "profile": "fast",  "prompt": "Hello",  "n":   64, "tok_per_s": 204.0 },
+    { "profile": "fast",  "prompt": "Hello",  "n":  256, "tok_per_s": 176.0 },
+    { "profile": "fast",  "prompt": "essay",  "n": 1024, "tok_per_s": 100.0 },
+    { "profile": "fast",  "prompt": "essay",  "n": 2048, "tok_per_s":  92.0 },
+    { "profile": "quant", "prompt": "Hello",  "n":   64, "tok_per_s":  85.0 }
+  ]
+}

@@ -66,6 +66,7 @@ check: cpu
 	@if [ -x ./qw36_metal ] || [ "$$(uname)" = "Darwin" ]; then \
 	    $(MAKE) metal && tests/quant_fastest_smoke.sh || true; \
 	fi
+	tests/cli_smoke.sh
 	tests/kvcache_smoke.sh
 
 # Full perf bench. Slower; intended for "I think this is ready to land".

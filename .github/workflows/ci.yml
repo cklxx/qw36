@@ -120,6 +120,8 @@ jobs:
         run: make asan
       - name: Build UBSAN
         run: make ubsan
+      - name: CLI smoke (uses CPU build, exercises --doctor / --print-config)
+        run: tests/cli_smoke.sh
       - name: kvcache smoke (uses CPU build, exercises the new code)
         run: tests/kvcache_smoke.sh
       - name: Sanitizer smoke run
