@@ -2,14 +2,14 @@
 
 ## TL;DR
 
-Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **208 tok/s peak
-short / 176 tok/s sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal under
-`QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1 QW36_METAL_QUANT_GPU_LM_HEAD=1`
-(vs llama.cpp 170 tok/s reference, MLX 244 tok/s reference). This fastest
-path is opt-in and smoke-gated by `tests/quant_fastest_smoke.sh`, not fp32
-bit-equal. Hit the 200 tok/s target. The fp16 MPS path tops out at 119/103
-tok/s — quant-path wins because we halve bandwidth via affine repack on layers
-AND lm_head.
+Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **~204 tok/s short
+/ 176 tok/s sustained / 92 tok/s at n=2048** on Qwen3.5-0.8B-Q4_K_M via Metal
+under `QW36_METAL_QUANT_GPU=1 QW36_METAL_FAST=1` (vs llama.cpp 170 tok/s
+reference, MLX 244 tok/s reference, ~84% of MLX). The fastest path is opt-in
+and smoke-gated by `tests/quant_fastest_smoke.sh`, not fp32 bit-equal. Past
+the 200 tok/s target. The fp16 MPS path tops out at 119/103 tok/s — quant-
+path wins because we halve bandwidth via affine repack on layers AND lm_head,
+and the MLX-style Q6K qdot saves another 3-4% over the bit-shift unpack.
 CPU baseline 1.7 tok/s.
 
 ## Decode throughput ladder (Metal, M-class GPU, Qwen3.5-0.8B-Q4_K_M)
@@ -40,7 +40,8 @@ CPU baseline 1.7 tok/s.
 | 766b7c0 + 90b1377  | 85 (opt-in) | Q4K → affine32 repack + qmv_fast kernel (Q4K only; still under fp16) |
 | 8d45cca + b5e0ecb  | **161 (opt-in)** | + Q5K → affine32 repack (gate_up is Q5K — dominant matmul class) |
 | b5e0ecb (triple)   | **170 short / 139 sustained** | + Q6K → scale16 (qkv = Q6K). Triple-affine through fp16 ceiling |
-| 743a158 (triple + lm_head) | **208 peak / 185 avg short / 176 sustained** | **+ lm_head Q6K_SCALE16 (decouple tied embed alias). 200 tok/s target hit.** |
+| 743a158 (triple + lm_head) | **208 peak / 185 avg short / 176 sustained** | + lm_head Q6K_SCALE16 (decouple tied embed alias). 200 tok/s target hit. |
+| 2464023 (Q6K_MLX default) | **~204 stable short / 176 sustained / 92 at n=2048** | + MLX bit-trick qdot for Q6K (lm_head + ffn_down). +3-4% short, +6% at n=2048 |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -108,22 +109,26 @@ Correctness gate:
 ./tests/quant_fastest_smoke.sh <gguf>
 ```
 
-**Long-context scaling (full quant + lm_head Q6K + fp16 KV):**
+**Long-context scaling (full FAST=1 path, Q6K_MLX default-on):**
 
-| n | tok/s before | tok/s after fp16 KV | ms/token |
-|---|------:|------:|---------:|
-| 64 | 185 | 194 | 5.2 |
-| 256 | 176 | 168 | 6.0 |
-| 512 | 138 | 148 | 6.8 |
-| 1024 | 111 | 121 | 8.3 |
-| 2048 | 68.6 | 87.3 | 11.5 |
+| n | initial | after fp16 KV | after Q6K_MLX | ms/token |
+|---|------:|------:|------:|---------:|
+| 64   | 185 | 194 | 203 | 4.9 |
+| 256  | 176 | 168 | 176 | 5.7 |
+| 512  | 138 | 148 | 155 | 6.5 |
+| 1024 | 111 | 121 | 126 | 7.9 |
+| 2048 | 68.6 | 87.3 | **92.5** | 10.8 |
 
-The fp16 KV fix (commit 6619ac8) unblocked the f16kv attention kernel under
-the quant path (was previously gated only on fp16-weights env). Long-context
-attention bandwidth halves so n=2048 jumped +27%. Short-context is
-matmul-bound so the gain is small there. Attention is still O(seq) — for
-much longer contexts a flash-attention-style streaming pass would be the
-next lever.
+Three compound levers got us here:
+1. fp16 KV under quant_gpu (commit 6619ac8) — halves attention bandwidth
+   at long context. n=2048 +27%.
+2. lm_head Q6K_SCALE16 (commit 743a158) — 3-4ms/token saved across all
+   contexts.
+3. MLX Q6K qdot (commit 7550375 + default-on 2464023) — adds +3-4% short
+   and +6% at n=2048 (lm_head fraction grows at long context).
+
+Attention is still O(seq). Flash-attention-style streaming pass is the next
+lever for n >= 2048.
 
 ## Coverage
 
