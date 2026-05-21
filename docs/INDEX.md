@@ -31,6 +31,8 @@ future contributors.
 | [`q4k_qmv_quad_design.md`](q4k_qmv_quad_design.md) | early qmv_quad-style Q4_K design notes (predecessor to v2) |
 | [`q4k_kernel_research_task.md`](q4k_kernel_research_task.md) | research brief that triggered task R |
 | [`quant_matmul_research_brief.md`](quant_matmul_research_brief.md) | how qw36 reasons about quant matmul performance |
+| [`llamacpp_metal_research.md`](llamacpp_metal_research.md) | how llama.cpp's Metal backend gets decent perf from GGUF K-quants without repacking — 6 GEMV tricks, mul_mv_ext small-batch, FA-with-quant-KV, mul_mv_id MoE |
+| [`mlx_metal_research.md`](mlx_metal_research.md) | how MLX hits 244 tok/s — qmv_quad (4-lane) + qmv_fast + qmm_splitk three-tier GEMV, NAX tensor cores, sdpa_vector 1024-thread decode, gather_qmm MoE; three-way comparison vs llama.cpp + qw36 |
 
 ## Reference (`docs/`)
 
