@@ -1,12 +1,26 @@
-/* qw36_kvcache.h — KV prefix cache (L1/L2/L3) public API.
+/* qw36_kvcache.h — KV prefix cache, tiered + backend-agnostic.
  *
- * Single-stream prefix reuse: when a new request shares a leading token
- * sequence with a recent one, the engine can rehydrate the cached
- * per-layer KV / conv_state / delta_state and skip prefill for that
- * region. See docs/kvcache_design.md.
+ * The cache is an **ordered list of tiers** (hottest first). Each tier
+ * implements a small `qw36_kv_tier_ops` vtable: get / put / evict /
+ * stats / destroy. The cache loop is generic — lookup walks tiers
+ * top-down with promotion, insert writes the hot tier, eviction
+ * demotes to the next tier — so adding a new storage medium (CUDA
+ * VRAM, RDMA / shared / network) is a matter of writing one new tier,
+ * not changing the cache. See docs/kvcache_design.md.
  *
- * v0: L2 in-RAM LRU, L3 on-disk persistence, exact-prefix match only.
- * Engine wiring lives elsewhere; this header is the stable contract. */
+ * Concrete tiers shipped here:
+ *   - qw36_kv_tier_ram_lru: in-process RAM, LRU with byte budget.
+ *   - qw36_kv_tier_disk:    on-disk store, one file per prefix hash,
+ *                           bounded by a per-machine byte budget.
+ *
+ * Mac unified memory naturally uses (ram_lru, disk). Discrete-GPU
+ * platforms can prepend a VRAM tier so the hot path doesn't pay an
+ * upload on hit. The cache treats every tier identically; only the
+ * tier implementation knows about its medium.
+ *
+ * v0 is exact-prefix match only; future versions may share storage
+ * across overlapping prefixes (radix). The tier vtable is stable
+ * across that change. */
 #ifndef QW36_KVCACHE_H
 #define QW36_KVCACHE_H
 
@@ -17,63 +31,132 @@
 extern "C" {
 #endif
 
-typedef struct qw36_state qw36_state;       /* fwd-decl from qw36.h */
+typedef struct qw36_state qw36_state;          /* fwd-decl from qw36.h */
 typedef struct qw36_kv_prefix_cache qw36_kv_prefix_cache;
+typedef struct qw36_kv_tier         qw36_kv_tier;
+
+/* ---------------------------------------------------------------- */
+/* Tier vtable — every storage medium implements this.              */
+/* ---------------------------------------------------------------- */
+
+typedef struct qw36_kv_tier_ops {
+    /* Stable label for stats / logs. Static lifetime. */
+    const char *name;
+
+    /* Lookup: 0 on miss, 1 on hit. On hit, *out_buf / *out_bytes
+     * point to a buffer the tier owns until the next get/put call
+     * (lifetime is conservative — the cache copies bytes before
+     * touching the tier again). Token vector is supplied so the
+     * tier can disambiguate hash collisions. */
+    int  (*get)(qw36_kv_tier *t, uint64_t key,
+                const uint32_t *tokens, uint32_t n_tokens,
+                const void **out_buf, size_t *out_bytes);
+
+    /* Insert: 0 on success. The tier copies the bytes; the caller
+     * keeps ownership of `buf`. May internally evict to make space.
+     * Tiers that don't accept inserts (e.g. read-only mirrors) may
+     * return >0 to signal "ignored, not an error". */
+    int  (*put)(qw36_kv_tier *t, uint64_t key,
+                const uint32_t *tokens, uint32_t n_tokens,
+                const void *buf, size_t bytes);
+
+    /* Total bytes resident in this tier (advisory; for cap checks). */
+    size_t (*used_bytes)(const qw36_kv_tier *t);
+
+    /* Capacity. SIZE_MAX = unbounded (e.g. disk). */
+    size_t (*capacity_bytes)(const qw36_kv_tier *t);
+
+    /* Forget everything in this tier (does not delete external files
+     * unless the tier explicitly opts in). */
+    void (*clear)(qw36_kv_tier *t);
+
+    /* Free per-tier state. */
+    void (*destroy)(qw36_kv_tier *t);
+} qw36_kv_tier_ops;
+
+struct qw36_kv_tier {
+    const qw36_kv_tier_ops *ops;
+    void                   *state;   /* tier-private */
+};
+
+/* ---------------------------------------------------------------- */
+/* Concrete tiers.                                                  */
+/* ---------------------------------------------------------------- */
+
+/* In-process RAM LRU. capacity_bytes=0 disables. */
+qw36_kv_tier *qw36_kv_tier_ram_lru_create(size_t capacity_bytes);
+
+/* On-disk store. One file per prefix hash under `dir`, file name
+ * `qw36_kv_<hex>.bin`. capacity_bytes=0 disables (still readable if
+ * dir non-empty? No — disabled means tier rejects all gets too).
+ * `dir` is duplicated internally; callers may free their copy. */
+qw36_kv_tier *qw36_kv_tier_disk_create(const char *dir,
+                                       size_t capacity_bytes);
+
+/* ---------------------------------------------------------------- */
+/* Cache — composes tiers, hot first.                               */
+/* ---------------------------------------------------------------- */
 
 typedef struct {
-    /* Maximum bytes the in-RAM LRU is allowed to keep. 0 disables L2. */
-    size_t l2_capacity_bytes;
-    /* Filesystem directory for L3. NULL or "" disables L3. The
-     * directory is created on demand; one file per prefix hash. */
-    const char *l3_dir;
-    /* Maximum disk bytes for L3. 0 = unlimited, the file system caps. */
-    size_t l3_capacity_bytes;
-    /* Minimum prefix length (in tokens) to bother caching at all.
-     * Short prefixes are cheap to recompute; caching them wastes the
-     * cache for longer high-value prefixes. Default 32. */
+    /* Minimum prefix length (in tokens) to bother caching. Short
+     * prefixes are cheap to recompute. Default 32. */
     uint32_t min_prefix_tokens;
+    /* On evict-from-tier-i, write back to tier-(i+1)? Default 1.
+     * Set 0 if downstream tiers should be strictly explicit. */
+    uint8_t  writeback_on_evict;
 } qw36_kv_cache_cfg;
 
 typedef struct {
     uint64_t lookups;
-    uint64_t l2_hits;
-    uint64_t l3_hits;
+    uint64_t hits_by_tier[8];      /* up to 8 tiers; tier 0 = hottest */
     uint64_t misses;
     uint64_t inserts;
-    uint64_t l2_evictions;
-    uint64_t l3_writebacks;
-    size_t   l2_bytes_used;
-    size_t   l3_bytes_used;
-    size_t   entries;
+    uint64_t writebacks;
+    uint64_t promotions;
+    size_t   bytes_by_tier[8];
+    uint32_t n_tiers;
 } qw36_kv_cache_stats_t;
 
-/* Create a cache. Returns NULL on alloc failure or bad config. */
-qw36_kv_prefix_cache *qw36_kv_cache_create(const qw36_kv_cache_cfg *cfg);
+/* Construct a cache from a left-to-right ordered tier list (hot first).
+ * The cache takes ownership of the tier pointers and will destroy them
+ * with the cache. Pass at most 8 tiers (v0 limit; bump if needed). */
+qw36_kv_prefix_cache *qw36_kv_cache_create(qw36_kv_tier **tiers,
+                                           uint32_t n_tiers,
+                                           const qw36_kv_cache_cfg *cfg);
+
+/* Convenience: the Mac-typical (ram_lru, disk) duo. Either capacity
+ * 0 omits that tier. Returns NULL if both are 0. */
+qw36_kv_prefix_cache *qw36_kv_cache_create_default(size_t l2_ram_bytes,
+                                                   const char *l3_disk_dir,
+                                                   size_t l3_disk_bytes,
+                                                   const qw36_kv_cache_cfg *cfg);
+
 void                  qw36_kv_cache_destroy(qw36_kv_prefix_cache *c);
 
-/* Look up the longest cached prefix of `tokens` and rehydrate `dst`
- * up to that position. Returns the number of tokens hydrated (0 on
- * miss, no side effect on dst). The engine should set st->seq_pos to
- * the returned value after a successful hydrate.
- *
- * `dst` must already be allocated by the engine with capacity ≥ matched
- * prefix length; otherwise the hydrate aborts and returns 0. */
+/* Longest-prefix lookup. Returns matched prefix length (0 on miss).
+ * On hit the matching tier's payload is the cache's working buffer
+ * (caller-owned read; copy before next cache call if needed beyond
+ * one operation). Promotes the hit into all hotter tiers. */
 size_t qw36_kv_cache_lookup(qw36_kv_prefix_cache *c,
                             const uint32_t *tokens, size_t n_tokens,
-                            qw36_state *dst);
+                            const void **out_buf, size_t *out_bytes);
 
-/* Snapshot the in-flight state at exactly `n_tokens` written. Idempotent
- * — re-insert on an existing key is a no-op. */
+/* Insert into the hot tier. The cache duplicates the buffer; the
+ * caller keeps ownership. Eviction cascades to colder tiers when
+ * writeback_on_evict is set. */
 int qw36_kv_cache_insert(qw36_kv_prefix_cache *c,
                          const uint32_t *tokens, size_t n_tokens,
-                         const qw36_state *src);
+                         const void *buf, size_t bytes);
 
-/* Stats are advisory; cache stays consistent without them being read. */
+void qw36_kv_cache_clear(qw36_kv_prefix_cache *c);
 void qw36_kv_cache_stats(const qw36_kv_prefix_cache *c,
                          qw36_kv_cache_stats_t *out);
 
-/* Forget everything (does not delete L3 files). Useful for tests. */
-void qw36_kv_cache_clear(qw36_kv_prefix_cache *c);
+/* ---------------------------------------------------------------- */
+/* Engine glue (separate file): qw36_kv_state_snapshot /            */
+/* qw36_kv_state_hydrate live alongside qw36_state because they     */
+/* depend on its internals. The cache only stores opaque blobs.     */
+/* ---------------------------------------------------------------- */
 
 #ifdef __cplusplus
 }

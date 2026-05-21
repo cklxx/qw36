@@ -1,112 +1,154 @@
-# KV prefix cache — L1 / L2 / L3 design
+# KV prefix cache — tier-composing design
 
-Goal: reuse the per-layer KV/conv/delta state across requests whose
-prompts share a leading token sequence. Typical wins are large for
-serving (system prompts, few-shot prefixes) and visible for the
-interactive CLI when the user repeats a long prefix.
+Goal: reuse the per-layer KV / conv / delta state across requests
+whose prompts share a leading token sequence. The cache is generic
+across backends; only the **storage tiers** differ per platform.
 
-## Tier model
+## Tier-as-strategy model
 
-| tier | scope                                    | persistence            | medium             |
-|------|------------------------------------------|------------------------|--------------------|
-| L1   | the current `qw36_state` for an in-flight session | per-engine, hot | RAM (already exists) |
-| L2   | LRU of recent **completed** sessions' prefixes    | per-engine            | RAM, opt-in        |
-| L3   | shared on-disk store of stable prefixes           | per-machine, restart-survive | disk file       |
-
-L1 is already implemented — it's `qw36_state` mid-forward. L2 and L3
-are the new infrastructure this design doc covers.
-
-We're not trying to reproduce vLLM's `PagedAttention` or SGLang's
-`RadixAttention` here — those are GPU-resident block tables aimed at
-multi-request batching. qw36 is single-stream; the win is **prefix
-reuse across consecutive calls**, not concurrent batching.
-
-## State shape per prefix
-
-For a model with `L` layers, after writing `n` tokens of prefix:
-
-| component         | dtype  | size                                                  | note |
-|-------------------|--------|-------------------------------------------------------|------|
-| `k_cache[l]`      | fp16   | `n * n_kv * head_dim * 2 bytes`                       | vanilla GQA layers only |
-| `v_cache[l]`      | fp16   | `n * n_kv * head_dim * 2 bytes`                       | vanilla GQA layers only |
-| `conv_state[l]`   | fp32   | `(conv_kernel - 1) * conv_dim * 4 bytes`              | DN layers only |
-| `delta_state[l]`  | fp32   | `n_v_heads * key_dim * val_dim * 4 bytes`             | DN layers only |
-| `seq_pos`         | u32    | 4 bytes                                               |   |
-
-For Qwen3.5-0.8B-Q4_K_M (24 layers, ~half DN):
-
-- vanilla K/V: 12 layers × n × 2KB ≈ **24n KB**
-- DN conv: 12 × 3 × 6144 × 4 = 0.9 MB constant
-- DN delta: 12 × 2 × 64 × 4096 × 4 = 25 MB constant
-
-So per-prefix budget is dominated by DN delta (~26 MB constant) plus
-K/V cache that scales 24 KB/token.
-
-For 35B-A3B-Q4_K_XL (40 layers, 10 vanilla / 30 DN):
-
-- vanilla K/V: 10 × n × 2 × 2 × 256 × 2 = **20n KB** (n_kv=2, head_dim=256)
-- DN conv: 30 × 3 × 8192 × 4 = **2.9 MB**
-- DN delta: 30 × 32 × 128 × 128 × 4 = **60 MB**
-
-State per 1024-token prefix on 35B: ~80 MB. A reasonable L2 cap of
-2-4 GB holds 25-50 prefixes; L3 on disk can be much larger.
-
-## API (see `common/qw36_kvcache.h`)
+A `qw36_kv_prefix_cache` is just an **ordered list of tiers**, hottest
+first. Each tier implements `qw36_kv_tier_ops`:
 
 ```c
-typedef struct qw36_kv_prefix_cache qw36_kv_prefix_cache;
-
-qw36_kv_prefix_cache *qw36_kv_cache_create(const qw36_kv_cache_cfg *cfg);
-void                  qw36_kv_cache_destroy(qw36_kv_prefix_cache *c);
-
-/* Look up the longest matching token prefix and rehydrate its state.
- * Returns the matched prefix length (0 if no hit). The engine is
- * responsible for resuming from that position. */
-size_t qw36_kv_cache_lookup(qw36_kv_prefix_cache *c,
-                            const uint32_t *tokens, size_t n_tokens,
-                            qw36_state *dst);
-
-/* Snapshot the current state at `seq_pos` for a given token prefix. */
-int qw36_kv_cache_insert(qw36_kv_prefix_cache *c,
-                         const uint32_t *tokens, size_t n_tokens,
-                         const qw36_state *src);
-
-void qw36_kv_cache_stats(const qw36_kv_prefix_cache *c,
-                         qw36_kv_cache_stats_t *out);
+typedef struct {
+    int  (*get)(...);          /* hit / miss */
+    int  (*put)(...);          /* insert; tier copies bytes */
+    size_t (*used_bytes)(...);
+    size_t (*capacity_bytes)(...);
+    void (*clear)(...);
+    void (*destroy)(...);
+} qw36_kv_tier_ops;
 ```
 
-`qw36_kv_cache_cfg` knobs: `l2_capacity_bytes`, `l3_dir`,
-`l3_capacity_bytes`. Setting either capacity to 0 disables that tier.
+The cache loop is platform-agnostic: lookup walks tiers top-down with
+promotion, insert writes the hot tier with optional writethrough,
+eviction is a tier-internal concern. **Adding a new storage medium is
+one new vtable, zero changes to the cache scheduler.**
 
-## Key choice
+## Per-platform tier stacks
 
-Prefix key = `fnv1a64(tokens[0..n-1])`. Cheap, no allocations, no
-external dep. Collisions are surfaced by storing the full token vector
-alongside the state and verifying it before rehydrate.
+This is what we ship today; the abstraction supports more.
 
-## Eviction policy
+### Mac (Apple Silicon, unified memory) — 2 tiers
 
-LRU within each tier. On L2 miss we check L3 (mmap that file, copy
-into L2). On L2 evict we may write back to L3 if the prefix is large
-enough to be worth re-loading later (threshold env-tunable).
+```
+[ ram_lru ] → [ disk ]
+```
+
+Unified memory means there is no distinct GPU memory tier — buffers
+the engine uploads to MTL go into the same RAM the cache LRU lives
+in. So Mac is naturally 2-tier: in-process LRU + on-disk persistence.
+
+### Discrete GPU (CUDA / HIP, future) — 3 tiers
+
+```
+[ vram_lru ] → [ ram_lru ] → [ disk ]
+```
+
+VRAM is a distinct memory pool; on hit we want the KV state to already
+live there to skip the host→device upload. The same generic cache
+loop applies. The VRAM tier knows how to allocate / free `cudaMalloc`
+buffers; the cache doesn't care.
+
+### Multi-machine / serving (future) — 4 tiers
+
+```
+[ vram_lru ] → [ ram_lru ] → [ disk ] → [ redis | rdma | s3 ]
+```
+
+A shared cold tier lets several inference servers share warm prefixes
+(e.g. system prompts) without each paying the cost once. Same vtable
+contract.
+
+### CPU-only (Linux / minimal Mac) — 2 tiers
+
+```
+[ ram_lru ] → [ disk ]
+```
+
+Identical to Mac. Cache code path is shared.
+
+## Cache loop (the part that's reused across all stacks)
+
+Lookup:
+1. Try longest prefix (`n_tokens`) → shorter (down to `min_prefix_tokens`).
+2. At each length, walk tiers hot→cold.
+3. On hit at tier `i`: promote payload into tiers `0..i-1` (best-effort).
+4. Return matched prefix length + payload.
+
+Insert:
+1. Put into tier `0` (hottest).
+2. If `writeback_on_evict` is set, mirror into colder tiers.
+
+Eviction:
+- Each tier owns its own policy (LRU, FIFO, ARC, …).
+- Future cross-tier writeback on evict is a tier-internal call; the
+  cache loop doesn't get involved.
+
+## Why composition over inheritance
+
+The earlier draft hard-coded L1/L2/L3 enums and rolled disk into the
+cache struct. That made adding a 4th tier (VRAM) a cache-wide change.
+The strategy split lets us:
+
+- Reuse the cache scheduler across all backends.
+- Unit-test each tier in isolation.
+- Swap tiers per environment (single binary, multiple storage stacks).
+- Add VRAM / network tiers without touching scheduler invariants.
+
+## State shape per prefix (engine-side, not cache-side)
+
+The cache stores **opaque payload bytes**. The engine encodes its
+`qw36_state` into a blob via `qw36_state_snapshot` (next to
+qw36_state, sees its internals) and decodes via `qw36_state_hydrate`.
+That keeps the cache 100% backend-agnostic.
+
+For 0.8B-Q4_K_M (24 layers, half DN):
+
+| component                   | size                                          |
+|-----------------------------|-----------------------------------------------|
+| vanilla k_cache + v_cache   | 12 × n × n_kv × head_dim × 2 bytes (fp16 KV) |
+| DN conv_state               | 12 × (kernel-1) × conv_dim × 4 bytes (const) |
+| DN delta_state              | 12 × n_v × key_dim × val_dim × 4 bytes (const) |
+| seq_pos                     | 4 bytes                                       |
+
+For 35B-A3B-Q4_K_XL (40 layers, 10 vanilla / 30 DN), per 1024-token
+prefix ≈ 80 MB. A 2 GB RAM LRU holds ~25 prefixes; disk effectively
+unbounded.
 
 ## What this is NOT
 
-- Not a batched-request scheduler. qw36 stays single-stream.
-- Not a GPU-resident table. The state lives in host memory and gets
-  re-uploaded to GPU buffers on rehydrate via the same path as engine
-  init.
-- Not yet PagedAttention. KV is contiguous per-layer; rehydrate is a
-  bulk memcpy, not a page-table lookup.
+- Not vLLM PagedAttention. KV remains contiguous per-layer; rehydrate
+  is a bulk memcpy/upload.
+- Not RadixAttention. v0 is exact-prefix match; radix-sharing is a
+  future evolution and reuses the tier vtable.
+- Not a batched-request scheduler. qw36 stays single-stream; the win
+  is sequential prefix reuse.
+- Not yet engine-wired. The cache stores opaque blobs; the
+  `qw36_state_snapshot` / `_hydrate` helpers that bridge engine state
+  ↔ blob are the next task on top of this skeleton.
 
-## Out of scope (v0)
+## File format (disk tier)
 
-- Token-stream-prefix matching with branching (a la RadixAttention).
-  v0 only supports exact prefix match.
-- Cross-engine shared cache (would need a network layer or a daemon).
+Single shot per prefix hash, little-endian on this host. Cross-machine
+sharing would add an endian flag; v0 doesn't claim it.
+
+```
+uint32  magic    = 0x57515646 ('KVQW')
+uint32  version  = 1
+uint32  n_tokens
+uint32  reserved
+uint64  payload_bytes
+uint32  tokens[n_tokens]
+uint8   payload[payload_bytes]
+```
+
+Filename: `qw36_kv_<hex16>.bin` where the hex is `fnv1a64(tokens)`.
 
 ## Tracking
 
-- Task #75 (AD): infrastructure with L1 conceptual / L2 in-RAM LRU /
-  L3 disk skeleton. Engine wiring deferred until codex's 35B Metal
-  work in `common/qw36.c` finishes to avoid conflicts.
+- Task #75 (AD): tier abstraction + ram_lru + disk tiers + cache loop.
+- Engine integration (snapshot/hydrate hooks in `qw36_prefill` /
+  `qw36_forward`): next task after codex's 35B Metal commits land.
+- Future tier ctors (CUDA VRAM, Redis, S3) plug into the same vtable
+  — they're independent work units that don't touch the cache.
