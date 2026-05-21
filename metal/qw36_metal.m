@@ -38,6 +38,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> f16_to_f32;
     id<MTLComputePipelineState> silu_mul;
     id<MTLComputePipelineState> moe_route;
+    id<MTLComputePipelineState> moe_route_tg;
     id<MTLComputePipelineState> moe_gate_up;
     id<MTLComputePipelineState> moe_down_combine;
     id<MTLComputePipelineState> moe_scale_add;
@@ -765,6 +766,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->f16_to_f32       = metal_make_pipeline(ctx, @"qw36_f16_to_f32_f32", err, err_cap);
     ctx->silu_mul         = metal_make_pipeline(ctx, @"qw36_silu_mul_f32", err, err_cap);
     ctx->moe_route        = metal_make_pipeline(ctx, @"qw36_moe_route_f32", err, err_cap);
+    ctx->moe_route_tg     = metal_make_pipeline(ctx, @"qw36_moe_route_tg_f32", err, err_cap);
     ctx->moe_gate_up      = metal_make_pipeline(ctx, @"qw36_moe_gate_up_f32", err, err_cap);
     ctx->moe_down_combine = metal_make_pipeline(ctx, @"qw36_moe_down_combine_f32", err, err_cap);
     ctx->moe_scale_add    = metal_make_pipeline(ctx, @"qw36_moe_scale_add_f32", err, err_cap);
@@ -805,7 +807,8 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
 
     if (!ctx->rmsnorm || !ctx->matmul || !ctx->f32_to_f16 ||
         !ctx->f16_to_f32 || !ctx->silu_mul ||
-        !ctx->moe_route || !ctx->moe_gate_up || !ctx->moe_down_combine ||
+        !ctx->moe_route || !ctx->moe_route_tg ||
+        !ctx->moe_gate_up || !ctx->moe_down_combine ||
         !ctx->moe_scale_add ||
         !ctx->dn_conv1d_silu || !ctx->dn_gated_delta ||
         !ctx->dn_prep_gdr || !ctx->dn_prep_gdr_conv1d ||
@@ -845,6 +848,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->moe_down_combine = nil;
         ctx->moe_scale_add = nil;
         ctx->moe_gate_up = nil;
+        ctx->moe_route_tg = nil;
         ctx->moe_route = nil;
         ctx->silu_mul = nil;
         ctx->f16_to_f32 = nil;
@@ -928,6 +932,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->moe_down_combine = nil;
     ctx->moe_scale_add = nil;
     ctx->moe_gate_up = nil;
+    ctx->moe_route_tg = nil;
     ctx->moe_route = nil;
     ctx->silu_mul = nil;
     ctx->f16_to_f32 = nil;
@@ -1741,12 +1746,32 @@ static void metal_attention(qw36_gpu_ctx *ctx,
                  wv->dtype == QW36_DTYPE_Q6_K ||
                  wv->dtype == QW36_DTYPE_Q6K_SCALE16 ||
                  wv->dtype == QW36_DTYPE_Q8_0);
-    static int kv_transposed_env_cached = -1;
-    if (kv_transposed_env_cached < 0) {
+    /* QW36_METAL_KV_TRANSPOSED tri-state:
+     *   unset / "auto"          → flip on when seq_capacity > 512
+     *   "0" / "off" / "false"   → always legacy [t][head][dim]
+     *   anything else           → always transposed [head][dim][t]
+     *
+     * Auto threshold matches the bench in commit b4bb6f6: transposed wins
+     * +24% at n=2048 and +15% at n=1024 but regresses 10% at n=64. The
+     * seq_capacity == 512 boundary is the breakeven on this host —
+     * sessions sized for long context get the long-context optimisation
+     * by default, short interactive sessions keep the cheap write path. */
+    enum { KV_AUTO = -1, KV_OFF = 0, KV_ON = 1 };
+    static int kv_transposed_mode_cached = -2;
+    if (kv_transposed_mode_cached == -2) {
         const char *e = getenv("QW36_METAL_KV_TRANSPOSED");
-        kv_transposed_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+        if (!e || !*e || strcasecmp(e, "auto") == 0) {
+            kv_transposed_mode_cached = KV_AUTO;
+        } else if (strcasecmp(e, "0") == 0 || strcasecmp(e, "off") == 0 ||
+                   strcasecmp(e, "false") == 0) {
+            kv_transposed_mode_cached = KV_OFF;
+        } else {
+            kv_transposed_mode_cached = KV_ON;
+        }
     }
-    uint32_t kv_transposed = kv_transposed_env_cached ? 1u : 0u;
+    uint32_t kv_transposed = (kv_transposed_mode_cached == KV_ON) ? 1u :
+                              (kv_transposed_mode_cached == KV_OFF) ? 0u :
+                              (seq_capacity > 512u) ? 1u : 0u;
     if (wq_ok && wk_ok && wv_ok &&
         tg_size <= 256 &&
         tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
@@ -2318,13 +2343,39 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
     if (!r || !p || !idx || !act) return;
 
     if (metal_matmul(ctx, r, x, router, 1, num_experts, hidden)) return;
-    metal_dispatch_1d(ctx, ctx->moe_route, 1, ^(id<MTLComputeCommandEncoder> enc) {
+    if (ctx->moe_route_tg && num_experts <= 256u) {
+        uint32_t tg_size = 256u;
+        double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+        int owns_cb = 0;
+        id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+        id<MTLComputeCommandEncoder> enc =
+            metal_compute_encoder_for_op(ctx, cb, owns_cb);
+        [enc setComputePipelineState:ctx->moe_route_tg];
         [enc setBuffer:r->mtl   offset:0 atIndex:0];
         [enc setBuffer:p->mtl   offset:0 atIndex:1];
         [enc setBuffer:idx->mtl offset:0 atIndex:2];
         [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
         [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
-    });
+        [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:5];
+        [enc setThreadgroupMemoryLength:(NSUInteger)tg_size * sizeof(float)
+                                atIndex:0];
+        [enc setThreadgroupMemoryLength:(NSUInteger)(tg_size + experts_per_tok) *
+                                         sizeof(uint32_t)
+                                atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        metal_finish_compute_encoder(ctx, enc, owns_cb);
+        metal_commit_wait_profile(ctx, cb, owns_cb,
+                                  @"qw36_moe_route_tg_f32", start_us);
+    } else {
+        metal_dispatch_1d(ctx, ctx->moe_route, 1, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:r->mtl   offset:0 atIndex:0];
+            [enc setBuffer:p->mtl   offset:0 atIndex:1];
+            [enc setBuffer:idx->mtl offset:0 atIndex:2];
+            [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
+            [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
+        });
+    }
 
     NSUInteger act_n = (NSUInteger)experts_per_tok * inter;
     metal_dispatch_1d(ctx, ctx->moe_gate_up, act_n, ^(id<MTLComputeCommandEncoder> enc) {
