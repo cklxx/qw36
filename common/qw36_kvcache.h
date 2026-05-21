@@ -31,7 +31,9 @@
 extern "C" {
 #endif
 
-typedef struct qw36_state qw36_state;          /* fwd-decl from qw36.h */
+/* qw36_state is defined in qw36.h as an anonymous-struct typedef;
+ * this header stays free of that dependency. The cache only stores
+ * opaque payload bytes; engine glue lives in qw36.c. */
 typedef struct qw36_kv_prefix_cache qw36_kv_prefix_cache;
 typedef struct qw36_kv_tier         qw36_kv_tier;
 

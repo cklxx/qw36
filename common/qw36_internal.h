@@ -60,6 +60,10 @@ struct qw36_engine {
     qw36_gpu_cache_entry *gpu_cache;
     size_t                gpu_cache_n;
     size_t                gpu_cache_cap;
+    /* Optional KV prefix cache (qw36_kv_prefix_cache *). Engine does
+     * NOT own it — caller is responsible for lifetime. NULL means no
+     * cache; qw36_prefill behaves as before. See docs/kvcache_design.md. */
+    void                 *kv_cache;
     char               arch[32];
 };
 

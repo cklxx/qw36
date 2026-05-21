@@ -8,6 +8,7 @@
  */
 
 #include "qw36_internal.h"
+#include "qw36_kvcache.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -1722,14 +1723,52 @@ int qw36_forward(qw36_engine *eng, qw36_state *st, uint32_t token)
 #undef QW36_FORWARD_RETURN
 }
 
+void qw36_engine_attach_kv_cache(qw36_engine *eng,
+                                 struct qw36_kv_prefix_cache *cache)
+{
+    if (eng) eng->kv_cache = cache;
+}
+
+struct qw36_kv_prefix_cache *qw36_engine_kv_cache(const qw36_engine *eng)
+{
+    return eng ? (struct qw36_kv_prefix_cache *)eng->kv_cache : NULL;
+}
+
 int qw36_prefill(qw36_engine *eng, qw36_state *st,
                  const uint32_t *tokens, size_t length)
 {
+    /* KV prefix cache consult (Roadmap 2.1). The lookup walks tier-by-
+     * tier looking for the longest matching prefix. v0 of the engine
+     * wiring: we count the hit but do NOT yet hydrate qw36_state from
+     * the blob — full snapshot/hydrate of per-layer KV / conv / delta
+     * state is the follow-up PR. The lookup counters move so smoke
+     * tests can verify the path is exercised; behaviourally this is
+     * still "miss + full prefill" today. */
+    qw36_kv_prefix_cache *cache = eng ? (qw36_kv_prefix_cache *)eng->kv_cache : NULL;
+    if (cache) {
+        const void *blob = NULL;
+        size_t blob_bytes = 0;
+        size_t matched = qw36_kv_cache_lookup(cache, tokens, length,
+                                              &blob, &blob_bytes);
+        (void)matched; (void)blob; (void)blob_bytes;
+        /* TODO(PR follow-up): if (matched > 0 && qw36_state_hydrate(st, blob, blob_bytes) == 0) {
+         *     start = matched;
+         *     st->seq_pos = matched;
+         * } */
+    }
+
     for (size_t i = 0; i < length; i++) {
         qw36__skip_logits_this_forward = (i + 1 < length);
         int rc = qw36_forward(eng, st, tokens[i]);
         qw36__skip_logits_this_forward = 0;
         if (rc) return rc;
+    }
+
+    /* Post-prefill insert. v0: empty payload — the cache records the
+     * prefix token vector and counter moves, but no engine state is
+     * stored yet. Full state snapshot is the follow-up PR. */
+    if (cache && length) {
+        qw36_kv_cache_insert(cache, tokens, length, NULL, 0);
     }
     return 0;
 }

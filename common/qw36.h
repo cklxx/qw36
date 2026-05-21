@@ -270,6 +270,23 @@ int qw36_prefill(qw36_engine *eng, qw36_state *st,
                  const uint32_t *tokens, size_t length);
 
 /* --------------------------------------------------------------------- */
+/* KV prefix cache attachment (Roadmap 2.1).                              */
+/*                                                                        */
+/* The cache itself lives in common/qw36_kvcache.{h,c} and is              */
+/* backend-agnostic. Attaching one here makes qw36_prefill consult it on  */
+/* entry (lookup) and insert the post-prefill state on exit. The engine   */
+/* does NOT take ownership — caller manages cache lifetime.                */
+/*                                                                        */
+/* v0 wire-up: prefill calls lookup + insert (counters move) but the      */
+/* snapshot/hydrate of qw36_state itself is a follow-up PR. Until then,   */
+/* cache hit counters are advisory.                                        */
+/* --------------------------------------------------------------------- */
+struct qw36_kv_prefix_cache;
+void qw36_engine_attach_kv_cache(qw36_engine *eng,
+                                 struct qw36_kv_prefix_cache *cache);
+struct qw36_kv_prefix_cache *qw36_engine_kv_cache(const qw36_engine *eng);
+
+/* --------------------------------------------------------------------- */
 /* Sampling                                                               */
 /* --------------------------------------------------------------------- */
 
