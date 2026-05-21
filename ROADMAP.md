@@ -1,14 +1,33 @@
 # qw36 — Roadmap
 
-**Snapshot, 2026-05-21.** `--fast` profile delivers **204 tok/s short / 176
-sustained / 92 tok/s @ n=2048** on Qwen3.5-0.8B-Q4_K_M on Apple Silicon
-— **84% of MLX short, 31% of MLX at n=1024 essay**. The fp16 path is
-ceiling-bound; the quant path has two unfinished kernel-level levers
-(flash-attn decode, bf16 KV). 35B-A3B is functional on CPU; Metal
-full-GPU is in flight (task #74, codex). KV prefix cache **skeleton**
-landed (tier-composing, two tiers shipped: `ram_lru` + `disk`); engine
-wiring is the next gate to long-context wallclock wins. CUDA/AMD
-backends are compile-checked only.
+**Snapshot, 2026-05-21 (late session, head `688aca1`).** `--fast` profile
+on Qwen3.5-0.8B-Q4_K_M:
+
+- short n=64: **210 tok/s** (+18% from flash-attn default-on, commit `15dde59`)
+- sustained n=256: **180 tok/s**
+- long-context n=2048: **105 tok/s** (transposed-KV auto on `seq>512`, flash-attn)
+- 84% of MLX short, 33% of MLX at n=1024 essay
+
+**KV cache infrastructure complete:**
+- fp32 / fp16 / bf16 / **Q8_0 (default under --fast, ~50% memory)**.
+  See [`docs/kv_quant_plan.md`](docs/kv_quant_plan.md).
+- KV prefix cache `ram_lru + disk` tiers with `qw36_state_snapshot`
+  / `_hydrate` end-to-end wired (commit `caa1de0`).
+
+**35B-A3B (Qwen3.6 MoE, 22 GB):**
+- Coherent on CPU + Metal (codex `59ebce1`, `137eaa9`)
+- Decode wallclock ~5 tok/s — MoE expert dispatch dominates (79% of
+  GPU time). **Active rewrite in progress (codex)**: MLX-style
+  SwitchGLU + `gather_qmm` operating on Q4/Q5/Q6 expert weights
+  directly. Replaces both the naive 1-thread-per-output kernel and
+  the failed Q8-only / 1-row-per-TG experiments.
+
+**Correctness gates (CI blocking):**
+- step-0 fp32 CPU == Metal bitwise
+- 8-config greedy token match
+- n=128 essay coherence (lexical diversity + degeneracy)
+- 7 kernel goldens (rmsnorm/silu/swiglu/matmul/rope/qgate/residual_add)
+- kvcache_e2e (hit ↔ bit-identical logits)
 
 The next 4–8 weeks fall into five themes. Each row has owner / effort /
 dependency / definition-of-done. The bottom of the doc lists the **next

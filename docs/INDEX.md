@@ -23,6 +23,7 @@ future contributors.
 |------|------------|
 | [`architecture.md`](architecture.md) | engine deep-dive — vtable contract, lazy weight materialization, per-token forward, fusion flags, persistent encoder, KV layouts; the "read for an afternoon" doc |
 | [`kvcache_design.md`](kvcache_design.md) | tier-composing KV prefix cache (vtable per medium; ram_lru + disk on Mac, future vram + redis) |
+| [`moe_design.md`](moe_design.md) | MoE GPU rewrite plan — MLX-style SwitchGLU + gather_qmm operating on Q4/Q5/Q6 expert weights directly (in flight, codex) |
 | [`kv_quant_plan.md`](kv_quant_plan.md) | KV cache quantization scoreboard (fp16 + bf16 shipped; Q8_0/Q4_0 planned) |
 | [`state_snapshot_plan.md`](state_snapshot_plan.md) | qw36_state_snapshot / _hydrate design for the KV prefix cache follow-up (task #82) |
 | [`speculative_decode_plan.md`](speculative_decode_plan.md) | speculative decoding sketch — explicit non-goal for the current window |
@@ -40,6 +41,7 @@ future contributors.
 | [`backend_parity.md`](backend_parity.md) | Metal / CUDA / AMD vtable-slot coverage and porting order |
 | [`performance_methodology.md`](performance_methodology.md) | how qw36 measures, why median-of-N + wallclock-not-gpu_ms, what counts as a real win |
 | [`troubleshooting.md`](troubleshooting.md) | top failure modes (build, runtime, perf) with concrete checks |
+| [`../tests/README.md`](../tests/README.md) | every test script catalogued — what it proves, when it runs, which CI job |
 
 ## Post-mortems / negative results (`docs/`)
 
