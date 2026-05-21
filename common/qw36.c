@@ -896,6 +896,11 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         const int q6k_scale16_weights =
             quant_gpu_weights && q6k_scale16_env &&
             atoi(q6k_scale16_env) != 0;
+        const char *quant_lm_head_env =
+            getenv("QW36_METAL_QUANT_GPU_LM_HEAD");
+        const int quant_gpu_lm_head =
+            quant_gpu_weights && quant_lm_head_env &&
+            atoi(quant_lm_head_env) != 0;
         const int fuse_dense_gate_up =
             backend->name && strcmp(backend->name, "metal") == 0;
         const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
@@ -909,18 +914,39 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             fp16_lazy_weights && !quant_gpu_weights &&
             (!fuse_dn_env || atoi(fuse_dn_env) != 0);
 
+        if (quant_gpu_lm_head && w->lm_head == w->embed_tokens) {
+            const qw36_lazy_w *src = (const qw36_lazy_w *)w->embed_tokens;
+            if (src && (src->dtype == QW36_DTYPE_Q5_K ||
+                        src->dtype == QW36_DTYPE_Q6_K)) {
+                qw36_lazy_w *lm_head =
+                    (qw36_lazy_w *)calloc(1, sizeof(*lm_head));
+                if (!lm_head) {
+                    if (err && err_cap) snprintf(err, err_cap,
+                        "%s: tied lm_head lazy clone failed", backend->name);
+                    qw36_engine_close(eng); return NULL;
+                }
+                *lm_head = *src;
+                lm_head->gpu_buf = NULL;
+                qw36__eng_own(eng, lm_head);
+                w->lm_head = lm_head;
+            }
+        }
+
         qw36_lazy_w *lws[] = {
             (qw36_lazy_w *)w->embed_tokens,
             (qw36_lazy_w *)w->lm_head,
             NULL
         };
         for (size_t i = 0; lws[i]; i++) {
-            /* Embed/lm_head stay materialised even in quant-GPU mode. The
-             * on-device dequant+gemv kernel is one threadgroup per output
-             * row — for the lm_head head (vocab × hidden ≈ 152k × 1024)
-             * that is 152k threadgroups, far slower than MPS fp16 gemv,
-             * so we keep them in dense form. Layer weights are small
-             * enough (n_heads*head_dim rows) that the per-row kernel wins. */
+            if (quant_gpu_lm_head && lws[i] == (qw36_lazy_w *)w->lm_head &&
+                w->lm_head != w->embed_tokens &&
+                (lws[i]->dtype == QW36_DTYPE_Q5_K ||
+                 lws[i]->dtype == QW36_DTYPE_Q6_K))
+                continue;
+            /* Embed stays materialised even in quant-GPU mode for the
+             * embedding_lookup fast path. lm_head does too unless the
+             * explicit QW36_METAL_QUANT_GPU_LM_HEAD experiment split a tied
+             * embedding descriptor above. */
             const int want_f16 = fp16_lazy_weights || quant_gpu_weights;
             int mrc = want_f16
                 ? lazy_materialize_f16(eng, lws[i])
@@ -975,7 +1001,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         #undef MAT_AS
 
         if (q4k_affine32_weights || q5k_affine32_weights ||
-            q6k_scale16_weights) {
+            q6k_scale16_weights || quant_gpu_lm_head) {
             size_t repacked_q4_n = 0;
             size_t repacked_q5_n = 0;
             size_t repacked_q6_n = 0;
@@ -1016,6 +1042,28 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                     repacked_q6_n++; \
                 } \
             } while (0)
+            if (quant_gpu_lm_head && w->lm_head != w->embed_tokens) {
+                qw36_lazy_w *lw = (qw36_lazy_w *)w->lm_head;
+                if (lw && lw->dtype == QW36_DTYPE_Q5_K) {
+                    if (lazy_repack_q5k_to_affine32(eng, lw,
+                                                    &repack_max_abs)) {
+                        if (err && err_cap) snprintf(err, err_cap,
+                            "%s: Q5_K affine32 repack failed at lm_head",
+                            backend->name);
+                        qw36_engine_close(eng); return NULL;
+                    }
+                    repacked_q5_n++;
+                } else if (lw && lw->dtype == QW36_DTYPE_Q6_K) {
+                    if (lazy_repack_q6k_to_scale16(eng, lw,
+                                                   &repack_max_abs)) {
+                        if (err && err_cap) snprintf(err, err_cap,
+                            "%s: Q6_K scale16 repack failed at lm_head",
+                            backend->name);
+                        qw36_engine_close(eng); return NULL;
+                    }
+                    repacked_q6_n++;
+                }
+            }
             for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
                 qw36_layer_weights *L = &eng->weights.layers[l];
                 REPACK_Q4K(q_proj); REPACK_Q4K(k_proj); REPACK_Q4K(v_proj);
