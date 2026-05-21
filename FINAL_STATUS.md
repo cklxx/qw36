@@ -101,21 +101,22 @@ QW36_METAL_QUANT_GPU_LM_HEAD=1 \
 ```
 → 208 tok/s peak short / 176 sustained.
 
-**Long-context scaling (full quant + lm_head Q6K, same load):**
+**Long-context scaling (full quant + lm_head Q6K + fp16 KV):**
 
-| n | tok/s | ms/token |
-|---|------:|---------:|
-| 64 | 185 avg / 208 peak | 5.4 |
-| 256 | 176 | 5.7 |
-| 512 | 138 | 7.2 |
-| 1024 | 111 | 9.0 |
-| 2048 | 68.6 | 14.6 |
+| n | tok/s before | tok/s after fp16 KV | ms/token |
+|---|------:|------:|---------:|
+| 64 | 185 | 194 | 5.2 |
+| 256 | 176 | 168 | 6.0 |
+| 512 | 138 | 148 | 6.8 |
+| 1024 | 111 | 121 | 8.3 |
+| 2048 | 68.6 | 87.3 | 11.5 |
 
-Each doubled context adds ~2-5ms/token: the fused decode attention reads
-K/V cache linearly so cost is O(seq_len). For long sequences the dominant
-op flips from matmul-bandwidth to attention-scoring. Next lever for n>=512:
-attention kernel (multi-row batching, warp-level cache reuse, or fp16 K
-re-quant).
+The fp16 KV fix (commit 6619ac8) unblocked the f16kv attention kernel under
+the quant path (was previously gated only on fp16-weights env). Long-context
+attention bandwidth halves so n=2048 jumped +27%. Short-context is
+matmul-bound so the gain is small there. Attention is still O(seq) — for
+much longer contexts a flash-attention-style streaming pass would be the
+next lever.
 
 ## Coverage
 
