@@ -2,11 +2,12 @@
 
 ## TL;DR
 
-Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **170 tok/s
-short-form / 139 tok/s sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal
-under `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1`
-(vs llama.cpp 170 tok/s reference). The fp16 MPS path tops out at 119/103
-tok/s — quant-path now wins because we halve bandwidth via affine repack.
+Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **208 tok/s peak
+short / 176 tok/s sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal under
+`QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1 QW36_METAL_QUANT_GPU_LM_HEAD=1`
+(vs llama.cpp 170 tok/s reference, MLX 244 tok/s reference). Hit the
+200 tok/s target. The fp16 MPS path tops out at 119/103 tok/s — quant-path
+wins because we halve bandwidth via affine repack on layers AND lm_head.
 CPU baseline 1.7 tok/s.
 
 ## Decode throughput ladder (Metal, M-class GPU, Qwen3.5-0.8B-Q4_K_M)
@@ -36,7 +37,8 @@ CPU baseline 1.7 tok/s.
 | 112e85f            | **122** | **persistent compute encoder** (fp16 path peak) |
 | 766b7c0 + 90b1377  | 85 (opt-in) | Q4K → affine32 repack + qmv_fast kernel (Q4K only; still under fp16) |
 | 8d45cca + b5e0ecb  | **161 (opt-in)** | + Q5K → affine32 repack (gate_up is Q5K — dominant matmul class) |
-| b5e0ecb (triple)   | **170 short / 139 sustained** | **+ Q6K → scale16 (qkv = Q6K). Triple-affine wins through fp16 ceiling** |
+| b5e0ecb (triple)   | **170 short / 139 sustained** | + Q6K → scale16 (qkv = Q6K). Triple-affine through fp16 ceiling |
+| 743a158 (triple + lm_head) | **208 peak / 185 avg short / 176 sustained** | **+ lm_head Q6K_SCALE16 (decouple tied embed alias). 200 tok/s target hit.** |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -94,9 +96,10 @@ QW36_METAL_QUANT_GPU=1 \
 QW36_METAL_Q4K_AFFINE32=1 \
 QW36_METAL_Q5K_AFFINE32=1 \
 QW36_METAL_Q6K_SCALE16=1 \
+QW36_METAL_QUANT_GPU_LM_HEAD=1 \
 ./qw36_metal -m <gguf> -p "Hello"
 ```
-→ 170 tok/s short / 139 sustained.
+→ 208 tok/s peak short / 176 sustained.
 
 ## Coverage
 
