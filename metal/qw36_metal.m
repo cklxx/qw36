@@ -269,6 +269,7 @@ static int metal_dtype_is_host_dequant(qw36_dtype dtype)
     return dtype == QW36_DTYPE_Q2_K ||
            dtype == QW36_DTYPE_Q3_K ||
            dtype == QW36_DTYPE_Q4_K ||
+           dtype == QW36_DTYPE_Q4K_AFFINE32 ||
            dtype == QW36_DTYPE_Q5_K ||
            dtype == QW36_DTYPE_Q6_K ||
            dtype == QW36_DTYPE_Q8_0;
@@ -347,6 +348,27 @@ static void metal_dq_q4_K(const uint8_t *blocks, float *out, size_t n)
             for (int l = 0; l < 32; l++) *out++ = d2 * (float)(qs[l] >> 4) - m2;
             qs += 32;
             is += 2;
+        }
+    }
+}
+
+static void metal_dq_q4k_affine32(const uint8_t *blocks, float *out, size_t n)
+{
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 160;
+        const uint16_t *scales = (const uint16_t *)b;
+        const uint16_t *biases = (const uint16_t *)(b + 16);
+        const uint8_t *qs = b + 32;
+        for (int sub = 0; sub < 8; sub++) {
+            const float scale = metal_f16_to_f32(scales[sub]);
+            const float bias = metal_f16_to_f32(biases[sub]);
+            const uint8_t *qg = qs + sub * 16;
+            for (int j = 0; j < 16; j++) {
+                uint8_t byte = qg[j];
+                *out++ = scale * (float)(byte & 0x0F) + bias;
+                *out++ = scale * (float)(byte >> 4) + bias;
+            }
         }
     }
 }
@@ -494,6 +516,7 @@ static int metal_quant_geom(qw36_dtype dtype, size_t *qk, size_t *bytes_per_bloc
         case QW36_DTYPE_Q2_K: *qk = 256; *bytes_per_block = 84;  return 0;
         case QW36_DTYPE_Q3_K: *qk = 256; *bytes_per_block = 110; return 0;
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q4K_AFFINE32: *qk = 256; *bytes_per_block = 160; return 0;
         case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
         case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
@@ -545,6 +568,7 @@ static int metal_dequant_row(const qw36_gpu_buf *buf, size_t row_idx,
         case QW36_DTYPE_Q2_K: metal_dq_q2_K(row, out, cols); return 0;
         case QW36_DTYPE_Q3_K: metal_dq_q3_K(row, out, cols); return 0;
         case QW36_DTYPE_Q4_K: metal_dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q4K_AFFINE32: metal_dq_q4k_affine32(row, out, cols); return 0;
         case QW36_DTYPE_Q5_K: metal_dq_q5_K(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: metal_dq_q6_K(row, out, cols); return 0;
         case QW36_DTYPE_Q8_0: metal_dq_q8_0(row, out, cols); return 0;

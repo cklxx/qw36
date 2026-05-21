@@ -41,6 +41,9 @@ typedef enum {
     QW36_DTYPE_Q8_0 = 8,
     QW36_DTYPE_Q3_K = 11,
     QW36_DTYPE_Q2_K = 10,
+    /* Internal post-load layout: GGUF Q4_K repacked as per-32 affine
+     * groups for Metal qmv kernels. Not a GGML/GGUF on-disk dtype. */
+    QW36_DTYPE_Q4K_AFFINE32 = 100,
     QW36_DTYPE_UNSUPPORTED = 0xFF
 } qw36_dtype;
 

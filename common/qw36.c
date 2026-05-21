@@ -177,6 +177,86 @@ static int lazy_materialize_f16(qw36_engine *eng, qw36_lazy_w *lw) {
     return 0;
 }
 
+static int lazy_q4k_affine32_sanity(const qw36_lazy_w *orig,
+                                    const qw36_lazy_w *repacked,
+                                    float *max_abs_out)
+{
+    if (!orig || !repacked || !max_abs_out || !orig->rows || !orig->cols)
+        return -1;
+    float *a = (float *)malloc((size_t)orig->cols * sizeof(float));
+    float *b = (float *)malloc((size_t)orig->cols * sizeof(float));
+    if (!a || !b) {
+        free(a); free(b);
+        return -1;
+    }
+    const size_t total_rows =
+        (size_t)orig->rows * (orig->n_extra ? (size_t)orig->n_extra : 1u);
+    size_t probes[3] = {0, total_rows / 2, total_rows ? total_rows - 1 : 0};
+    float max_abs = 0.0f;
+    for (size_t pi = 0; pi < 3 && total_rows; pi++) {
+        size_t row = probes[pi];
+        if (qw36__dequant_row(orig, row, a) ||
+            qw36__dequant_row(repacked, row, b)) {
+            free(a); free(b);
+            return -1;
+        }
+        for (size_t i = 0; i < (size_t)orig->cols; i++) {
+            float d = fabsf(a[i] - b[i]);
+            if (d > max_abs) max_abs = d;
+        }
+    }
+    free(a); free(b);
+    *max_abs_out = max_abs;
+    return 0;
+}
+
+/* Runtime-only low-memory Metal path: convert GGUF Q4_K into an affine
+ * per-32 layout that is compatible with MLX-style qmv kernels:
+ *   [fp16 scale[8] | fp16 bias[8] | packed q4 groups[8][16]]
+ * per 256-element block. */
+static int lazy_repack_q4k_to_affine32(qw36_engine *eng, qw36_lazy_w *lw,
+                                       float *max_abs_out)
+{
+    if (!lw || lw->dtype != QW36_DTYPE_Q4_K) return 0;
+    if (!lw->cols || (lw->cols % 256u) != 0 || !lw->rows) return -1;
+    size_t numel = (size_t)lw->cols * (size_t)lw->rows;
+    if (lw->n_extra) {
+        if (numel > SIZE_MAX / (size_t)lw->n_extra) return -1;
+        numel *= (size_t)lw->n_extra;
+    }
+    size_t bytes = qw36__tensor_bytes(QW36_DTYPE_Q4K_AFFINE32, numel);
+    if (!bytes) return -1;
+    uint8_t *p = (uint8_t *)malloc(bytes);
+    if (!p) return -1;
+    if (qw36__repack_q4k_affine32(lw, p)) {
+        free(p);
+        return -1;
+    }
+
+    qw36_lazy_w repacked = *lw;
+    repacked.data = p;
+    repacked.dtype = QW36_DTYPE_Q4K_AFFINE32;
+    repacked.gpu_buf = NULL;
+    float max_abs = 0.0f;
+    if (lazy_q4k_affine32_sanity(lw, &repacked, &max_abs)) {
+        free(p);
+        return -1;
+    }
+    /* Original Q4_K computes scale/bias in fp32 from fp16 super-scales;
+     * affine32 stores the derived scale/bias in fp16. The check is for
+     * fp16-rounding equivalence, not bitwise fp32 identity. */
+    if (max_abs > 0.25f) {
+        free(p);
+        return -1;
+    }
+    if (max_abs_out && max_abs > *max_abs_out) *max_abs_out = max_abs;
+    if (!qw36__eng_own(eng, p)) { free(p); return -1; }
+    lw->data = p;
+    lw->dtype = QW36_DTYPE_Q4K_AFFINE32;
+    lw->gpu_buf = NULL;
+    return 0;
+}
+
 /* Metal dense-MLP fast path: concatenate gate_proj and up_proj into one
  * [2*inter, hidden] dense matrix after materialization and before upload.
  * L->up_proj == NULL is the internal signal that the backend should split
@@ -708,6 +788,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         const int quant_gpu_weights =
             backend->name && strcmp(backend->name, "metal") == 0 &&
             qgpu_env && atoi(qgpu_env) != 0;
+        const char *q4k_affine32_env = getenv("QW36_METAL_Q4K_AFFINE32");
+        const int q4k_affine32_weights =
+            quant_gpu_weights && q4k_affine32_env &&
+            atoi(q4k_affine32_env) != 0;
         const int fuse_dense_gate_up =
             backend->name && strcmp(backend->name, "metal") == 0;
         const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
@@ -785,6 +869,44 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             MAT_AS(moe_shared_down, fp16_lazy_weights);
         }
         #undef MAT_AS
+
+        if (q4k_affine32_weights) {
+            size_t repacked_n = 0;
+            float repack_max_abs = 0.0f;
+            #define REPACK_Q4K(field) do { \
+                qw36_lazy_w *lw = (qw36_lazy_w *)L->field; \
+                if (lw && lw->dtype == QW36_DTYPE_Q4_K) { \
+                    if (lazy_repack_q4k_to_affine32(eng, lw, &repack_max_abs)) { \
+                        if (err && err_cap) snprintf(err, err_cap, \
+                            "%s: Q4_K affine32 repack failed at blk.%u." #field, \
+                            backend->name, l); \
+                        qw36_engine_close(eng); return NULL; \
+                    } \
+                    repacked_n++; \
+                } \
+            } while (0)
+            for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
+                qw36_layer_weights *L = &eng->weights.layers[l];
+                REPACK_Q4K(q_proj); REPACK_Q4K(k_proj); REPACK_Q4K(v_proj);
+                REPACK_Q4K(o_proj);
+                REPACK_Q4K(dn_qkv); REPACK_Q4K(dn_gate);
+                REPACK_Q4K(dn_alpha); REPACK_Q4K(dn_beta);
+                REPACK_Q4K(dn_out);
+                REPACK_Q4K(gate_proj); REPACK_Q4K(up_proj);
+                REPACK_Q4K(down_proj);
+                REPACK_Q4K(moe_router);
+                REPACK_Q4K(moe_expert_gate); REPACK_Q4K(moe_expert_up);
+                REPACK_Q4K(moe_expert_down);
+                REPACK_Q4K(moe_shared_gate); REPACK_Q4K(moe_shared_up);
+                REPACK_Q4K(moe_shared_down);
+            }
+            #undef REPACK_Q4K
+            if (repacked_n) {
+                fprintf(stderr,
+                    "qw36: Q4_K affine32 repacked %zu tensors (sanity max_abs %.6g)\n",
+                    repacked_n, repack_max_abs);
+            }
+        }
 
         if (fuse_dense_gate_up) {
             for (uint32_t l = 0; l < c->num_hidden_layers; l++) {

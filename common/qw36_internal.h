@@ -83,6 +83,7 @@ int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk,
                            size_t *bytes_per_block);
 int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out);
 float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n);
+int qw36__repack_q4k_affine32(const qw36_lazy_w *w, void *dst);
 uint16_t qw36__f32_to_f16(float f);
 float    qw36__f16_to_f32(uint16_t h);
 int qw36__active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out);

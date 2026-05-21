@@ -91,6 +91,7 @@ size_t qw36__tensor_bytes(qw36_dtype dtype, size_t numel) {
         case QW36_DTYPE_Q2_K: return (numel / 256u) *  84u;
         case QW36_DTYPE_Q3_K: return (numel / 256u) * 110u;
         case QW36_DTYPE_Q4_K: return (numel / 256u) * 144u;
+        case QW36_DTYPE_Q4K_AFFINE32: return (numel / 256u) * 160u;
         case QW36_DTYPE_Q5_K: return (numel / 256u) * 176u;
         case QW36_DTYPE_Q6_K: return (numel / 256u) * 210u;
         case QW36_DTYPE_Q8_0: return (numel /  32u) *  34u;
@@ -102,7 +103,8 @@ int qw36__dtype_is_native_gpu_quant(qw36_dtype dt) {
     /* Quantised dtypes for which the Metal backend has a native on-device
      * matmul kernel. CUDA/AMD don't yet, so callers gate on backend name. */
     return dt == QW36_DTYPE_Q4_K || dt == QW36_DTYPE_Q5_K ||
-           dt == QW36_DTYPE_Q6_K || dt == QW36_DTYPE_Q8_0;
+           dt == QW36_DTYPE_Q6_K || dt == QW36_DTYPE_Q8_0 ||
+           dt == QW36_DTYPE_Q4K_AFFINE32;
 }
 
 /* --------------------------------------------------------------------- */
@@ -165,6 +167,84 @@ static void dq_q4_K(const uint8_t *blocks, float *out, size_t n) {
             qs += 32; is += 2;
         }
     }
+}
+
+/* Q4K_AFFINE32: internal runtime layout produced from GGUF Q4_K.
+ * Per 256-element block:
+ *   fp16 scale[8]      (16B)  scale = d * sc[sub]
+ *   fp16 bias[8]       (16B)  bias  = -dmin * mn[sub]
+ *   u8 q[8][16]       (128B)  each 32-element sub-block packed low/high
+ * Total: 160 bytes. */
+static void dq_q4k_affine32(const uint8_t *blocks, float *out, size_t n) {
+    const size_t nb = n / QW36_QK_K;
+    for (size_t i = 0; i < nb; i++) {
+        const uint8_t *b = blocks + i * 160;
+        const uint16_t *scales = (const uint16_t *)b;
+        const uint16_t *biases = (const uint16_t *)(b + 16);
+        const uint8_t *qs = b + 32;
+        for (int sub = 0; sub < 8; sub++) {
+            const float scale = f16_to_f32(scales[sub]);
+            const float bias = f16_to_f32(biases[sub]);
+            const uint8_t *qg = qs + sub * 16;
+            for (int j = 0; j < 16; j++) {
+                uint8_t byte = qg[j];
+                *out++ = scale * (float)(byte & 0x0F) + bias;
+                *out++ = scale * (float)(byte >> 4) + bias;
+            }
+        }
+    }
+}
+
+static uint8_t q4_K_nibble(const uint8_t *block, int sub, int j) {
+    const uint8_t *qs = block + 16;
+    int iter = sub >> 1;
+    int hi = sub & 1;
+    uint8_t byte = qs[iter * 32 + j];
+    return hi ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0x0F);
+}
+
+int qw36__repack_q4k_affine32(const qw36_lazy_w *w, void *dst_void) {
+    if (!w || !dst_void || w->dtype != QW36_DTYPE_Q4_K ||
+        !w->cols || (w->cols % QW36_QK_K) != 0)
+        return -1;
+    const size_t rows = (size_t)w->rows * (w->n_extra ? (size_t)w->n_extra : 1u);
+    const size_t blocks_per_row = (size_t)w->cols / QW36_QK_K;
+    const uint8_t *src = (const uint8_t *)w->data;
+    uint8_t *dst = (uint8_t *)dst_void;
+    const size_t src_row_bytes = blocks_per_row * 144u;
+    const size_t dst_row_bytes = blocks_per_row * 160u;
+
+    for (size_t r = 0; r < rows; r++) {
+        const uint8_t *src_row = src + r * src_row_bytes;
+        uint8_t *dst_row = dst + r * dst_row_bytes;
+        for (size_t bi = 0; bi < blocks_per_row; bi++) {
+            const uint8_t *b = src_row + bi * 144u;
+            uint8_t *o = dst_row + bi * 160u;
+            uint16_t dh, dmh;
+            memcpy(&dh,  b,     2);
+            memcpy(&dmh, b + 2, 2);
+            const float d = f16_to_f32(dh);
+            const float dmin = f16_to_f32(dmh);
+            const uint8_t *packed_scales = b + 4;
+            uint16_t *out_scales = (uint16_t *)o;
+            uint16_t *out_biases = (uint16_t *)(o + 16);
+            uint8_t *out_q = o + 32;
+
+            for (int sub = 0; sub < 8; sub++) {
+                uint8_t sc, mn;
+                q4_K_get_scale_min(sub, packed_scales, &sc, &mn);
+                out_scales[sub] = qw36__f32_to_f16(d * (float)sc);
+                out_biases[sub] = qw36__f32_to_f16(-dmin * (float)mn);
+                uint8_t *qg = out_q + sub * 16;
+                for (int j = 0; j < 16; j++) {
+                    uint8_t q0 = q4_K_nibble(b, sub, j * 2);
+                    uint8_t q1 = q4_K_nibble(b, sub, j * 2 + 1);
+                    qg[j] = (uint8_t)(q0 | (q1 << 4));
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 /* Q2_K: 84 bytes/block. Layout:
@@ -353,6 +433,9 @@ float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n) {
         case QW36_DTYPE_Q4_K:
             dq_q4_K((const uint8_t *)data, out, n);
             return out;
+        case QW36_DTYPE_Q4K_AFFINE32:
+            dq_q4k_affine32((const uint8_t *)data, out, n);
+            return out;
         case QW36_DTYPE_Q5_K:
             dq_q5_K((const uint8_t *)data, out, n);
             return out;
@@ -374,6 +457,7 @@ int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk, size_t *bytes_per_block) {
         case QW36_DTYPE_Q2_K: *qk = 256; *bytes_per_block =  84; return 0;
         case QW36_DTYPE_Q3_K: *qk = 256; *bytes_per_block = 110; return 0;
         case QW36_DTYPE_Q4_K: *qk = 256; *bytes_per_block = 144; return 0;
+        case QW36_DTYPE_Q4K_AFFINE32: *qk = 256; *bytes_per_block = 160; return 0;
         case QW36_DTYPE_Q5_K: *qk = 256; *bytes_per_block = 176; return 0;
         case QW36_DTYPE_Q6_K: *qk = 256; *bytes_per_block = 210; return 0;
         case QW36_DTYPE_Q8_0: *qk = 32;  *bytes_per_block = 34;  return 0;
@@ -413,6 +497,7 @@ int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
         case QW36_DTYPE_Q2_K: dq_q2_K(row, out, cols); return 0;
         case QW36_DTYPE_Q3_K: dq_q3_K(row, out, cols); return 0;
         case QW36_DTYPE_Q4_K: dq_q4_K(row, out, cols); return 0;
+        case QW36_DTYPE_Q4K_AFFINE32: dq_q4k_affine32(row, out, cols); return 0;
         case QW36_DTYPE_Q5_K: dq_q5_K(row, out, cols); return 0;
         case QW36_DTYPE_Q6_K: dq_q6_K(row, out, cols); return 0;
         case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
