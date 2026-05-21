@@ -181,7 +181,10 @@ static size_t scalar_size(gguf_value_type t) {
     }
 }
 
-/* Skip a value of given type in the cursor (without keeping it). */
+/* KEEP — skip a value of a given type in the cursor without copying.
+ * Currently unused because the loader pre-allocates every value, but
+ * left in for the future "only-read-the-keys-we-care-about" pass that
+ * would cut load time for huge GGUFs by skipping irrelevant metadata. */
 static void skip_value(cur_t *c, gguf_value_type t) {
     size_t s = scalar_size(t);
     if (s) { cur_skip(c, s); return; }

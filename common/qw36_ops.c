@@ -289,6 +289,10 @@ static void matmul_f32(float *y, const float *x, const float *w,
 
 float qw36__silu(float x) { return x / (1.0f + expf(-x)); }
 
+/* KEEP — reference SwiGLU MLP for documentation. The hot path lives in
+ * qw36_mlp.c; this function is unused but preserved as the single most
+ * concise statement of the math. Don't remove without updating
+ * qw36_mlp.c's comments to compensate. */
 static void swiglu_mlp_f32(float *y, const float *x,
                            const float *w_gate, const float *w_up,
                            const float *w_down,
@@ -363,6 +367,10 @@ void qw36__rope_head(float *x, size_t pos, size_t rot_dim, float theta_base,
  * `attn_scratch` must point to at least (n_heads * (seq_capacity + 1))
  * floats — workspace for the per-head score arrays.
  */
+/* KEEP — reference attention for documentation. Vanilla GQA without
+ * Q-gate; the production path in qw36_attn_vanilla.c adds the gate
+ * and the partial-rotary RoPE wrinkle. Don't remove without updating
+ * qw36_attn_vanilla.c's docstring to compensate. */
 static void attention_f32(float *y,
                           const float *x,
                           const float *wq, const float *wk, const float *wv,

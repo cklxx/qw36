@@ -249,7 +249,13 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                               char *err, size_t err_cap);
 void         qw36_engine_close(qw36_engine *eng);
 
+/* Borrowed pointer to the engine's parsed config (hidden_size, layer
+ * count, rope_theta, etc.). Lifetime = engine. */
 const qw36_config  *qw36_engine_config(const qw36_engine *eng);
+
+/* Borrowed pointer to the engine's lazy-weight descriptor table
+ * (embed_tokens, lm_head, per-layer projections, ...). Lifetime =
+ * engine. Typical use: read-only inspection in --info and tests. */
 const qw36_weights *qw36_engine_weights(const qw36_engine *eng);
 
 /* Borrowed pointer to the engine's GGUF file — used to construct a
@@ -307,6 +313,10 @@ typedef struct {
     uint64_t rng_seed;
 } qw36_sampler;
 
+/* Sample a token id from `logits` (size = `vocab`) using `s`'s
+ * temperature / top-p / top-k / seed. `temperature <= 0` returns the
+ * argmax (and ignores top-p / top-k). Modifies the sampler's RNG
+ * state. */
 uint32_t qw36_sample(const float *logits, uint32_t vocab,
                      qw36_sampler *s);
 
