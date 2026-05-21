@@ -98,6 +98,9 @@ int qw36__dtype_block_geom(qw36_dtype dt, size_t *qk,
                            size_t *bytes_per_block);
 int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out);
 float *qw36__materialize_f32(const void *data, qw36_dtype dt, size_t n);
+int qw36__lazy_w_shape(const qw36_lazy_w *w, size_t *rows_out,
+                       size_t *cols_out, size_t *numel_out);
+uint16_t *qw36__materialize_f16_rows(const qw36_lazy_w *w);
 int qw36__repack_q4k_affine32(const qw36_lazy_w *w, void *dst);
 int qw36__repack_q5k_affine32(const qw36_lazy_w *w, void *dst);
 int qw36__repack_q6k_scale16(const qw36_lazy_w *w, void *dst);

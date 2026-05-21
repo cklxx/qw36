@@ -111,6 +111,26 @@ int qw36__dtype_is_native_gpu_quant(qw36_dtype dt) {
            dt == QW36_DTYPE_Q6K_SCALE16;
 }
 
+int qw36__lazy_w_shape(const qw36_lazy_w *w, size_t *rows_out,
+                       size_t *cols_out, size_t *numel_out)
+{
+    if (!w || !w->cols) return -1;
+    uint64_t rows64 = w->rows ? w->rows : 1u;
+    if (w->n_extra) {
+        if (rows64 > UINT64_MAX / w->n_extra) return -1;
+        rows64 *= w->n_extra;
+    }
+    if (rows64 > (uint64_t)SIZE_MAX || w->cols > (uint64_t)SIZE_MAX)
+        return -1;
+    size_t rows = (size_t)rows64;
+    size_t cols = (size_t)w->cols;
+    if (rows && cols > SIZE_MAX / rows) return -1;
+    if (rows_out) *rows_out = rows;
+    if (cols_out) *cols_out = cols;
+    if (numel_out) *numel_out = rows * cols;
+    return 0;
+}
+
 /* --------------------------------------------------------------------- */
 /* GGML-style quantized block dequantizers.                               */
 /*                                                                        */
@@ -711,4 +731,32 @@ int qw36__dequant_row(const qw36_lazy_w *w, size_t row_idx, float *out) {
         case QW36_DTYPE_Q8_0: dq_q8_0(row, out, cols); return 0;
         default: return -1;
     }
+}
+
+uint16_t *qw36__materialize_f16_rows(const qw36_lazy_w *w)
+{
+    size_t rows = 0, cols = 0, numel = 0;
+    if (qw36__lazy_w_shape(w, &rows, &cols, &numel)) return NULL;
+    if (numel > SIZE_MAX / sizeof(uint16_t) ||
+        cols > SIZE_MAX / sizeof(float))
+        return NULL;
+    uint16_t *p = (uint16_t *)malloc(numel * sizeof(uint16_t));
+    float *row = (float *)malloc(cols * sizeof(float));
+    if (!p || !row) {
+        free(p);
+        free(row);
+        return NULL;
+    }
+    for (size_t r = 0; r < rows; r++) {
+        if (qw36__dequant_row(w, r, row)) {
+            free(p);
+            free(row);
+            return NULL;
+        }
+        uint16_t *dst = p + r * cols;
+        for (size_t c = 0; c < cols; c++)
+            dst[c] = qw36__f32_to_f16(row[c]);
+    }
+    free(row);
+    return p;
 }

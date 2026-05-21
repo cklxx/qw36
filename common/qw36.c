@@ -152,8 +152,8 @@ static float *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
  * engine for free-on-close. Returns 0 on success, -1 on OOM/unsupported. */
 static int lazy_materialize_f32(qw36_engine *eng, qw36_lazy_w *lw) {
     if (!lw || lw->dtype == QW36_DTYPE_F32) return 0;
-    size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1);
-    if (lw->n_extra) numel *= (size_t)lw->n_extra;
+    size_t numel = 0;
+    if (qw36__lazy_w_shape(lw, NULL, NULL, &numel)) return -1;
     float *p = qw36__materialize_f32(lw->data, lw->dtype, numel);
     if (!p) return -1;
     if (!qw36__eng_own(eng, p)) { free(p); return -1; }
@@ -164,14 +164,8 @@ static int lazy_materialize_f32(qw36_engine *eng, qw36_lazy_w *lw) {
 
 static int lazy_materialize_f16(qw36_engine *eng, qw36_lazy_w *lw) {
     if (!lw || lw->dtype == QW36_DTYPE_F16) return 0;
-    size_t numel = (size_t)lw->cols * (lw->rows ? lw->rows : 1);
-    if (lw->n_extra) numel *= (size_t)lw->n_extra;
-    float *tmp = qw36__materialize_f32(lw->data, lw->dtype, numel);
-    if (!tmp) return -1;
-    uint16_t *p = (uint16_t *)malloc(numel * sizeof(uint16_t));
-    if (!p) { free(tmp); return -1; }
-    for (size_t i = 0; i < numel; i++) p[i] = qw36__f32_to_f16(tmp[i]);
-    free(tmp);
+    uint16_t *p = qw36__materialize_f16_rows(lw);
+    if (!p) return -1;
     if (!qw36__eng_own(eng, p)) { free(p); return -1; }
     lw->data  = p;
     lw->dtype = QW36_DTYPE_F16;
@@ -615,6 +609,24 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         if (err && err_cap) snprintf(err, err_cap,
             "missing required %s.* config keys (mask=0x%x)", eng->arch, missing);
         qw36_engine_close(eng); return NULL;
+    }
+    {
+        uint32_t nextn_layers = 0;
+        if (eng_get_u32(eng, "nextn_predict_layers", &nextn_layers) == 0 &&
+            nextn_layers > 0) {
+            if (nextn_layers >= c->num_hidden_layers) {
+                if (err && err_cap) snprintf(err, err_cap,
+                    "invalid nextn_predict_layers=%u for block_count=%u",
+                    nextn_layers, c->num_hidden_layers);
+                qw36_engine_close(eng); return NULL;
+            }
+            fprintf(stderr,
+                "qw36: skipping %u nextn/MTP layer(s): block_count %u -> "
+                "transformer layers %u\n",
+                nextn_layers, c->num_hidden_layers,
+                c->num_hidden_layers - nextn_layers);
+            c->num_hidden_layers -= nextn_layers;
+        }
     }
     /* head_dim — Qwen3 stores attention.key_length; fall back to hidden/heads. */
     if (eng_get_u32(eng, "attention.key_length", &c->head_dim)) {

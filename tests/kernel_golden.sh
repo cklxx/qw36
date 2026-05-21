@@ -10,9 +10,12 @@ if [[ ! -f "$MODEL" ]]; then
   exit 2
 fi
 
-if [[ ! -x "$DUMP" || "$ROOT/tools/dump_tensor.c" -nt "$DUMP" || "$ROOT/common/qw36_gguf.c" -nt "$DUMP" ]]; then
+if [[ ! -x "$DUMP" || "$ROOT/tools/dump_tensor.c" -nt "$DUMP" ||
+      "$ROOT/common/qw36_gguf.c" -nt "$DUMP" ||
+      "$ROOT/common/qw36_dequant.c" -nt "$DUMP" ]]; then
   cc -O2 -std=c11 -I"$ROOT/common" \
-    "$ROOT/tools/dump_tensor.c" "$ROOT/common/qw36_gguf.c" \
+    "$ROOT/tools/dump_tensor.c" \
+    "$ROOT/common/qw36_gguf.c" "$ROOT/common/qw36_dequant.c" \
     -lm -o "$DUMP"
 fi
 
