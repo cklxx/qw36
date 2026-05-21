@@ -12,3 +12,6 @@ qw36_cpu_asan
 models/
 *.gguf
 .DS_Store
+
+# Claude Code runtime state
+.claude/
