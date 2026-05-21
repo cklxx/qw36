@@ -184,6 +184,53 @@ int qw36__matmul_lazy_slice(float *y, const float *x,
 
 /* MoE router/top-k implementation lives in qw36_moe.c. */
 
+static void v_reorder_rows_f32(float *data, uint32_t rows, uint32_t cols,
+                               uint32_t num_k_heads,
+                               uint32_t num_v_per_k,
+                               uint32_t head_dim,
+                               int reverse)
+{
+    if (!data || num_v_per_k <= 1 || !num_k_heads || !head_dim || !cols)
+        return;
+    const uint32_t expected_rows = num_k_heads * num_v_per_k * head_dim;
+    if (rows != expected_rows) return;
+    const size_t n = (size_t)rows * cols;
+    float *src = (float *)malloc(n * sizeof(float));
+    if (!src) return;
+    memcpy(src, data, n * sizeof(float));
+    const size_t head_stride = (size_t)head_dim * cols;
+    for (uint32_t k = 0; k < num_k_heads; k++) {
+        for (uint32_t v = 0; v < num_v_per_k; v++) {
+            const uint32_t gguf_head = v * num_k_heads + k;
+            const uint32_t hf_head = k * num_v_per_k + v;
+            const uint32_t src_head = reverse ? gguf_head : hf_head;
+            const uint32_t dst_head = reverse ? hf_head : gguf_head;
+            memcpy(data + (size_t)dst_head * head_stride,
+                   src + (size_t)src_head * head_stride,
+                   head_stride * sizeof(float));
+        }
+    }
+    free(src);
+}
+
+void qw36__reverse_v_reorder_rows_f32(float *data, uint32_t rows,
+                                      uint32_t cols, uint32_t num_k_heads,
+                                      uint32_t num_v_per_k,
+                                      uint32_t head_dim)
+{
+    v_reorder_rows_f32(data, rows, cols, num_k_heads, num_v_per_k,
+                       head_dim, 1);
+}
+
+void qw36__forward_v_reorder_rows_f32(float *data, uint32_t rows,
+                                      uint32_t cols, uint32_t num_k_heads,
+                                      uint32_t num_v_per_k,
+                                      uint32_t head_dim)
+{
+    v_reorder_rows_f32(data, rows, cols, num_k_heads, num_v_per_k,
+                       head_dim, 0);
+}
+
 /* Embedding lookup: write hidden=W.cols floats to out from row `token`. */
 int qw36__embed_lookup_lazy(const qw36_lazy_w *w, uint32_t token, float *out) {
     qw36_gpu_backend *be;

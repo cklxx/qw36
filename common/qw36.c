@@ -562,7 +562,8 @@ static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
     lw->dtype     = t.dtype;
     lw->ggml_type = t.ggml_type;
     lw->cols      = t.n_dims >= 1 ? t.dims[0] : 0;
-    lw->rows      = t.n_dims >= 2 ? t.dims[1] : 0;
+    lw->rows      = t.n_dims >= 2 ? t.dims[1] :
+                    (t.n_dims == 1 ? 1 : 0);
     lw->n_extra   = t.n_dims >= 3 ? t.dims[2] : 0;
     if (!qw36__eng_own(eng, lw)) { free(lw); return NULL; }
     return lw;
@@ -694,6 +695,8 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     eng_get_u32(eng, "expert_count",              &c->moe_num_experts);
     eng_get_u32(eng, "expert_used_count",         &c->moe_experts_per_tok);
     eng_get_u32(eng, "expert_feed_forward_length",&c->moe_intermediate_size);
+    eng_get_u32(eng, "expert_shared_feed_forward_length",
+                &c->moe_shared_expert_intermediate_size);
     if (!c->moe_decoder_sparse_step) c->moe_decoder_sparse_step = 1;
 
     /* Gated DeltaNet config. Prefer the explicit GGUF SSM metadata:
@@ -866,17 +869,39 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         BIND_NORM(dn_conv1d,     "blk.%u.ssm_conv1d.weight");
         BIND_NORM(dn_dt_bias,    "blk.%u.ssm_dt.bias");
         BIND_NORM(dn_a_log,      "blk.%u.ssm_a");
-        static int dn_a_raw = -1;
-        if (dn_a_raw < 0) {
-            const char *e = getenv("QW36_DN_A_RAW");
-            dn_a_raw = e && atoi(e) ? 1 : 0;
+        const uint32_t dn_vpk =
+            (c->dn_num_key_heads &&
+             c->dn_num_value_heads % c->dn_num_key_heads == 0)
+                ? c->dn_num_value_heads / c->dn_num_key_heads
+                : 1;
+        if (dn_vpk > 1 && L->dn_conv1d && c->dn_key_head_dim &&
+            c->dn_value_head_dim && c->dn_conv_kernel_size) {
+            const uint32_t qk_channels =
+                c->dn_num_key_heads * c->dn_key_head_dim * 2u;
+            const uint32_t v_channels =
+                c->dn_num_value_heads * c->dn_value_head_dim;
+            qw36__reverse_v_reorder_rows_f32(
+                (float *)L->dn_conv1d +
+                    (size_t)qk_channels * c->dn_conv_kernel_size,
+                v_channels, c->dn_conv_kernel_size,
+                c->dn_num_key_heads, dn_vpk, c->dn_value_head_dim);
         }
-        if (L->dn_a_log && c->dn_num_value_heads && !dn_a_raw) {
+        if (dn_vpk > 1 && L->dn_dt_bias && c->dn_num_value_heads) {
+            qw36__reverse_v_reorder_rows_f32(
+                (float *)L->dn_dt_bias, c->dn_num_value_heads, 1,
+                c->dn_num_key_heads, dn_vpk, 1);
+        }
+        if (L->dn_a_log && c->dn_num_value_heads) {
             float *a = (float *)L->dn_a_log;
             for (uint32_t i = 0; i < c->dn_num_value_heads; i++) {
                 float v = fabsf(a[i]);
                 if (v < 1.0e-10f) v = 1.0e-10f;
                 a[i] = logf(v);
+            }
+            if (dn_vpk > 1) {
+                qw36__reverse_v_reorder_rows_f32(
+                    a, c->dn_num_value_heads, 1,
+                    c->dn_num_key_heads, dn_vpk, 1);
             }
         }
         BIND_NORM(dn_norm,       "blk.%u.ssm_norm.weight");
@@ -896,6 +921,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         BIND_W(moe_shared_gate,   "blk.%u.ffn_gate_shexp.weight");
         BIND_W(moe_shared_up,     "blk.%u.ffn_up_shexp.weight");
         BIND_W(moe_shared_down,   "blk.%u.ffn_down_shexp.weight");
+        BIND_W(moe_shared_gate_inp, "blk.%u.ffn_gate_inp_shexp.weight");
         #undef BIND_NORM
         #undef BIND_W
     }
@@ -1011,6 +1037,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             MAT_AS(moe_shared_gate, fp16_lazy_weights);
             MAT_AS(moe_shared_up, fp16_lazy_weights);
             MAT_AS(moe_shared_down, fp16_lazy_weights);
+            MAT_AS(moe_shared_gate_inp, 0);
         }
         #undef MAT_AS
 
@@ -1092,6 +1119,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 REPACK_Q4K(moe_expert_down);
                 REPACK_Q4K(moe_shared_gate); REPACK_Q4K(moe_shared_up);
                 REPACK_Q4K(moe_shared_down);
+                REPACK_Q4K(moe_shared_gate_inp);
                 REPACK_Q5K(q_proj); REPACK_Q5K(k_proj); REPACK_Q5K(v_proj);
                 REPACK_Q5K(o_proj);
                 REPACK_Q5K(dn_qkv); REPACK_Q5K(dn_gate);
@@ -1104,6 +1132,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 REPACK_Q5K(moe_expert_down);
                 REPACK_Q5K(moe_shared_gate); REPACK_Q5K(moe_shared_up);
                 REPACK_Q5K(moe_shared_down);
+                REPACK_Q5K(moe_shared_gate_inp);
                 REPACK_Q6K(q_proj); REPACK_Q6K(k_proj); REPACK_Q6K(v_proj);
                 REPACK_Q6K(o_proj);
                 REPACK_Q6K(dn_qkv); REPACK_Q6K(dn_gate);
@@ -1116,6 +1145,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 REPACK_Q6K(moe_expert_down);
                 REPACK_Q6K(moe_shared_gate); REPACK_Q6K(moe_shared_up);
                 REPACK_Q6K(moe_shared_down);
+                REPACK_Q6K(moe_shared_gate_inp);
             }
             #undef REPACK_Q6K
             #undef REPACK_Q5K
@@ -1186,6 +1216,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             UPLOAD(moe_router);
             UPLOAD(moe_expert_gate); UPLOAD(moe_expert_up); UPLOAD(moe_expert_down);
             UPLOAD(moe_shared_gate); UPLOAD(moe_shared_up); UPLOAD(moe_shared_down);
+            UPLOAD(moe_shared_gate_inp);
         }
         #undef UPLOAD
         /* Globals. */

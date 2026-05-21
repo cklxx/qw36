@@ -166,10 +166,20 @@ int qw36__moe_forward_f32(float *y, const float *x,
                           const qw36_lazy_w *shared_gate,
                           const qw36_lazy_w *shared_up,
                           const qw36_lazy_w *shared_down,
+                          const qw36_lazy_w *shared_gate_inp,
                           uint32_t hidden, uint32_t moe_inter,
+                          uint32_t shared_inter,
                           uint32_t n_experts, int top_k,
                           uint8_t norm_topk,
                           float *scratch, float *row_scratch);
+void qw36__reverse_v_reorder_rows_f32(float *data, uint32_t rows,
+                                      uint32_t cols, uint32_t num_k_heads,
+                                      uint32_t num_v_per_k,
+                                      uint32_t head_dim);
+void qw36__forward_v_reorder_rows_f32(float *data, uint32_t rows,
+                                      uint32_t cols, uint32_t num_k_heads,
+                                      uint32_t num_v_per_k,
+                                      uint32_t head_dim);
 void qw36__rope_head(float *x, size_t pos, size_t rot_dim, float theta_base,
                      const uint32_t *sections, uint32_t n_sections);
 

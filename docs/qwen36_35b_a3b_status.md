@@ -21,117 +21,76 @@ Update, 2026-05-21:
   `token_embd[9419] -> output_norm -> output.weight` produces the exact same
   top-10 as qw36, headed by id 16870 (` Release`). That zero-layer result is
   not evidence of a qw36 dequant/materialize bug.
+- Fixed the real CPU correctness bug: MoE used the same `st->x_rms` buffer for
+  input and output, then zeroed `y` before expert matmuls, so every MoE block
+  saw an all-zero normalized input. `qw36__moe_forward_f32` now preserves an
+  aliasing input copy.
+- Aligned Qwen3.5 GGUF DeltaNet layout with `../agent-infer`: V-head blocks in
+  qkv/z/a/b activations, conv1d V rows, `dt_bias`, and `ssm_a` are converted
+  from GGUF V-within-K order to HF K-grouped order; `ssm_a` keeps the
+  `log(abs(raw))` transform; `dn_out` receives the inverse V reorder.
+- Bound `ffn_gate_inp_shexp.weight` and applied the Qwen3.5 shared-expert
+  scalar gate `sigmoid(shared_expert_gate(x)) * shared_expert(x)`.
 
-## Symptom
+## Current Status
 
 ```
-./qw36_metal --fast -m ~/models/gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
-    -p Hello -n 32 --no-special
-→ "nö,and,and richer lock lock使它 rembourseteree集中e集中eenlzerzern..."
+./qw36_cpu -m ~/models/gguf/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
+    -p Hello -n 8 --no-special --debug-top 5
+→ ",\n\nI am trying to use the"
 ```
 
-Gibberish from token 0 of decode. Same Hello prompt on
-`Qwen3.5-0.8B-Q4_K_M.gguf` produces "Hello! How can I help you today?".
+This matches the local `llama-completion` CPU reference for the same raw
+prompt (`",\n\nI am trying to use the"`). The default chat-template path is
+also no longer multilingual garbage; first tokens are `<think>\n</think>\n`.
 
-## Bisection results
+`QW36_MAX_LAYERS=0 --no-special` on 35B still returns id 16870 (` Release`),
+and still matches the direct `gguf-py` zero-layer computation. That path only
+tests `embed_lookup -> output_norm -> untied output.weight`, not transformer
+quality. With the default chat template, `QW36_MAX_LAYERS=0` top-1 is
+`' most'`, not `Release`, but the meaningful correctness check is the full
+40-layer CPU result above.
 
-| config                          | top-1 first token       | conclusion |
-|---------------------------------|-------------------------|------------|
-| metal `--fast`, all 41 layers   | `nö` / `oxygen` / etc.  | broken |
-| metal `--fast`, `MAX_LAYERS=4`  | `ENDebru` / gibberish   | broken |
-| cpu  `MAX_LAYERS=1`             | `oxygenning`            | broken (DN layer 0) |
-| cpu  `MAX_LAYERS=8`             | `achuYRO`               | broken |
-| cpu  `MAX_LAYERS=0`             | ` Release` (id 16870)   | matches `gguf-py`; not a row-indexing bug |
-| cpu  `MAX_LAYERS=0`, **0.8B**   | `Hello` (id 9419) ✓     | works (tied embeddings) |
-| cpu  `MAX_LAYERS=1`, **0.8B**   | ` bye`                  | works (semantically near) |
-| metal `--profile reference`     | OOM (exit 137)          | n/a — 22 GB Q→fp16 won't fit on this host |
-
-**Reading.** With `MAX_LAYERS=0` only the path `embed_lookup → output_norm →
-lm_head matmul → argmax` runs. 0.8B has tied embeddings so lm_head sees the
-embed of "Hello" and argmax returns "Hello". 35B-A3B has **untied** output
-weight (both `token_embd.weight` and `output.weight` exist as separate
-Q8_0 tensors). The earlier claim that the zero-layer untied result should be
-a semantic neighbor was not evidence-backed; `gguf-py` produces ` Release`
-for the same zero-layer computation.
-
-That makes the embed/norm/lm_head trio (the path before any transformer
-layer fires) suspect on 35B. The model loads:
+## Model Notes
 
 - `general.architecture = qwen35moe`
 - `block_count = 41` (40 transformer + 1 nextn / MTP)
 - `attention.head_count = 16`, `head_count_kv = 2`, `head_dim = 256`
 - `ssm.group_count = 16`, `ssm.state_size = 128`, `ssm.inner_size = 4096`,
   `ssm.conv_kernel = 4`
-- `expert_count = 256`, `expert_used_count = 8`, `expert_feed_forward_length = 512`
-- `full_attention_interval = 4` → vanilla layers at multiples of 4,
-  rest are DeltaNet (matches qw36's `vanilla_q=11/41 ssm=30/41`).
+- `expert_count = 256`, `expert_used_count = 8`,
+  `expert_feed_forward_length = 512`,
+  `expert_shared_feed_forward_length = 512`
+- Full-attention layers are 3, 7, 11, ..., 39; the other 30 layers are
+  DeltaNet (current survey: `vanilla_q=10/40 fused_qkv=30/40 ssm=30/40`).
 - Embed + lm_head are Q8_0, shape `[2048, 248320]`.
 - attn_qkv (DN) is Q8_0 `[2048, 8192]` = `2*key_dim + value_dim`.
 
-## Top suspects (ranked)
+## Root Causes
 
-1. **Q8_0 row indexing for huge matrices.**  `embed_lookup` reads row 9419
-   of a 248320-row Q8_0 tensor. Offset = `9419 × (2048/32) × 34 = 20,495,744`
-   bytes — fits in `size_t` fine, but the GGUF loader passes data via mmap;
-   any pointer-arithmetic wraparound or signed-int promotion bug would only
-   surface on huge tensors. `qw36__dequant_row` for Q8_0 looks correct in
-   isolation (commit point: `common/qw36_dequant.c:676`) but hasn't been
-   diff-tested against a Python reference for this specific tensor.
+1. **MoE input/output aliasing.** CPU MoE was invoked as
+   `qw36__moe_forward_f32(st->x_rms, st->x_rms, ...)`. The implementation
+   zeroed `y` before expert matmuls, clearing `x` as well. `QW36_DEBUG_LAYER=1`
+   showed `||y||=0.000000` on every MoE block before the fix.
+2. **Missing Qwen3.5 shared-expert scalar gate.** The GGUF tensor
+   `ffn_gate_inp_shexp.weight` was not bound; shared experts were added
+   unscaled instead of `sigmoid(linear(x)) * shared_expert(x)`.
+3. **Qwen3.5 GGUF V-head layout.** llama.cpp stores value heads as
+   V-within-K groups. Runtime math expects K-grouped value heads. The fix
+   mirrors `../agent-infer`'s `reverse_v_reorder*` loaders and forwards the
+   inverse reorder into raw `ssm_out.weight`.
 
-2. **Untied lm_head + Q8_0 dispatch.**  The lm_head path landed for tied
-   embeddings in commit `743a158`; the untied case (separate
-   `output.weight`) follows the legacy lazy_materialize_f16 path. For
-   248320 × 2048 Q8_0 = ~497 MB tensor, the materialize-to-fp16 produces
-   a 1 GB fp16 buffer that the MPS GEMV reads. Worth confirming the
-   materialize loop walks all 248320 rows correctly (no row-count truncation).
+The negative DN probe env paths were deleted rather than kept as opt-in
+alternatives: `ssm_a` is always `log(abs(raw))`, Q/K head mapping is always
+`v / values_per_key`, and `attn_qkv` is always `[Q all | K all | V all]`.
 
-3. **MTP / nextn_predict_layers = 1.**  block_count is 41 but transformer
-   layers are 40; the 41st (blk.40) is a multi-token-prediction head.
-   qw36 now subtracts `nextn_predict_layers` at load time, so default forward
-   executes 40 transformer layers and skips blk.40.
+## Verification
 
-4. **DN config defaults for 35B-A3B.**  `dn_value_head_dim` is derived
-   from `inner_size / dn_value_head_dim` after `value_head_dim` is set to
-   `state_size`. For 35B: `state_size=128, inner_size=4096` → 32 value
-   heads of 128. That matches the model's value_dim = 4096. Likely OK.
-
-## Recommended next steps
-
-1. Continue the layer bisection from `MAX_LAYERS=1`; `MAX_LAYERS=0` is no
-   longer a useful failure signal because it matches the direct `gguf-py`
-   zero-layer computation.
-2. Use the 40-layer count when comparing against MLX/HF references; blk.40 is
-   MTP/nextn and should not be part of normal autoregressive forward.
-
-## DN probes attempted, all negative
-
-Two opt-in probes were added to bisect DN-internal behaviour on 35B:
-
-| env                    | what it does                                            |
-|------------------------|---------------------------------------------------------|
-| `QW36_DN_A_RAW=1`      | skip the `logf(|a|)` transform on `ssm_a` weight load   |
-| `QW36_DN_KH_MOD=1`     | flip k-head/v-head pairing to `v % n_key` (vs `v / group`) |
-
-`QW36_MAX_LAYERS=1` on 35B with the four combinations:
-
-| A_RAW | KH_MOD | first 4 tokens          |
-|-------|--------|-------------------------|
-| 0     | 0      | `oxygenning etc`        |
-| 0     | 1      | `ieurhythmurgy`         |
-| 1     | 0      | `oxygenaultenticated`   |
-| 1     | 1      | `ieurhythmurgy`         |
-
-All four are gibberish but differ — DN forward is sensitive to KH_MOD
-(no surprise — it changes the per-head q/k pairing). None converges to
-plausible text. The bug is deeper than these two probes.
-
-## Reasonable interim posture
-
-35B-A3B is documented as functional-smoke-only in AGENTS.md §Project shape
-("仅用于功能冒烟，不用于 perf 主线"). The model loads, runs end-to-end, and
-exits cleanly — qw36's plumbing for huge GGUFs works. The output text is
-incorrect because the DN layer 0 forward produces wrong values on this
-config (`ssm.state_size=128, inner_size=4096, group_count=16, conv_kernel=4`).
-**Do not optimize 35B perf** until at least MAX_LAYERS=1 yields a
-plausible top-1 on Hello. The probes stay in tree as opt-in for future
-investigators.
+- `make -C cpu`
+- `tests/q8_0_golden.sh`
+- `tests/f16_materialize_audit.sh`
+- `tests/quant_fastest_smoke.sh` (0.8B Metal fastest path unchanged)
+- `./qw36_cpu ... -p Hello -n 8 --no-special --debug-top 5`
+  starts with `,\n\nI am trying to use the`
+- `QW36_MAX_LAYERS=0 ./qw36_cpu ... -p Hello -n 1 --debug-top 5`
+  top-1 is `' most'` (chat template, not `Release`)

@@ -30,8 +30,8 @@
 /*   q = qkv[k_head*key_dim ..]            (already conv+SiLU'd by caller)*/
 /*   k = qkv[q_dim + k_head*key_dim ..]                                   */
 /*   v_in = qkv[q_dim + k_dim + v*val_dim ..]                             */
-/*   q ← L2-normalize(q) / sqrt(key_dim)                                  */
-/*   k ← L2-normalize(k)                                                  */
+/*   q ← RMSNorm(q, eps=1e-6) / key_dim                                  */
+/*   k ← RMSNorm(k, eps=1e-6) / sqrt(key_dim)                            */
 /*   x = α[v] + dt_bias[v];     softplus = log(1 + e^x) (or x if x>20)    */
 /*   g  = -e^{A_log[v]} * softplus;   exp_g = e^g                         */
 /*   β  = σ(b[v])                                                         */
@@ -53,58 +53,34 @@ void qw36__gated_delta_decode(const float *qkv,
 {
     const uint32_t q_dim_total = n_key * key_dim;
     const uint32_t k_dim_total = q_dim_total;
-    const float    inv_sqrt_d  = 1.0f / sqrtf((float)key_dim);
-
-    /* Qwen3.5 / 3.6 GGUF attn_qkv follows the reference split
-     * [Q all heads | K all heads | V all heads]. An earlier bisection
-     * treated it as [Qh,Kh,Vh] interleaved, which made the first vanilla
-     * layer receive a corrupted residual and produced multilingual noise.
-     * Keep the correct block layout by default; set QW36_QKV_INTERLEAVE=1
-     * only for experimental checkpoints that really store per-head blocks. */
-    static int qkv_interleave = -1;
-    if (qkv_interleave < 0) {
-        const char *e = getenv("QW36_QKV_INTERLEAVE");
-        qkv_interleave = (e && atoi(e) != 0) ? 1 : 0;
-    }
 
     for (uint32_t v = 0; v < n_value; v++) {
-        static int kh_mod = -1;
-        if (kh_mod < 0) {
-            const char *e = getenv("QW36_DN_KH_MOD");
-            kh_mod = e && atoi(e) ? 1 : 0;
-        }
         uint32_t group = (n_key && n_value % n_key == 0) ? n_value / n_key : 1;
         if (group == 0) group = 1;
-        const uint32_t kh = kh_mod
-            ? v % n_key
-            : (n_value >= n_key && n_value % n_key == 0)
-            ? v / group
-            : v % n_key;
-        const uint32_t head_stride = 2 * key_dim + val_dim;  /* per-head: q,k,v */
+        const uint32_t kh =
+            (n_value >= n_key && n_value % n_key == 0)
+                ? v / group
+                : v % n_key;
 
-        /* Copy and L2-normalize q, k for this head. */
+        /* Copy and RMS-normalize q, k for this head. */
         double qss = 0.0, kss = 0.0;
         for (uint32_t d = 0; d < key_dim; d++) {
-            if (qkv_interleave) {
-                qbuf[d] = qkv[kh * head_stride + d];
-                kbuf[d] = qkv[kh * head_stride + key_dim + d];
-            } else {
-                qbuf[d] = qkv[kh * key_dim + d];
-                kbuf[d] = qkv[q_dim_total + kh * key_dim + d];
-            }
+            qbuf[d] = qkv[kh * key_dim + d];
+            kbuf[d] = qkv[q_dim_total + kh * key_dim + d];
             qss += (double)qbuf[d] * qbuf[d];
             kss += (double)kbuf[d] * kbuf[d];
         }
-        float q_scale = 1.0f / sqrtf((float)qss + 1e-12f);
-        float k_scale = 1.0f / sqrtf((float)kss + 1e-12f);
+        float q_scale = 1.0f /
+            (sqrtf((float)qss + (float)key_dim * 1e-6f) *
+             sqrtf((float)key_dim));
+        float k_scale = 1.0f /
+            sqrtf((float)kss + (float)key_dim * 1e-6f);
         for (uint32_t d = 0; d < key_dim; d++) {
-            qbuf[d] *= q_scale * inv_sqrt_d;
+            qbuf[d] *= q_scale;
             kbuf[d] *= k_scale;
         }
 
-        const float *vin = qkv_interleave
-            ? qkv + v * head_stride + 2 * key_dim
-            : qkv + q_dim_total + k_dim_total + v * val_dim;
+        const float *vin = qkv + q_dim_total + k_dim_total + v * val_dim;
 
         /* Gating scalars. */
         float a_v = a_proj_raw[v] + dt_bias[v];
@@ -237,6 +213,8 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     const uint32_t kd = c->dn_key_head_dim;
     const uint32_t vd = c->dn_value_head_dim;
     if (!n_v || !n_k || !kd || !vd) return -1;
+    if (n_v > n_k && n_v % n_k == 0 && n_v / n_k > 1)
+        return -1;
     const uint32_t qkv_dim = n_k * kd * 2 + n_v * vd;
     const uint32_t z_dim = n_v * vd;
     const uint32_t alpha_offset = fused_proj ? qkv_dim + z_dim : 0;
@@ -397,6 +375,7 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     const uint32_t k_dim_t = n_k * kd;
     const uint32_t v_dim = n_v * vd;
     const uint32_t qkv_dim = q_dim + k_dim_t + v_dim;
+    const uint32_t vpk = (n_k && n_v % n_k == 0) ? n_v / n_k : 1;
     const int fused_proj = L->dn_qkv && !L->dn_gate &&
                            !L->dn_alpha && !L->dn_beta;
     const size_t fused_dim = (size_t)qkv_dim + v_dim + (size_t)n_v * 2;
@@ -408,6 +387,7 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
                       + (size_t)v_dim
                       + (size_t)n_v * 2
                       + (size_t)v_dim
+                      + (size_t)v_dim
                       + (size_t)kd * 2
                       + (fused_proj ? fused_dim : 0);
     float *blk = (float *)calloc(need, sizeof(float));
@@ -418,7 +398,8 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
     float *alpha = z_proj + v_dim;
     float *beta = alpha + n_v;
     float *gout = beta + n_v;
-    float *qb = gout + v_dim;
+    float *gout_out = gout + v_dim;
+    float *qb = gout_out + v_dim;
     float *kb = qb + kd;
     float *fused_raw = kb + kd;
 
@@ -458,6 +439,14 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
         return -4;
     }
 
+    if (vpk > 1) {
+        qw36__reverse_v_reorder_rows_f32(qkv + q_dim + k_dim_t,
+                                         v_dim, 1, n_k, vpk, vd);
+        qw36__reverse_v_reorder_rows_f32(z_proj, v_dim, 1, n_k, vpk, vd);
+        qw36__reverse_v_reorder_rows_f32(alpha, n_v, 1, n_k, vpk, 1);
+        qw36__reverse_v_reorder_rows_f32(beta, n_v, 1, n_k, vpk, 1);
+    }
+
     static int skip_conv = -1;
     if (skip_conv < 0) {
         const char *e = getenv("QW36_SKIP_CONV1D");
@@ -485,7 +474,14 @@ int qw36__attn_deltanet_forward(qw36_forward_ctx *fc,
         for (uint32_t d = 0; d < vd; d++) go[d] = qw36__silu(zp[d]) * go[d];
     }
 
-    if (qw36__matmul_lazy(st->x_rms, gout,
+    const float *dn_out_in = gout;
+    if (vpk > 1) {
+        memcpy(gout_out, gout, (size_t)v_dim * sizeof(float));
+        qw36__forward_v_reorder_rows_f32(gout_out, v_dim, 1, n_k, vpk, vd);
+        dn_out_in = gout_out;
+    }
+
+    if (qw36__matmul_lazy(st->x_rms, dn_out_in,
                           (const qw36_lazy_w *)L->dn_out,
                           fc->row_scratch)) {
         fprintf(stderr, "qw36: DN out projection failed at layer %u "

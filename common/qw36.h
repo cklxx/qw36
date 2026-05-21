@@ -157,6 +157,7 @@ typedef struct {
     void *moe_shared_gate;
     void *moe_shared_up;
     void *moe_shared_down;
+    void *moe_shared_gate_inp;  /* [hidden] -> scalar sigmoid gate */
 
     qw36_dtype dtype;
 } qw36_layer_weights;

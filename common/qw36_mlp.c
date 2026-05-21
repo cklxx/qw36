@@ -96,6 +96,7 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
 
     if (fc->gpu_state && !mlp_gpu_done && L->moe_router &&
         L->moe_expert_gate && L->moe_expert_up && L->moe_expert_down &&
+        !L->moe_shared_gate_inp &&
         eng->backend && eng->backend->rmsnorm &&
         eng->backend->moe_forward && eng->backend->residual_add) {
         const qw36_lazy_w *router = (const qw36_lazy_w *)L->moe_router;
@@ -173,9 +174,15 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
         const uint32_t mi = c->moe_intermediate_size
                           ? c->moe_intermediate_size
                           : ((const qw36_lazy_w *)L->moe_expert_gate)->rows;
+        const uint32_t si = c->moe_shared_expert_intermediate_size
+                          ? c->moe_shared_expert_intermediate_size
+                          : mi;
+        const uint32_t ai = mi > si ? mi : si;
         const size_t need = (size_t)c->moe_num_experts
                           + (size_t)c->moe_experts_per_tok * 2
-                          + (size_t)mi * 2
+                          + (size_t)ai * 2
+                          + (size_t)hidden
+                          + 1u
                           + (size_t)hidden;
         float *moe_scratch = (float *)calloc(need, sizeof(float));
         if (!moe_scratch) return -3;
@@ -187,11 +194,19 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
             (const qw36_lazy_w *)L->moe_shared_gate,
             (const qw36_lazy_w *)L->moe_shared_up,
             (const qw36_lazy_w *)L->moe_shared_down,
-            (uint32_t)hidden, mi, c->moe_num_experts,
+            (const qw36_lazy_w *)L->moe_shared_gate_inp,
+            (uint32_t)hidden, mi, si, c->moe_num_experts,
             (int)c->moe_experts_per_tok, c->moe_norm_topk_prob,
             moe_scratch, fc->row_scratch);
         free(moe_scratch);
         if (mrc) return -11;
+        if (fc->debug_layer) {
+            double ss = 0.0;
+            for (size_t i = 0; i < hidden; i++)
+                ss += (double)st->x_rms[i] * st->x_rms[i];
+            fprintf(stderr, "[L%u moe] ||y||=%.6f\n",
+                    layer_idx, sqrt(ss));
+        }
         qw36__residual_add_dispatch(x, st->x_rms, hidden);
     } else if (has_dense_swiglu_weights(L, (uint32_t)inter)) {
         if (qw36__swiglu_dispatch(st->x_rms, st->x_rms,

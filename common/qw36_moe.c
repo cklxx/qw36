@@ -56,7 +56,8 @@ static void softmax_k(float *vals, int k) {
  *
  *   expert_e(x) = down_exps[e] @ (qw36__silu(gate_exps[e] @ x) * (up_exps[e] @ x))
  *
- * scratch needs: hidden + n_experts + 2*k + 2*moe_inter + hidden floats. */
+ * scratch needs: n_experts + 2*k + 2*max(moe_inter, shared_inter)
+ *              + 2*hidden + 1 floats. */
 int qw36__moe_forward_f32(float *y, const float *x,
                            const qw36_lazy_w *router,
                            const qw36_lazy_w *gate_exps,
@@ -65,7 +66,9 @@ int qw36__moe_forward_f32(float *y, const float *x,
                            const qw36_lazy_w *shared_gate,
                            const qw36_lazy_w *shared_up,
                            const qw36_lazy_w *shared_down,
+                           const qw36_lazy_w *shared_gate_inp,
                            uint32_t hidden, uint32_t moe_inter,
+                           uint32_t shared_inter,
                            uint32_t n_experts, int top_k,
                            uint8_t norm_topk,
                            float *scratch, float *row_scratch)
@@ -73,12 +76,21 @@ int qw36__moe_forward_f32(float *y, const float *x,
     float    *r_logits = scratch;                          /* n_experts */
     float    *tk_vals  = r_logits + n_experts;             /* top_k    */
     uint32_t *tk_idx   = (uint32_t *)(tk_vals + top_k);    /* top_k    */
-    float    *tmp_gate = (float *)(tk_idx + top_k);        /* moe_inter*/
-    float    *tmp_up   = tmp_gate + moe_inter;             /* moe_inter*/
-    float    *tmp_y    = tmp_up   + moe_inter;             /* hidden   */
+    const uint32_t act_inter = moe_inter > shared_inter ? moe_inter : shared_inter;
+    float    *tmp_gate = (float *)(tk_idx + top_k);        /* act_inter*/
+    float    *tmp_up   = tmp_gate + act_inter;             /* act_inter*/
+    float    *tmp_y    = tmp_up   + act_inter;             /* hidden   */
+    float    *shared_gate_scalar = tmp_y + hidden;         /* 1        */
+    float    *tmp_x    = shared_gate_scalar + 1;           /* hidden   */
+    const float *xin = x;
+
+    if (y == x) {
+        memcpy(tmp_x, x, (size_t)hidden * sizeof(float));
+        xin = tmp_x;
+    }
 
     /* 1. router */
-    if (qw36__matmul_lazy(r_logits, x, router, row_scratch)) return -1;
+    if (qw36__matmul_lazy(r_logits, xin, router, row_scratch)) return -1;
 
     /* 2. top-k */
     top_k_select(r_logits, n_experts, top_k, tk_idx, tk_vals);
@@ -92,8 +104,8 @@ int qw36__moe_forward_f32(float *y, const float *x,
     for (int t = 0; t < top_k; t++) {
         const uint32_t e = tk_idx[t];
         const float    p = tk_vals[t];
-        if (qw36__matmul_lazy_slice(tmp_gate, x, gate_exps, e, row_scratch)) return -1;
-        if (qw36__matmul_lazy_slice(tmp_up,   x, up_exps,   e, row_scratch)) return -1;
+        if (qw36__matmul_lazy_slice(tmp_gate, xin, gate_exps, e, row_scratch)) return -1;
+        if (qw36__matmul_lazy_slice(tmp_up,   xin, up_exps,   e, row_scratch)) return -1;
         for (uint32_t i = 0; i < moe_inter; i++)
             tmp_gate[i] = qw36__silu(tmp_gate[i]) * tmp_up[i];
         if (qw36__matmul_lazy_slice(tmp_y, tmp_gate, down_exps, e, row_scratch)) return -1;
@@ -102,12 +114,18 @@ int qw36__moe_forward_f32(float *y, const float *x,
 
     /* 5. shared expert (Qwen3-MoE: always-on extra path) */
     if (shared_gate && shared_up && shared_down) {
-        if (qw36__matmul_lazy(tmp_gate, x, shared_gate, row_scratch)) return -1;
-        if (qw36__matmul_lazy(tmp_up,   x, shared_up,   row_scratch)) return -1;
-        for (uint32_t i = 0; i < moe_inter; i++)
+        if (qw36__matmul_lazy(tmp_gate, xin, shared_gate, row_scratch)) return -1;
+        if (qw36__matmul_lazy(tmp_up,   xin, shared_up,   row_scratch)) return -1;
+        for (uint32_t i = 0; i < shared_inter; i++)
             tmp_gate[i] = qw36__silu(tmp_gate[i]) * tmp_up[i];
         if (qw36__matmul_lazy(tmp_y, tmp_gate, shared_down, row_scratch)) return -1;
-        for (uint32_t i = 0; i < hidden; i++) y[i] += tmp_y[i];
+        float scale = 1.0f;
+        if (shared_gate_inp) {
+            if (qw36__matmul_lazy(shared_gate_scalar, xin, shared_gate_inp,
+                                  row_scratch)) return -1;
+            scale = 1.0f / (1.0f + expf(-shared_gate_scalar[0]));
+        }
+        for (uint32_t i = 0; i < hidden; i++) y[i] += scale * tmp_y[i];
     }
     return 0;
 }
