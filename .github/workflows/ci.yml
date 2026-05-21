@@ -77,11 +77,18 @@ jobs:
           if [ -n "${QW36_TEST_MODEL:-}" ] && [ -f "${QW36_TEST_MODEL}" ]; then
             tests/precision_cpu_vs_metal.sh "$QW36_TEST_MODEL"
           else
-            # the script itself short-circuits with "skip: model not found"
-            # when its default path is absent — invoke it so we exercise
-            # the test harness wiring even without a model.
             tests/precision_cpu_vs_metal.sh
           fi
+
+      - name: Correctness greedy gate (per-KV-config token match)
+        shell: bash
+        env:
+          QW36_TEST_MODEL: ${{ env.QW36_TEST_MODEL }}
+        run: |
+          set -euo pipefail
+          # Only meaningful with a model — but always invoke the script
+          # so the harness wiring stays exercised.
+          tests/correctness_greedy.sh
 
   cuda-build-check:
     name: linux / cuda compile check

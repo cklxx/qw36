@@ -71,8 +71,10 @@ check: cpu
 	tests/golden_kernels.sh
 	@if [ -f "$${QW36_TEST_MODEL:-/Users/bytedance/code/agent-infer/models/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf}" ]; then \
 	    tests/kvcache_e2e.sh; \
+	    tests/correctness_greedy.sh; \
 	else \
 	    echo "[kvcache-e2e] skip: model not found"; \
+	    echo "[correctness-greedy] skip: model not found"; \
 	fi
 
 # Full perf bench. Slower; intended for "I think this is ready to land".
