@@ -11,23 +11,34 @@ fi
 
 if [ ! -x ./qw36_metal ]; then make -s metal; fi
 
+run_summary() {
+  "$@" 2>&1 | grep -E "generated|prefill|affine32 repacked"
+}
+
 echo "=== baseline (fp16 path, no quant) ==="
 for i in 1 2 3; do
-  QW36_METAL_FP16_WEIGHTS=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+  run_summary env QW36_METAL_FP16_WEIGHTS=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128
 done
 
 echo
 echo "=== QUANT_GPU current (default kernel) ==="
 for i in 1 2 3; do
-  QW36_METAL_QUANT_GPU=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+  run_summary env QW36_METAL_QUANT_GPU=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128
 done
 
 echo
-echo "=== QUANT_GPU + Q4K_QUAD opt-in (when codex lands the new kernel) ==="
+echo "=== QUANT_GPU + Q4K_AFFINE32 opt-in ==="
 for i in 1 2 3; do
-  QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 2>&1 | grep -E "generated|prefill"
+  run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128
 done
 
 echo
-echo "=== correctness check (Hello continuation) ==="
-QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 16 2>&1 | tail -3
+echo "=== QUANT_GPU + Q4K_QUAD opt-in (legacy experimental kernel) ==="
+for i in 1 2 3; do
+  run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_QUAD=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 128 ||
+    echo "legacy Q4K_QUAD run failed"
+done
+
+echo
+echo "=== correctness check (Hello continuation, affine32) ==="
+QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 ./qw36_metal -m "$MODEL" -p "Hello" -n 16 2>&1 | tail -3

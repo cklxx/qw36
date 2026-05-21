@@ -1647,6 +1647,94 @@ kernel void qw36_matmul_q4_k_qmv_quad_f32(
     }
 }
 
+static inline float qw36_affine32_half(device const uchar *p, uint half_idx)
+{
+    device const half *h = (device const half *)p;
+    return float(h[half_idx]);
+}
+
+static inline float qw36_qdot4_affine32_16(device const uchar *qbytes,
+                                           device const float *x,
+                                           uint k,
+                                           float scale,
+                                           float bias)
+{
+    float qacc = 0.0f;
+    float xsum = 0.0f;
+    for (uint i = 0; i < 8u; ++i) {
+        uchar byte = qbytes[i];
+        float x0 = x[k + i * 2u + 0u];
+        float x1 = x[k + i * 2u + 1u];
+        xsum += x0 + x1;
+        qacc += x0 * float(byte & 0x0fu) + x1 * float(byte >> 4);
+    }
+    return scale * qacc + bias * xsum;
+}
+
+/* Q4K_AFFINE32 qmv_fast-style matmul.
+ *
+ * Layout per 256 elements:
+ *   half scale[8], half bias[8], uint8 packed_q[8][16]
+ * where each 32-element group is affine: value = q * scale + bias.
+ *
+ * Threadgroup: 4 SIMD groups (128 threads). Each SIMD group owns 4 output
+ * rows. Each lane processes 16 contiguous K values at a time, so two lanes
+ * cover one affine32 group and 32 lanes cover a 512-wide K tile. This keeps
+ * intra-row parallelism while reusing the same x segment across 4 rows. */
+kernel void qw36_matmul_q4k_affine32_qmv_fast_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 160u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+        uint group = k >> 5;          /* 32-element affine group */
+        uint block = group >> 3;      /* 8 groups per 256-element block */
+        uint sub = group & 7u;
+        uint group_local = k & 31u;   /* 0 or 16 for this schedule */
+        uint qbyte_offset = group_local >> 1;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 160u;
+            float scale = qw36_affine32_half(blk, sub);
+            float bias = qw36_affine32_half(blk + 16u, sub);
+            device const uchar *qbytes = blk + 32u + sub * 16u + qbyte_offset;
+            acc[r] += qw36_qdot4_affine32_16(qbytes, x, k, scale, bias);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
 kernel void qw36_matmul_q6_k_f32(
     device float       *y    [[buffer(0)]],
     device const float *x    [[buffer(1)]],

@@ -130,12 +130,14 @@ int qw36__attn_vanilla_forward(qw36_forward_ctx *fc,
     const int fused_qkv = wq_lw && !wk_lw && !wv_lw;
     /* The fused decode kernel reads q/k/v as fp32; the matmul writing them
      * may be either MPS (when weights are F16) or the native quantised
-     * dequant+gemv kernel (when weights stay Q4_K/Q5_K/Q6_K/Q8_0 on GPU).
+     * dequant+gemv kernel (when weights stay Q4_K/Q5_K/Q6_K/Q8_0 or
+     * affine32-repacked Q4_K on GPU).
      * Either path produces fp32 q/k/v, so allow the fused fast-path in both
      * cases — the slower prep+score+combine fallback still cannot consume
      * the gated q layout, so non-fused matmul backends fall back to CPU. */
     #define QW36_FUSED_DTYPE_OK(d_) ((d_) == QW36_DTYPE_F16 || \
-        (d_) == QW36_DTYPE_Q4_K || (d_) == QW36_DTYPE_Q5_K || \
+        (d_) == QW36_DTYPE_Q4_K || (d_) == QW36_DTYPE_Q4K_AFFINE32 || \
+        (d_) == QW36_DTYPE_Q5_K || \
         (d_) == QW36_DTYPE_Q6_K || (d_) == QW36_DTYPE_Q8_0)
     const int dtype_ok = fused_qkv
         ? (wq_lw && QW36_FUSED_DTYPE_OK(wq_lw->dtype))
