@@ -20,6 +20,47 @@ the design is reviewed.
 - Apple SDK headers:
   `MPSMatrixMultiplication.h` and `MPSMatrix.h`
 
+## S2 Implementation Result
+
+Phase S2 landed as an opt-in path behind
+`QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1`. It repacks GGUF Q4_K into
+160-byte affine32 blocks at load time, then uses
+`qw36_matmul_q4k_affine32_qmv_fast_f32` for decode GEMV.
+
+Correctness gates passed:
+
+```sh
+make metal
+./tests/precision_cpu_vs_metal.sh
+QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 ./qw36_metal ... -p Hello -n 16
+QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 ./qw36_metal ... -p 写一首关于秋天的古诗 -n 32
+```
+
+The affine32 kernel is a clear Q4_K kernel win, but not a whole-model 150+
+tok/s win because this model still spends most quant-path time in Q5_K/Q6_K
+and the fp16 lm_head. Standalone-profile comparison on `Hello -n 16`:
+
+| shape (rows x K) | old Q4_K avg us | affine32 avg us |
+|---|---:|---:|
+| 3584x1024 | 126.3 | 22.8 |
+| 2048x1024 | 82.4 | 14.9 |
+| 1024x3584 | 70.3 | 27.3 |
+| 4096x1024 | 146.4 | 22.0 |
+| 1024x2048 | 49.5 | 17.4 |
+
+End-to-end decode on this host:
+
+| mode | prompt | generated speed |
+|---|---|---:|
+| fp16 weights | `Hello` | 115-120 tok/s |
+| QUANT_GPU old | `Hello` | 57-59 tok/s |
+| QUANT_GPU + affine32 | `Hello` | 75-85 tok/s |
+| QUANT_GPU + affine32 | `The capital of France is` | 86 tok/s |
+
+Conclusion: keep affine32 opt-in for the low-memory path and use the same
+repack/qmv_fast pattern for Q5_K next. Do not make it the default speed path
+until the remaining Q5_K/Q6_K bottlenecks are addressed.
+
 ## Measurement Notes
 
 `QW36_METAL_PERF=1` disables batch command buffers so absolute per-token speed
