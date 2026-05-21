@@ -17,7 +17,7 @@ cc $CFLAGS -Icommon tools/check_goldens.c -o qw36_check_goldens -lm
 echo "[golden] (re)generate fixtures"
 ./qw36_gen_goldens tests/goldens
 
-for k in rmsnorm silu swiglu; do
+for k in rmsnorm silu swiglu matmul rope qgate residual_add; do
     fix="tests/goldens/${k}.bin"
     if [ ! -f "$fix" ]; then
         echo "[golden] FAIL: missing fixture $fix"; exit 1

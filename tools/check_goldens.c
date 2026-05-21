@@ -23,6 +23,10 @@ typedef enum {
     QW36_GOLDEN_RMSNORM = 1,
     QW36_GOLDEN_SWIGLU  = 2,
     QW36_GOLDEN_SILU    = 3,
+    QW36_GOLDEN_MATMUL  = 4,
+    QW36_GOLDEN_ROPE    = 5,
+    QW36_GOLDEN_QGATE   = 6,
+    QW36_GOLDEN_RESIDUAL_ADD = 7,
 } qw36_golden_kernel;
 
 static float silu_f32(float x) { return x / (1.0f + expf(-x)); }
@@ -134,6 +138,78 @@ int main(int argc, char **argv) {
         for (uint32_t i = 0; i < out_dims[0]; i++)
             y[i] = silu_f32(inputs[0][i]) * inputs[1][i];
         rc = diff_floats(y, outputs[0], out_dims[0], rtol, atol, "swiglu");
+        free(y);
+        break;
+    }
+    case QW36_GOLDEN_MATMUL: {
+        if (n_inputs != 2 || n_outputs != 1) {
+            fprintf(stderr, "matmul fixture shape mismatch\n"); rc = 2; break;
+        }
+        uint32_t cols = in_dims[0];
+        uint32_t w_n  = in_dims[1];
+        uint32_t rows = out_dims[0];
+        if (w_n != rows * cols) {
+            fprintf(stderr, "matmul: W shape inconsistent\n"); rc = 2; break;
+        }
+        float *y = (float *)malloc(rows * sizeof(float));
+        for (uint32_t r = 0; r < rows; r++) {
+            double acc = 0.0;
+            const float *wr = inputs[1] + (size_t)r * cols;
+            for (uint32_t c = 0; c < cols; c++) acc += (double)wr[c] * inputs[0][c];
+            y[r] = (float)acc;
+        }
+        rc = diff_floats(y, outputs[0], rows, rtol, atol, "matmul");
+        free(y);
+        break;
+    }
+    case QW36_GOLDEN_ROPE: {
+        /* Hard-coded knobs match gen_goldens: pos=17, base=1e6, head_dim=128.
+         * Re-deriving here keeps check_goldens self-contained. */
+        if (n_inputs != 1 || n_outputs != 1 ||
+            in_dims[0] != out_dims[0]) {
+            fprintf(stderr, "rope fixture shape mismatch\n"); rc = 2; break;
+        }
+        uint32_t head_dim = in_dims[0];
+        const float base = 1.0e6f;
+        const uint32_t pos = 17;
+        float *y = (float *)malloc(head_dim * sizeof(float));
+        memcpy(y, inputs[0], head_dim * sizeof(float));
+        for (uint32_t i = 0; i < head_dim / 2; i++) {
+            float freq = 1.0f / powf(base, (float)(2u * i) / (float)head_dim);
+            float angle = (float)pos * freq;
+            float c = cosf(angle), s = sinf(angle);
+            float a = y[2*i], b = y[2*i + 1];
+            y[2*i]     = a * c - b * s;
+            y[2*i + 1] = a * s + b * c;
+        }
+        rc = diff_floats(y, outputs[0], head_dim, rtol, atol, "rope");
+        free(y);
+        break;
+    }
+    case QW36_GOLDEN_QGATE: {
+        if (n_inputs != 1 || n_outputs != 1 ||
+            in_dims[0] != 2u * out_dims[0]) {
+            fprintf(stderr, "qgate fixture shape mismatch\n"); rc = 2; break;
+        }
+        uint32_t q_dim = out_dims[0];
+        float *y = (float *)malloc(q_dim * sizeof(float));
+        for (uint32_t i = 0; i < q_dim; i++) {
+            float g = 1.0f / (1.0f + expf(-inputs[0][q_dim + i]));
+            y[i] = inputs[0][i] * g;
+        }
+        rc = diff_floats(y, outputs[0], q_dim, rtol, atol, "qgate");
+        free(y);
+        break;
+    }
+    case QW36_GOLDEN_RESIDUAL_ADD: {
+        if (n_inputs != 2 || n_outputs != 1 ||
+            in_dims[0] != in_dims[1] || in_dims[0] != out_dims[0]) {
+            fprintf(stderr, "residual_add fixture shape mismatch\n"); rc = 2; break;
+        }
+        float *y = (float *)malloc(out_dims[0] * sizeof(float));
+        for (uint32_t i = 0; i < out_dims[0]; i++)
+            y[i] = inputs[0][i] + inputs[1][i];
+        rc = diff_floats(y, outputs[0], out_dims[0], rtol, atol, "residual_add");
         free(y);
         break;
     }
