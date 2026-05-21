@@ -42,6 +42,8 @@ CPU baseline 1.7 tok/s.
 | b5e0ecb (triple)   | **170 short / 139 sustained** | + Q6K → scale16 (qkv = Q6K). Triple-affine through fp16 ceiling |
 | 743a158 (triple + lm_head) | **208 peak / 185 avg short / 176 sustained** | + lm_head Q6K_SCALE16 (decouple tied embed alias). 200 tok/s target hit. |
 | 2464023 (Q6K_MLX default) | **~204 stable short / 176 sustained / 92 at n=2048** | + MLX bit-trick qdot for Q6K (lm_head + ffn_down). +3-4% short, +6% at n=2048 |
+| 77653bd (quant gate_up fused) | **~213 hello / ~205 essay / 182 sustained** | + extended `lazy_fuse_dense_gate_up` to Q4K/Q5K/Q6K + AFFINE32 variants. Halves MLP matmul dispatches per vanilla layer. +5% across the board. |
+| b4bb6f6 (KV transposed, opt-in) | **n=1024 +15% / n=2048 +24%** | + transposed K/V cache layout `QW36_METAL_KV_TRANSPOSED=1` (codex). Adjacent-t reads contiguous along the lane. n=2048: 92→114 tok/s. Short-context regresses 10% (transposed write cost), so opt-in only. |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -130,24 +132,22 @@ Three compound levers got us here:
 Attention is still O(seq). Flash-attention-style streaming pass is the next
 lever for n >= 2048.
 
-**Side-by-side vs MLX (commit 7e07bc7, `tests/compare_mlx.sh long`, load 5.6):**
+**Side-by-side vs MLX (after gate_up quant fusion, `REPEAT=5 tests/compare_mlx.sh short`, load 4.5):**
 
-Same prompts, same n, both greedy + `--ignore-chat-template`. Median of 3.
+Same prompts, same n, both greedy + `--ignore-chat-template`. Median of 5.
 
 | prompt          | n    | qw36 (Q4_K_M) | MLX (4-bit) | qw36/MLX |
 |-----------------|-----:|--------------:|------------:|---------:|
-| hello           | 64   | 190.2 | 298.3 | 64% |
-| hello           | 256  | 189.7 | 290.0 | 65% |
-| hello           | 512  | 191.0 | 291.4 | 66% |
-| hello           | 1024 | 190.4 | 289.7 | 66% |
-| long_essay      | 64   | 185.7 | 299.6 | 62% |
-| long_essay      | 256  | 167.3 | 319.1 | 52% |
-| long_essay      | 512  | 157.6 | 255.6 | 62% |
-| long_essay      | 1024 |  97.7 | 320.2 | **31%** |
-| detailed_essay  | 64   | 197.1 | 334.5 | 59% |
-| detailed_essay  | 256  | 170.1 | 326.6 | 52% |
-| detailed_essay  | 512  | 154.8 | 283.5 | 55% |
-| detailed_essay  | 1024 |  99.6 | 294.9 | **34%** |
+| hello           | 64   | 212.5 | 326.9 | 65% |
+| hello           | 256  | 212.4 | 328.0 | 65% |
+| long_essay      | 64   | 205.6 | 324.7 | 63% |
+| long_essay      | 256  | 181.7 | 312.0 | 58% |
+| detailed_essay  | 64   | 198.7 | 320.6 | 62% |
+| detailed_essay  | 256  | 173.5 | 306.2 | 57% |
+
+Earlier long-context data (n=1024 essay was qw36 ~100 vs MLX ~290 = 31%) —
+not re-run yet under the new gate_up fusion + Q6K_MLX defaults; awaiting
+codex's K-cache transposition (task W) for the proper long-context push.
 
 **Reading:**
 - On *hello* (short EOS-bounded outputs) qw36 stays flat at ~190 across all
