@@ -92,6 +92,8 @@ geometry (4-lane simdgroup quad) didn't help — see `docs/q4k_qmv_quad_failed.m
 | persistent compute encoder (codex O)    | minimal — CPU encode already <0.1% of budget |
 | Q4K → affine32 + qmv_fast kernel (S2)   | +45% over native Q4_K quant_gpu (57→85 tok/s) but still under fp16 MPS ceiling (115). Kept as opt-in: `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1`. Sanity passes (max_abs 1e-4 vs Q4_K original). |
 | MLX-style qmv variant for Q4K affine32 (8d45cca) | Slower than codex's variant on n=256 (78 vs 87 tok/s) **under load 5+**. Re-tested 2026-05-21 under load 3.0 with 5-rep medians: now wins +5% sustained essay. Promoted default-on in aa293f7 (`QW36_METAL_Q4K_AFFINE32_MLX=0` to opt out). Lesson: machine-load-skewed early results need a 5-rep retest before discarding. |
+| MoE 1-row-per-TG simdgroup GEMV          | 24× slower on 35B-A3B. 4096 separate threadgroups × 32 lanes dominated by per-TG launch overhead; replaced by MLX SwitchGLU with ROWS_PER_SIMD. See `docs/moe_kernel_failed.md`. |
+| MoE Q8-only fast path (Q8 activation × Q8 weight) | Wrong direction: 35B expert weights are Q4/Q5, repacking to Q8 doubles bytes read with no compute win. Kernel should operate on native quant dtype. Deleted; replaced by SwitchGLU gather_qmm on Q4/Q5/Q6 directly. |
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).

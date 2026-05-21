@@ -51,6 +51,7 @@ Keep these — they document blind alleys so we don't retry them.
 |------|------------|
 | [`q4k_qmv_quad_failed.md`](q4k_qmv_quad_failed.md) | first Q4_K qmv_quad port was 29 tok/s vs 58 baseline; root cause: GGUF Q4_K layout has per-32 scales, qmv_quad assumed per-group |
 | [`fp16_state_root_cause.md`](fp16_state_root_cause.md) | fp16 state buffer caused multi-layer logit drift; bf16 would have been right (per agent-infer) |
+| [`moe_kernel_failed.md`](moe_kernel_failed.md) | MoE rewrite dead ends — 1-row-per-TG (24× slower) and Q8-only (wrong direction); the lessons that drove the SwitchGLU design |
 | [`qwen36_35b_a3b_status.md`](qwen36_35b_a3b_status.md) | Qwen3.6-35B-A3B (MoE) functional-smoke bring-up notes: MoE/aliasing bug, GGUF V-head reorder, gibberish-bisection history |
 
 ## Codex task briefs (`docs/briefs/`)
