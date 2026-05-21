@@ -16,7 +16,14 @@ using namespace metal;
 
 constant uint QW36_DTYPE_F32  = 0;
 constant uint QW36_DTYPE_F16  = 1;
+constant uint QW36_DTYPE_Q8_0 = 8;
+constant uint QW36_DTYPE_Q4_K = 12;
+constant uint QW36_DTYPE_Q5_K = 13;
+constant uint QW36_DTYPE_Q6_K = 14;
 constant uint QW36_DTYPE_BF16 = 30;
+constant uint QW36_DTYPE_Q4K_AFFINE32 = 100;
+constant uint QW36_DTYPE_Q5K_AFFINE32 = 101;
+constant uint QW36_DTYPE_Q6K_SCALE16  = 102;
 
 static inline float qw36_bf16_to_f32(ushort v)
 {
@@ -32,6 +39,65 @@ static inline float qw36_load_scalar(device const uchar *ptr, uint dtype, uint i
         return float(((device const half *)ptr)[i]);
     } else if (dtype == QW36_DTYPE_BF16) {
         return qw36_bf16_to_f32(((device const ushort *)ptr)[i]);
+    } else if (dtype == QW36_DTYPE_Q8_0) {
+        /* 34-byte blocks of 32 elements: fp16 d + int8 qs[32]. */
+        uint block = i >> 5u;          /* i / 32 */
+        uint local = i & 31u;
+        device const uchar *b = ptr + block * 34u;
+        half d = ((device const half *)b)[0];
+        device const char *qs = (device const char *)(b + 2);
+        int q = int(qs[local]);
+        return float(d) * float(q);
+    } else if (dtype == QW36_DTYPE_Q4K_AFFINE32) {
+        /* 160-byte blocks of 256 elements:
+         *   half scale[8] | half bias[8] | uint8 packed_q[8][16]
+         * Each 32-element sub-block has one (scale,bias). 4-bit values
+         * pack 2 per byte; even/odd low/high nibble. */
+        uint block = i >> 8u;
+        uint sub   = (i >> 5u) & 7u;        /* 0..7 */
+        uint local = i & 31u;               /* 0..31 within sub-block */
+        device const uchar *b = ptr + block * 160u;
+        half scale = ((device const half *)b)[sub];
+        half bias  = ((device const half *)b)[8u + sub];
+        uchar packed = b[32u + sub * 16u + (local >> 1u)];
+        uint nib = (local & 1u) ? (uint(packed) >> 4) : (uint(packed) & 0x0fu);
+        return float(nib) * float(scale) + float(bias);
+    } else if (dtype == QW36_DTYPE_Q5K_AFFINE32) {
+        /* 192-byte blocks of 256 elements:
+         *   half scale[8] | half bias[8] | uint8 packed_q[8][20]
+         * Each sub-block stores 32 5-bit values in two 5-byte packs of 8. */
+        uint block = i >> 8u;
+        uint sub   = (i >> 5u) & 7u;
+        uint local = i & 31u;
+        device const uchar *b = ptr + block * 192u;
+        half scale = ((device const half *)b)[sub];
+        half bias  = ((device const half *)b)[8u + sub];
+        device const uchar *p = b + 32u + sub * 20u + (local >> 3u) * 5u;
+        uint idx = local & 7u;
+        ulong bits = ulong(p[0]) |
+                     (ulong(p[1]) << 8) |
+                     (ulong(p[2]) << 16) |
+                     (ulong(p[3]) << 24) |
+                     (ulong(p[4]) << 32);
+        uint q = uint((bits >> (5u * idx)) & 31ul);
+        return float(q) * float(scale) + float(bias);
+    } else if (dtype == QW36_DTYPE_Q6K_SCALE16) {
+        /* 224-byte blocks of 256 elements:
+         *   half scale[16] | uint8 packed_q[16][12]
+         * Per-16 scale, value = (q - 32) * scale. */
+        uint block = i >> 8u;
+        uint sub   = (i >> 4u) & 15u;
+        uint local = i & 15u;
+        device const uchar *b = ptr + block * 224u;
+        half scale = ((device const half *)b)[sub];
+        device const uchar *p = b + 32u + sub * 12u;
+        uint bit = 6u * local;
+        uint byte = bit >> 3;
+        uint shift = bit & 7u;
+        uint bits = uint(p[byte]);
+        if (byte + 1u < 12u) bits |= uint(p[byte + 1u]) << 8;
+        uint q = (bits >> shift) & 63u;
+        return (float(q) - 32.0f) * float(scale);
     }
     return 0.0f;
 }
