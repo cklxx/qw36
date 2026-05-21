@@ -132,7 +132,10 @@ Runtime and debug knobs are read at startup unless noted otherwise:
 | `QW36_METAL_FP16_XRMS=1` / `QW36_METAL_FP16_Q=1` | Metal diagnostics. Flip only the RMSNorm-output edge or only the attention-output edge to fp16 for #46 bisection. |
 | `QW36_METAL_F16_GEMV_QUAD=1` | Metal diagnostic. Route fp16-weight GEMV through a qmv_quad-style MSL kernel for rows up to `QW36_METAL_F16_GEMV_QUAD_MAX_ROWS` (default 512). Correct but slower than MPS on this host, so off by default. |
 | `QW36_METAL_MMA_GEMV=1`      | Metal diagnostic. Route fp16-weight GEMV through an 8x8 `simdgroup_matrix` MMA kernel, optionally bounded by `QW36_METAL_MMA_GEMV_MIN_ROWS` / `QW36_METAL_MMA_GEMV_MAX_ROWS`. Correct but slower than MPS for M=1 decode on this host. |
-| `QW36_METAL_QUANT_GPU=1`     | Metal only. Use GPU-native quant matmul instead of host fp32/fp16 materialization. This saves roughly 1 GB RAM on the 0.8B model and currently runs around 40 tok/s, so it is an opt-in low-memory path. |
+| `QW36_METAL_QUANT_GPU=1`     | Metal only. Use GPU-native quant matmul instead of host fp32/fp16 materialization. This saves roughly 1 GB RAM on the 0.8B model and is an opt-in low-memory path. |
+| `QW36_METAL_QK_REPACK=1`     | Metal quant path. Repack hot Q4_K/Q5_K weights into qmv-friendly affine32 layouts. On Qwen3.5-0.8B-Q4_K_M this raises the quant path from roughly 35-60 tok/s to about 100 tok/s in the short Hello bench while preserving the standard smoke output. |
+| `QW36_METAL_Q4K_AFFINE32=1` / `QW36_METAL_Q5K_AFFINE32=1` | Metal diagnostics. Enable only one affine32 repack family for bisecting Q4_K or Q5_K kernels. |
+| `QW36_METAL_Q6K_SCALE16=1`   | Metal diagnostic. Repack Q6_K into a scale16 qmv layout. The kernel is faster in isolation, but this path is not part of `QW36_METAL_QK_REPACK=1` because it needs more golden-logit validation before being treated as correctness-safe. |
 | `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `||x||` and the first residual components before/after each block. Useful for bisecting the first divergent layer. |
 | `QW36_MAX_LAYERS=<n>`        | Stop forward after the first `n` layers. Used with layer traces for range bisection. |
 | `QW36_BYPASS_LAYERS=<spec>`  | Bypass selected layer ids or ranges during forward. Used to isolate a bad block without changing model loading. |

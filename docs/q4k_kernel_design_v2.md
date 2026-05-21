@@ -61,6 +61,38 @@ Conclusion: keep affine32 opt-in for the low-memory path and use the same
 repack/qmv_fast pattern for Q5_K next. Do not make it the default speed path
 until the remaining Q5_K/Q6_K bottlenecks are addressed.
 
+## Follow-on: Q5_K/Q6_K Repack
+
+The Q5_K follow-on is implemented behind
+`QW36_METAL_QUANT_GPU=1 QW36_METAL_QK_REPACK=1`. It uses the same affine
+per-32 scheme as Q4_K, except each 32-element group stores four little-endian
+5-byte packs (8 values per pack). Load-time sanity checks compare sampled
+rows against the original GGUF Q5_K dequantizer; the observed max absolute
+delta on Qwen3.5-0.8B-Q4_K_M is `0.000202417`.
+
+Q6_K was also implemented as an explicit diagnostic path,
+`QW36_METAL_Q6K_SCALE16=1`, with `half scale[16]` plus 16 packed 6-bit
+groups per 256 elements. It is faster than the old Q6_K row kernel in
+standalone profiles, but it is intentionally not enabled by
+`QW36_METAL_QK_REPACK=1`: the Q6 path changes enough fp32 weight values
+through fp16 scale rounding that it needs golden-logit validation before it
+can be called correctness-safe.
+
+Current correctness-safe low-memory path:
+
+```sh
+QW36_METAL_QUANT_GPU=1 QW36_METAL_QK_REPACK=1 ./qw36_metal ...
+```
+
+Bench snapshot on this host with `tests/quant_kernel_bench.sh`:
+
+| mode | Hello decode speed |
+|---|---:|
+| QUANT_GPU old | 35-38 tok/s |
+| QUANT_GPU + Q4K_AFFINE32 | 53-57 tok/s |
+| QUANT_GPU + QK_REPACK (Q4_K+Q5_K) | 99-103 tok/s |
+| legacy Q4K_QUAD | 21 tok/s |
+
 ## Measurement Notes
 
 `QW36_METAL_PERF=1` disables batch command buffers so absolute per-token speed
