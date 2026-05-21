@@ -1495,6 +1495,204 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     }
 }
 
+/* qw36_attn_decode_flash_f16kv_f32 — single-pass online-softmax variant.
+ *
+ * Same front matter as the fused f16kv kernel (Q/K compute with per-head
+ * RMSNorm, partial-rotary RoPE, Q-gate detection, KV append), but the
+ * attention itself uses the FlashAttention-style online softmax: stream
+ * through K and V in one pass, maintaining a running (m, l, o) state.
+ *
+ * Math: for each timestep t,
+ *
+ *   s_t       = q · k[t] / sqrt(head_dim)
+ *   m_new     = max(m, s_t)
+ *   p_t       = exp(s_t - m_new)
+ *   correction= exp(m - m_new)
+ *   l_new     = l * correction + p_t
+ *   o[d]      = o[d] * correction + p_t * v[t][d]   (per lane)
+ *   m         = m_new
+ *
+ * After the loop, y[d] = o[d] / l. No threadgroup `scores[count]` array
+ * (saves O(seq_pos) TG memory and one barrier per t). The bandwidth win
+ * shows up at long context where the score array would otherwise spill.
+ *
+ * Opt-in via QW36_METAL_FLASH_ATTN=1 (host-side dispatch). Correctness
+ * is the gate, not speed — we keep the existing fused kernel as the
+ * fp16kv-default until precision smoke passes long enough that the gate
+ * flips by default.
+ */
+kernel void qw36_attn_decode_flash_f16kv_f32(
+    device uchar       *y            [[buffer(0)]],
+    device const float *q_raw        [[buffer(1)]],
+    device const float *k_raw        [[buffer(2)]],
+    device const float *v_raw        [[buffer(3)]],
+    device uchar       *k_cache      [[buffer(4)]],
+    device uchar       *v_cache      [[buffer(5)]],
+    device const uchar *q_norm       [[buffer(6)]],
+    device const uchar *k_norm       [[buffer(7)]],
+    constant uint      &n_heads      [[buffer(8)]],
+    constant uint      &n_kv         [[buffer(9)]],
+    constant uint      &head_dim     [[buffer(10)]],
+    constant uint      &seq_pos      [[buffer(11)]],
+    constant uint      &seq_capacity [[buffer(12)]],
+    constant float     &theta        [[buffer(13)]],
+    constant float     &partial      [[buffer(14)]],
+    constant float     &eps          [[buffer(15)]],
+    constant uint      &q_w_dtype    [[buffer(16)]],
+    constant uint      &k_w_dtype    [[buffer(17)]],
+    constant uint      &tg_size      [[buffer(18)]],
+    constant uint      &q_has_gate   [[buffer(19)]],
+    constant uint      &y_dtype      [[buffer(20)]],
+    constant uint      &q_offset     [[buffer(21)]],
+    constant uint      &k_offset     [[buffer(22)]],
+    constant uint      &v_offset     [[buffer(23)]],
+    constant uint      &kv_transposed [[buffer(24)]],
+    constant uint      &kv_dtype     [[buffer(25)]],
+    threadgroup float  *scratch      [[threadgroup(0)]],
+    uint                lane         [[thread_index_in_threadgroup]],
+    uint3               tg_pos       [[threadgroup_position_in_grid]])
+{
+    uint h = tg_pos.x;
+    if (h >= n_heads || seq_pos >= seq_capacity) return;
+
+    uint kvh = h * n_kv / n_heads;
+    uint kv_len = n_kv * head_dim;
+    uint count = seq_pos + 1;
+    uint rot_dim = uint(float(head_dim) * partial);
+    if (rot_dim > head_dim) rot_dim = head_dim;
+    rot_dim &= ~1u;
+    uint half_dim = rot_dim / 2;
+
+    /* Scratch layout: partials[simd_count] for cross-simd reduce +
+     * dot_bcast (1 float) for broadcasting the per-t score to all lanes.
+     * No scores[] array — that's the whole point. */
+    threadgroup float *partials  = scratch;
+    threadgroup float *dot_bcast = scratch + tg_size;
+    uint simd_lane = lane & 31u;
+    uint simd_id   = lane >> 5;
+    uint simd_count = (tg_size + 31u) >> 5;
+
+    device const float *q_base = q_raw + q_offset;
+    device const float *k_base = k_raw + k_offset;
+    device const float *v_base = v_raw + v_offset;
+    uint q_head_stride = q_has_gate ? (2u * head_dim) : head_dim;
+    device const float *qh_base = q_base + h * q_head_stride;
+    device const float *gate_base = q_base + h * 2u * head_dim + head_dim;
+    device const float *kh_base = k_base + kvh * head_dim;
+
+    /* Per-head RMSNorm for q. */
+    float q_in = (lane < head_dim) ? qh_base[lane] : 0.0f;
+    float k_in = (lane < head_dim) ? kh_base[lane] : 0.0f;
+    float q_ss = simd_sum((lane < head_dim) ? q_in * q_in : 0.0f);
+    if (simd_lane == 0) partials[simd_id] = q_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    q_ss = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+    if (lane == 0) partials[0] = q_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_scale = rsqrt(partials[0] / float(head_dim) + eps);
+
+    float k_ss = simd_sum((lane < head_dim) ? k_in * k_in : 0.0f);
+    if (simd_lane == 0) partials[simd_id] = k_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    k_ss = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+    if (lane == 0) partials[0] = k_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_scale = rsqrt(partials[0] / float(head_dim) + eps);
+
+    /* q and k for THIS step, with partial-rotary RoPE applied. */
+    float qv = 0.0f;
+    float kv = 0.0f;
+    if (lane < head_dim) {
+        qv = q_in * q_scale * qw36_load_scalar(q_norm, q_w_dtype, lane);
+        kv = k_in * k_scale * qw36_load_scalar(k_norm, k_w_dtype, lane);
+        if (lane < rot_dim) {
+            bool upper = lane >= half_dim;
+            uint pair = upper ? (lane - half_dim) : lane;
+            uint d0 = pair;
+            uint d1 = pair + half_dim;
+            float q0 = qh_base[d0] * q_scale * qw36_load_scalar(q_norm, q_w_dtype, d0);
+            float q1 = qh_base[d1] * q_scale * qw36_load_scalar(q_norm, q_w_dtype, d1);
+            float k0 = kh_base[d0] * k_scale * qw36_load_scalar(k_norm, k_w_dtype, d0);
+            float k1 = kh_base[d1] * k_scale * qw36_load_scalar(k_norm, k_w_dtype, d1);
+            float inv_freq = 1.0f / pow(theta, (2.0f * float(pair)) / float(rot_dim));
+            float angle = float(seq_pos) * inv_freq;
+            float c = cos(angle);
+            float s = sin(angle);
+            qv = upper ? (q0 * s + q1 * c) : (q0 * c - q1 * s);
+            kv = upper ? (k0 * s + k1 * c) : (k0 * c - k1 * s);
+        }
+    }
+
+    /* Append current K/V to the cache. One lane per kv head per dim. */
+    if (lane < head_dim && h == kvh * n_heads / n_kv) {
+        uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
+        qw36_store_scalar(k_cache, kv_dtype, off, kv);
+        qw36_store_scalar(v_cache, kv_dtype, off,
+                          v_base[kvh * head_dim + lane]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* --- Online softmax single-pass --- */
+    float inv_sqrt_d = rsqrt(float(head_dim));
+    /* Use -1e30f instead of -INFINITY because exp(-INFINITY - finite) is
+     * 0 but exp(-INFINITY - -INFINITY) is NaN; first-iter correction = 1
+     * if we anchor m at a finite very-negative sentinel. */
+    float m = -1e30f;
+    float l = 0.0f;
+    float o = 0.0f;  /* per-lane accumulator */
+
+    for (uint t = 0; t < count; ++t) {
+        /* Load K[t][lane], compute Q·K with simd reduction. */
+        float kval = 0.0f;
+        if (lane < head_dim) {
+            kval = (t == seq_pos)
+                ? kv
+                : qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
+        }
+        float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
+        if (simd_lane == 0) partials[simd_id] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dot = simd_sum((lane < simd_count) ? partials[lane] : 0.0f);
+        if (lane == 0) dot_bcast[0] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s_t = dot_bcast[0] * inv_sqrt_d;
+
+        /* Online update — each lane recomputes m_new / correction / p_t
+         * from the broadcast s_t, so all lanes stay in lockstep on
+         * (m, l) without an explicit broadcast for those scalars. */
+        float m_new      = max(m, s_t);
+        float correction = exp(m - m_new);
+        float p_t        = exp(s_t - m_new);
+        l = l * correction + p_t;
+        m = m_new;
+
+        /* Load V[t][lane], update per-lane accumulator. */
+        if (lane < head_dim) {
+            float vv = (t == seq_pos)
+                ? v_base[kvh * head_dim + lane]
+                : qw36_load_scalar(v_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
+            o = o * correction + p_t * vv;
+        }
+        /* No barrier needed before next iter: each lane's state is
+         * locally consistent; only `dot_bcast` is shared and we barrier
+         * before writing it at the top of the next iter. */
+    }
+
+    if (lane < head_dim) {
+        float y_val = o / l;
+        if (q_has_gate) {
+            float g = gate_base[lane];
+            y_val *= 1.0f / (1.0f + exp(-g));
+        }
+        qw36_store_scalar(y, y_dtype, h * head_dim + lane, y_val);
+    }
+}
+
 /* x4 variant of qw36_attn_decode_fused_f16kv_f32. Score loop processes
  * 4 t positions per outer iteration: each lane computes 4 partial dot
  * products into 4 simd_sum results (one barrier per 4 t's instead of one

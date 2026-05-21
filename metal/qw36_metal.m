@@ -61,6 +61,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> attn_decode_fused;
     id<MTLComputePipelineState> attn_decode_fused_f16kv;
     id<MTLComputePipelineState> attn_decode_fused_f16kv_x4;
+    id<MTLComputePipelineState> attn_decode_flash_f16kv;  /* opt-in flash-attn single-pass */
     /* GGUF-native quantised matmul (port of agent-infer's
      * gguf_q*_k_matmul). One threadgroup per output row, on-the-fly
      * dequant per element — replaces the f32→f16 MPS round-trip when the
@@ -789,6 +790,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->attn_decode_fused = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f32", err, err_cap);
     ctx->attn_decode_fused_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_f32", err, err_cap);
     ctx->attn_decode_fused_f16kv_x4 = metal_make_pipeline(ctx, @"qw36_attn_decode_fused_f16kv_x4_f32", err, err_cap);
+    ctx->attn_decode_flash_f16kv = metal_make_pipeline(ctx, @"qw36_attn_decode_flash_f16kv_f32", err, err_cap);
     ctx->matmul_qmv_quad_f16 = metal_make_pipeline(ctx, @"qw36_matmul_qmv_quad_f16", err, err_cap);
     ctx->matmul_mma_f16 = metal_make_pipeline(ctx, @"qw36_matmul_mma_f16_f32", err, err_cap);
     ctx->matmul_q4_k = metal_make_pipeline(ctx, @"qw36_matmul_q4_k_f32", err, err_cap);
@@ -903,6 +905,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->attn_decode_fused = nil;
     ctx->attn_decode_fused_f16kv = nil;
     ctx->attn_decode_fused_f16kv_x4 = nil;
+    ctx->attn_decode_flash_f16kv = nil;
     ctx->matmul_mma_f16 = nil;
     ctx->matmul_q4k_affine32 = nil;
     ctx->matmul_q4k_affine32_mlx = nil;
@@ -1786,24 +1789,38 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             const char *e = getenv("QW36_METAL_ATTN_X4");
             attn_x4_env_cached = (e && atoi(e) != 0) ? 1 : 0;
         }
-        const int use_x4 = kv16_kv && attn_x4_env_cached &&
+        /* QW36_METAL_FLASH_ATTN=1 opts into the online-softmax single-pass
+         * decode kernel. Requires kv16_kv (fp16 or bf16 KV) — same
+         * dispatch surface as the existing fused kernel. Defaults off
+         * until precision smoke + perf gate run against it. */
+        static int flash_attn_env_cached = -1;
+        if (flash_attn_env_cached < 0) {
+            const char *e = getenv("QW36_METAL_FLASH_ATTN");
+            flash_attn_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+        }
+        const int use_flash = kv16_kv && flash_attn_env_cached &&
+                              ctx->attn_decode_flash_f16kv;
+        const int use_x4 = !use_flash && kv16_kv && attn_x4_env_cached &&
                            ctx->attn_decode_fused_f16kv_x4 &&
                            positions >= 128u;
         double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
-        NSString *perf_label = use_x4
-            ? @"qw36_attn_decode_fused_f16kv_x4_f32"
-            : (kv16_kv ? @"qw36_attn_decode_fused_f16kv_f32"
-                       : @"qw36_attn_decode_fused_f32");
+        NSString *perf_label = use_flash
+            ? @"qw36_attn_decode_flash_f16kv_f32"
+            : (use_x4
+                ? @"qw36_attn_decode_fused_f16kv_x4_f32"
+                : (kv16_kv ? @"qw36_attn_decode_fused_f16kv_f32"
+                           : @"qw36_attn_decode_fused_f32"));
         int owns_cb = 0;
         id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
         id<MTLComputeCommandEncoder> enc =
             metal_compute_encoder_for_op(ctx, cb, owns_cb);
         uint32_t q_w_dtype = (uint32_t)q_norm->dtype;
         uint32_t k_w_dtype = (uint32_t)k_norm->dtype;
-        [enc setComputePipelineState:use_x4
-            ? ctx->attn_decode_fused_f16kv_x4
-            : (kv16_kv ? ctx->attn_decode_fused_f16kv
-                       : ctx->attn_decode_fused)];
+        [enc setComputePipelineState:use_flash
+            ? ctx->attn_decode_flash_f16kv
+            : (use_x4 ? ctx->attn_decode_fused_f16kv_x4
+                : (kv16_kv ? ctx->attn_decode_fused_f16kv
+                           : ctx->attn_decode_fused))];
         [enc setBuffer:y->mtl       offset:0 atIndex:0];
         [enc setBuffer:q->mtl       offset:0 atIndex:1];
         [enc setBuffer:k->mtl       offset:0 atIndex:2];
