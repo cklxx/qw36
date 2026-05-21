@@ -86,9 +86,15 @@ jobs:
           QW36_TEST_MODEL: ${{ env.QW36_TEST_MODEL }}
         run: |
           set -euo pipefail
-          # Only meaningful with a model — but always invoke the script
-          # so the harness wiring stays exercised.
           tests/correctness_greedy.sh
+
+      - name: Long-context coherence gate (degeneracy / lexical-diversity check)
+        shell: bash
+        env:
+          QW36_TEST_MODEL: ${{ env.QW36_TEST_MODEL }}
+        run: |
+          set -euo pipefail
+          tests/correctness_long_coherence.sh
 
   cuda-build-check:
     name: linux / cuda compile check
