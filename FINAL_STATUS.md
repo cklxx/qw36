@@ -32,6 +32,7 @@ to 200 tok/s in progress (#30/#40).
 | 0ba7349            | 121    | DN gated rmsnorm tail fuse      |
 | aac7f50            | 121    | DN conv1d + gated_delta fuse     |
 | 112e85f            | **122** | **persistent compute encoder**  |
+| 766b7c0 + 90b1377  | 85 (opt-in) | Q4K → affine32 repack + qmv_fast kernel (+45% vs native Q4_K quant_gpu; still under fp16 ceiling) |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -70,6 +71,7 @@ generic 256-thread TG version isn't there).
 | Fused silu_mul + down_proj custom GEMV  | wash with MPS+silu_mul    |
 | fp16 residual state (x_dev / x_rms fp16) | step-0 logit drift; left as opt-in |
 | persistent compute encoder (codex O)    | minimal — CPU encode already <0.1% of budget |
+| Q4K → affine32 + qmv_fast kernel (S2)   | +45% over native Q4_K quant_gpu (57→85 tok/s) but still under fp16 MPS ceiling (115). Kept as opt-in: `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1`. Sanity passes (max_abs 1e-4 vs Q4_K original). |
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
