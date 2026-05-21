@@ -23,7 +23,9 @@ future contributors.
 |------|------------|
 | [`architecture.md`](architecture.md) | engine deep-dive — vtable contract, lazy weight materialization, per-token forward, fusion flags, persistent encoder, KV layouts; the "read for an afternoon" doc |
 | [`kvcache_design.md`](kvcache_design.md) | tier-composing KV prefix cache (vtable per medium; ram_lru + disk on Mac, future vram + redis) |
-| [`kv_quant_plan.md`](kv_quant_plan.md) | KV cache quantization scoreboard (fp16 shipped; bf16/Q8_0/Q4_0 planned with cost estimates) |
+| [`kv_quant_plan.md`](kv_quant_plan.md) | KV cache quantization scoreboard (fp16 + bf16 shipped; Q8_0/Q4_0 planned) |
+| [`state_snapshot_plan.md`](state_snapshot_plan.md) | qw36_state_snapshot / _hydrate design for the KV prefix cache follow-up (task #82) |
+| [`speculative_decode_plan.md`](speculative_decode_plan.md) | speculative decoding sketch — explicit non-goal for the current window |
 | [`q4k_kernel_design_v2.md`](q4k_kernel_design_v2.md) | Q4_K affine32 + qmv_fast kernel design, the lever that unlocked >170 tok/s |
 | [`q4k_qmv_quad_design.md`](q4k_qmv_quad_design.md) | early qmv_quad-style Q4_K design notes (predecessor to v2) |
 | [`q4k_kernel_research_task.md`](q4k_kernel_research_task.md) | research brief that triggered task R |
@@ -35,6 +37,7 @@ future contributors.
 |------|------------|
 | [`env_knobs.md`](env_knobs.md) | every `QW36_*` env knob the engine reads, with file:line, default, and lifecycle (stable / internal / research) |
 | [`model_support_matrix.md`](model_support_matrix.md) | green/yellow/red per (model, backend) cell with testing scope |
+| [`backend_parity.md`](backend_parity.md) | Metal / CUDA / AMD vtable-slot coverage and porting order |
 | [`performance_methodology.md`](performance_methodology.md) | how qw36 measures, why median-of-N + wallclock-not-gpu_ms, what counts as a real win |
 | [`troubleshooting.md`](troubleshooting.md) | top failure modes (build, runtime, perf) with concrete checks |
 
