@@ -68,9 +68,16 @@ void qw36__gated_delta_decode(const float *qkv,
     }
 
     for (uint32_t v = 0; v < n_value; v++) {
+        static int kh_mod = -1;
+        if (kh_mod < 0) {
+            const char *e = getenv("QW36_DN_KH_MOD");
+            kh_mod = e && atoi(e) ? 1 : 0;
+        }
         uint32_t group = (n_key && n_value % n_key == 0) ? n_value / n_key : 1;
         if (group == 0) group = 1;
-        const uint32_t kh = (n_value >= n_key && n_value % n_key == 0)
+        const uint32_t kh = kh_mod
+            ? v % n_key
+            : (n_value >= n_key && n_value % n_key == 0)
             ? v / group
             : v % n_key;
         const uint32_t head_stride = 2 * key_dim + val_dim;  /* per-head: q,k,v */

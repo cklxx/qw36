@@ -103,11 +103,35 @@ layer fires) suspect on 35B. The model loads:
 2. Use the 40-layer count when comparing against MLX/HF references; blk.40 is
    MTP/nextn and should not be part of normal autoregressive forward.
 
+## DN probes attempted, all negative
+
+Two opt-in probes were added to bisect DN-internal behaviour on 35B:
+
+| env                    | what it does                                            |
+|------------------------|---------------------------------------------------------|
+| `QW36_DN_A_RAW=1`      | skip the `logf(|a|)` transform on `ssm_a` weight load   |
+| `QW36_DN_KH_MOD=1`     | flip k-head/v-head pairing to `v % n_key` (vs `v / group`) |
+
+`QW36_MAX_LAYERS=1` on 35B with the four combinations:
+
+| A_RAW | KH_MOD | first 4 tokens          |
+|-------|--------|-------------------------|
+| 0     | 0      | `oxygenning etc`        |
+| 0     | 1      | `ieurhythmurgy`         |
+| 1     | 0      | `oxygenaultenticated`   |
+| 1     | 1      | `ieurhythmurgy`         |
+
+All four are gibberish but differ — DN forward is sensitive to KH_MOD
+(no surprise — it changes the per-head q/k pairing). None converges to
+plausible text. The bug is deeper than these two probes.
+
 ## Reasonable interim posture
 
 35B-A3B is documented as functional-smoke-only in AGENTS.md §Project shape
 ("仅用于功能冒烟，不用于 perf 主线"). The model loads, runs end-to-end, and
 exits cleanly — qw36's plumbing for huge GGUFs works. The output text is
-incorrect because the embed-to-lm_head untied/Q8_0/MTP path has at least
-one unfixed bug. **Do not optimize 35B perf** until at least
-MAX_LAYERS=0 yields a coherent top-1 on Hello.
+incorrect because the DN layer 0 forward produces wrong values on this
+config (`ssm.state_size=128, inner_size=4096, group_count=16, conv_kernel=4`).
+**Do not optimize 35B perf** until at least MAX_LAYERS=1 yields a
+plausible top-1 on Hello. The probes stay in tree as opt-in for future
+investigators.

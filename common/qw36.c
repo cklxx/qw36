@@ -866,7 +866,12 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
         BIND_NORM(dn_conv1d,     "blk.%u.ssm_conv1d.weight");
         BIND_NORM(dn_dt_bias,    "blk.%u.ssm_dt.bias");
         BIND_NORM(dn_a_log,      "blk.%u.ssm_a");
-        if (L->dn_a_log && c->dn_num_value_heads) {
+        static int dn_a_raw = -1;
+        if (dn_a_raw < 0) {
+            const char *e = getenv("QW36_DN_A_RAW");
+            dn_a_raw = e && atoi(e) ? 1 : 0;
+        }
+        if (L->dn_a_log && c->dn_num_value_heads && !dn_a_raw) {
             float *a = (float *)L->dn_a_log;
             for (uint32_t i = 0; i < c->dn_num_value_heads; i++) {
                 float v = fabsf(a[i]);
