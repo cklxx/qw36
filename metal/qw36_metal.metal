@@ -1671,6 +1671,79 @@ static inline float qw36_qdot4_affine32_16(device const uchar *qbytes,
     return scale * qacc + bias * xsum;
 }
 
+/* MLX-style qdot: read packed weights as uint16 (4 nibbles each), use raw
+ * masked bits without shifts — caller pre-scales x_thread by 1/16/256/4096
+ * so masks 0x000f / 0x00f0 / 0x0f00 / 0xf000 multiply correctly. */
+static inline float qw36_qdot4_affine32_16_mlx(device const uchar *qbytes,
+                                               const thread float *x_thread,
+                                               float scale,
+                                               float bias,
+                                               float sum)
+{
+    device const uint16_t *ws = (device const uint16_t *)qbytes;
+    float accum = 0.0f;
+    for (uint i = 0; i < 4u; ++i) {
+        uint w = uint(ws[i]);
+        accum += x_thread[4u*i + 0u] * float(w & 0x000fu)
+              +  x_thread[4u*i + 1u] * float(w & 0x00f0u)
+              +  x_thread[4u*i + 2u] * float(w & 0x0f00u)
+              +  x_thread[4u*i + 3u] * float(w & 0xf000u);
+    }
+    return scale * accum + bias * sum;
+}
+
+static inline uint qw36_unpack5(device const uchar *p, uint idx)
+{
+    ulong bits = ulong(p[0]) |
+                 (ulong(p[1]) << 8) |
+                 (ulong(p[2]) << 16) |
+                 (ulong(p[3]) << 24) |
+                 (ulong(p[4]) << 32);
+    return uint((bits >> (5u * idx)) & 31ul);
+}
+
+static inline float qw36_qdot5_affine32_16(device const uchar *qbytes,
+                                           device const float *x,
+                                           uint k,
+                                           float scale,
+                                           float bias)
+{
+    float qacc = 0.0f;
+    float xsum = 0.0f;
+    for (uint pack = 0; pack < 2u; ++pack) {
+        device const uchar *p = qbytes + pack * 5u;
+        for (uint i = 0; i < 8u; ++i) {
+            uint xi = pack * 8u + i;
+            float xv = x[k + xi];
+            xsum += xv;
+            qacc += xv * float(qw36_unpack5(p, i));
+        }
+    }
+    return scale * qacc + bias * xsum;
+}
+
+static inline uint qw36_unpack6(device const uchar *p, uint idx)
+{
+    uint bit = 6u * idx;
+    uint byte = bit >> 3;
+    uint shift = bit & 7u;
+    uint bits = uint(p[byte]);
+    if (byte + 1u < 12u)
+        bits |= uint(p[byte + 1u]) << 8;
+    return (bits >> shift) & 63u;
+}
+
+static inline float qw36_qdot6_scale16_16(device const uchar *qbytes,
+                                          device const float *x,
+                                          uint k,
+                                          float scale)
+{
+    float qacc = 0.0f;
+    for (uint i = 0; i < 16u; ++i)
+        qacc += x[k + i] * (float(qw36_unpack6(qbytes, i)) - 32.0f);
+    return scale * qacc;
+}
+
 /* Q4K_AFFINE32 qmv_fast-style matmul.
  *
  * Layout per 256 elements:
@@ -1725,6 +1798,198 @@ kernel void qw36_matmul_q4k_affine32_qmv_fast_f32(
             float bias = qw36_affine32_half(blk + 16u, sub);
             device const uchar *qbytes = blk + 32u + sub * 16u + qbyte_offset;
             acc[r] += qw36_qdot4_affine32_16(qbytes, x, k, scale, bias);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
+/* MLX-style variant: pre-scale x_thread once per outer K iteration so the
+ * inner qdot uses raw masked uint16 bits and saves 16 nibble shifts per
+ * lane per row. Same Q4K_AFFINE32 layout / TG geometry. Gate: env
+ * QW36_METAL_Q4K_AFFINE32_MLX=1 picks this pipeline. */
+kernel void qw36_matmul_q4k_affine32_qmv_mlx_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 160u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+
+        /* Pre-scale x once per lane per K block; sum stays raw for bias. */
+        float xsum = 0.0f;
+        for (uint i = 0; i < values_per_thread; i += 4u) {
+            float x0 = x[k + i + 0u];
+            float x1 = x[k + i + 1u];
+            float x2 = x[k + i + 2u];
+            float x3 = x[k + i + 3u];
+            xsum += x0 + x1 + x2 + x3;
+            x_thread[i + 0u] = x0;
+            x_thread[i + 1u] = x1 * (1.0f / 16.0f);
+            x_thread[i + 2u] = x2 * (1.0f / 256.0f);
+            x_thread[i + 3u] = x3 * (1.0f / 4096.0f);
+        }
+
+        uint group = k >> 5;
+        uint block = group >> 3;
+        uint sub = group & 7u;
+        uint qbyte_offset = (k & 31u) >> 1;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 160u;
+            float scale = qw36_affine32_half(blk, sub);
+            float bias = qw36_affine32_half(blk + 16u, sub);
+            device const uchar *qbytes = blk + 32u + sub * 16u + qbyte_offset;
+            acc[r] += qw36_qdot4_affine32_16_mlx(qbytes, x_thread, scale,
+                                                  bias, xsum);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
+/* Q5K_AFFINE32 sibling of the Q4 affine32 qmv_fast kernel.
+ *
+ * Layout per 256 elements:
+ *   half scale[8], half bias[8], uint8 packed_q[8][20]
+ * where each 32-element group stores four little-endian 5-byte packs of
+ * eight 5-bit values. */
+kernel void qw36_matmul_q5k_affine32_qmv_fast_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 192u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+        uint group = k >> 5;
+        uint block = group >> 3;
+        uint sub = group & 7u;
+        uint group_local = k & 31u;
+        uint qbyte_offset = (group_local >> 3) * 5u;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 192u;
+            float scale = qw36_affine32_half(blk, sub);
+            float bias = qw36_affine32_half(blk + 16u, sub);
+            device const uchar *qbytes = blk + 32u + sub * 20u + qbyte_offset;
+            acc[r] += qw36_qdot5_affine32_16(qbytes, x, k, scale, bias);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
+/* Q6K_SCALE16 qmv_fast kernel.
+ *
+ * Layout per 256 elements:
+ *   half scale[16], uint8 packed_q[16][12]
+ * where each 16-element group stores one 6-bit signed group encoded as
+ * unsigned q in [0, 63] with value = (q - 32) * scale. */
+kernel void qw36_matmul_q6k_scale16_qmv_fast_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 224u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+        uint group = k >> 4;          /* 16-element scale group */
+        uint block = group >> 4;      /* 16 groups per 256-element block */
+        uint sub = group & 15u;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 224u;
+            float scale = qw36_affine32_half(blk, sub);
+            device const uchar *qbytes = blk + 32u + sub * 12u;
+            acc[r] += qw36_qdot6_scale16_16(qbytes, x, k, scale);
         }
     }
 
