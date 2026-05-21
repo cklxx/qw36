@@ -34,6 +34,7 @@ future contributors.
 | file | what it is |
 |------|------------|
 | [`env_knobs.md`](env_knobs.md) | every `QW36_*` env knob the engine reads, with file:line, default, and lifecycle (stable / internal / research) |
+| [`model_support_matrix.md`](model_support_matrix.md) | green/yellow/red per (model, backend) cell with testing scope |
 | [`performance_methodology.md`](performance_methodology.md) | how qw36 measures, why median-of-N + wallclock-not-gpu_ms, what counts as a real win |
 | [`troubleshooting.md`](troubleshooting.md) | top failure modes (build, runtime, perf) with concrete checks |
 

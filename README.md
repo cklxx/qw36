@@ -304,4 +304,4 @@ qw36/
 
 ## License
 
-[MIT](LICENSE) (when LICENSE lands — current state is research-only).
+[MIT](LICENSE). Copyright © 2026 cklxx.
