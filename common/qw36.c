@@ -356,22 +356,34 @@ static int lazy_fuse_dense_gate_up(qw36_engine *eng, qw36_layer_weights *L) {
         return 0;
     qw36_lazy_w *gate = (qw36_lazy_w *)L->gate_proj;
     qw36_lazy_w *up   = (qw36_lazy_w *)L->up_proj;
-    if (gate->dtype != up->dtype ||
-        (gate->dtype != QW36_DTYPE_F32 && gate->dtype != QW36_DTYPE_F16) ||
+    /* Allow dense (F32/F16) and the K-quant family. For quants we copy
+     * raw block bytes — qw36__tensor_bytes knows the per-block layout, and
+     * cols must be a multiple of 256 (Q*_K block size). The downstream
+     * matmul kernels (qmv_fast / qmv_mlx) consume the fused row range
+     * (2*rows × cols) the same way they consume any single-tensor row range. */
+    int is_dense = (gate->dtype == QW36_DTYPE_F32 ||
+                    gate->dtype == QW36_DTYPE_F16);
+    int is_qk = (gate->dtype == QW36_DTYPE_Q4_K ||
+                 gate->dtype == QW36_DTYPE_Q5_K ||
+                 gate->dtype == QW36_DTYPE_Q6_K ||
+                 gate->dtype == QW36_DTYPE_Q4K_AFFINE32 ||
+                 gate->dtype == QW36_DTYPE_Q5K_AFFINE32 ||
+                 gate->dtype == QW36_DTYPE_Q6K_SCALE16);
+    if (gate->dtype != up->dtype || (!is_dense && !is_qk) ||
         gate->rows != up->rows || gate->cols != up->cols ||
         gate->n_extra || up->n_extra)
+        return 0;
+    if (is_qk && (gate->cols % 256u) != 0)
         return 0;
     if (gate->rows > SIZE_MAX || gate->cols > SIZE_MAX ||
         gate->rows > UINT64_MAX / 2)
         return -1;
     const size_t rows = (size_t)gate->rows;
     const size_t cols = (size_t)gate->cols;
-    const size_t elem = qw36__dtype_nbytes(gate->dtype);
-    if (!elem || (cols && rows > SIZE_MAX / cols)) return -1;
+    if (cols && rows > SIZE_MAX / cols) return -1;
     const size_t half_numel = rows * cols;
-    if (half_numel > SIZE_MAX / elem) return -1;
-    const size_t half_bytes = half_numel * elem;
-    if (half_bytes > SIZE_MAX / 2) return -1;
+    const size_t half_bytes = qw36__tensor_bytes(gate->dtype, half_numel);
+    if (!half_bytes || half_bytes > SIZE_MAX / 2) return -1;
 
     uint8_t *buf = (uint8_t *)malloc(2 * half_bytes);
     qw36_lazy_w *fused = (qw36_lazy_w *)calloc(1, sizeof(*fused));
