@@ -893,67 +893,17 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     if (backend) {
         eng->ctx = backend->init(err, err_cap);
         if (!eng->ctx) { qw36_engine_close(eng); return NULL; }
-        /* Opt-in fp16 weight materialization on Metal — nearly doubles
-         * decode throughput (55 → 81 tok/s) but introduces ~1e-3 drift
-         * that can flip the argmax later in a greedy run. Default off so
-         * tests/precision_cpu_vs_metal.sh stays bit-equal; set
-         * QW36_METAL_FP16_WEIGHTS=1 for the perf path. */
-        const char *fp16_env = getenv("QW36_METAL_FP16_WEIGHTS");
-        const int fp16_lazy_weights =
-            backend->name && strcmp(backend->name, "metal") == 0 &&
-            fp16_env && atoi(fp16_env) != 0;
-        /* QW36_METAL_QUANT_GPU=1 keeps Q4_K/Q5_K/Q6_K/Q8_0 weights in their
-         * packed layout on the GPU and dispatches a native dequant+gemv
-         * kernel per matmul. Skips the fp16 materialise (saves RAM) and the
-         * f32↔f16 round-trip per call (lower per-op overhead, higher
-         * effective bandwidth utilisation). Overrides fp16_lazy_weights. */
-        const char *qgpu_env = getenv("QW36_METAL_QUANT_GPU");
-        const int quant_gpu_weights =
-            backend->name && strcmp(backend->name, "metal") == 0 &&
-            qgpu_env && atoi(qgpu_env) != 0;
-        const char *qk_repack_env = getenv("QW36_METAL_QK_REPACK");
-        const char *qk_affine32_env = getenv("QW36_METAL_QK_AFFINE32");
-        const int qk_repack_weights =
-            quant_gpu_weights &&
-            ((qk_repack_env && atoi(qk_repack_env) != 0) ||
-             (qk_affine32_env && atoi(qk_affine32_env) != 0));
-        /* QW36_METAL_FAST=1 turns on the full affine-repack + lm_head quant
-         * path under quant-GPU mode. Individual flags still win when set
-         * explicitly to 0 so users can isolate one component for debugging. */
-        const char *fast_env = getenv("QW36_METAL_FAST");
-        const int fast_path =
-            quant_gpu_weights && fast_env && atoi(fast_env) != 0;
-        const char *q4k_affine32_env = getenv("QW36_METAL_Q4K_AFFINE32");
-        const int q4k_affine32_weights =
-            qk_repack_weights ||
-            (quant_gpu_weights &&
-             (q4k_affine32_env ? atoi(q4k_affine32_env) != 0 : fast_path));
-        const char *q5k_affine32_env = getenv("QW36_METAL_Q5K_AFFINE32");
-        const int q5k_affine32_weights =
-            qk_repack_weights ||
-            (quant_gpu_weights &&
-             (q5k_affine32_env ? atoi(q5k_affine32_env) != 0 : fast_path));
-        const char *q6k_scale16_env = getenv("QW36_METAL_Q6K_SCALE16");
-        const int q6k_scale16_weights =
-            quant_gpu_weights &&
-            (q6k_scale16_env ? atoi(q6k_scale16_env) != 0 : fast_path);
-        const char *quant_lm_head_env =
-            getenv("QW36_METAL_QUANT_GPU_LM_HEAD");
-        const int quant_gpu_lm_head =
-            quant_gpu_weights &&
-            (quant_lm_head_env ? atoi(quant_lm_head_env) != 0 : fast_path);
-        const int fuse_dense_gate_up =
-            backend->name && strcmp(backend->name, "metal") == 0;
-        const char *fuse_qkv_env = getenv("QW36_METAL_FUSE_QKV");
-        const int fuse_vanilla_qkv =
-            backend->name && strcmp(backend->name, "metal") == 0 &&
-            fp16_lazy_weights && !quant_gpu_weights &&
-            (!fuse_qkv_env || atoi(fuse_qkv_env) != 0);
-        const char *fuse_dn_env = getenv("QW36_METAL_FUSE_DN_QKVZAB");
-        const int fuse_dn_qkvzab =
-            backend->name && strcmp(backend->name, "metal") == 0 &&
-            fp16_lazy_weights && !quant_gpu_weights &&
-            (!fuse_dn_env || atoi(fuse_dn_env) != 0);
+        qw36_backend_policy pol;
+        qw36__backend_policy_from_env(&pol, backend);
+        const int fp16_lazy_weights = pol.fp16_weights;
+        const int quant_gpu_weights = pol.quant_gpu;
+        const int q4k_affine32_weights = pol.q4k_affine32;
+        const int q5k_affine32_weights = pol.q5k_affine32;
+        const int q6k_scale16_weights = pol.q6k_scale16;
+        const int quant_gpu_lm_head = pol.quant_lm_head;
+        const int fuse_dense_gate_up = pol.fuse_dense_gate_up;
+        const int fuse_vanilla_qkv = pol.fuse_vanilla_qkv;
+        const int fuse_dn_qkvzab = pol.fuse_dn_qkvzab;
 
         if (quant_gpu_lm_head && w->lm_head == w->embed_tokens) {
             const qw36_lazy_w *src = (const qw36_lazy_w *)w->embed_tokens;

@@ -49,7 +49,7 @@ done
 echo
 echo "=== fastest opt-in quant path (Q4+Q5+Q6 + lm_head) ==="
 for i in 1 2 3; do
-  run_summary env QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1 QW36_METAL_QUANT_GPU_LM_HEAD=1 ./qw36_metal -m "$MODEL" --no-special -p "$BENCH_PROMPT" -n "$BENCH_N"
+  run_summary ./qw36_metal --fast -m "$MODEL" --no-special -p "$BENCH_PROMPT" -n "$BENCH_N"
 done
 
 echo

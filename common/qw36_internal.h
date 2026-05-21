@@ -33,6 +33,21 @@ typedef struct qw36_gpu_cache_entry {
     qw36_gpu_buf *gpu_buf;
 } qw36_gpu_cache_entry;
 
+typedef struct qw36_backend_policy {
+    const char *profile_name;
+    int is_metal;
+    int fp16_weights;
+    int quant_gpu;
+    int qk_repack;
+    int q4k_affine32;
+    int q5k_affine32;
+    int q6k_scale16;
+    int quant_lm_head;
+    int fuse_dense_gate_up;
+    int fuse_vanilla_qkv;
+    int fuse_dn_qkvzab;
+} qw36_backend_policy;
+
 struct qw36_engine {
     qw36_config       cfg;
     qw36_weights      weights;
@@ -89,6 +104,9 @@ int qw36__repack_q6k_scale16(const qw36_lazy_w *w, void *dst);
 uint16_t qw36__f32_to_f16(float f);
 float    qw36__f16_to_f32(uint16_t h);
 int qw36__active_backend(qw36_gpu_backend **be_out, qw36_gpu_ctx **ctx_out);
+void qw36__backend_policy_from_env(qw36_backend_policy *p,
+                                   const qw36_gpu_backend *backend);
+int qw36__profile_name_is_valid(const char *profile);
 
 qw36_gpu_buf *qw36__gpu_cached_upload(qw36_engine *eng, const void *host,
                                       size_t bytes, qw36_dtype dtype);

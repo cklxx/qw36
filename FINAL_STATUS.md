@@ -4,7 +4,7 @@
 
 Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **~204 tok/s short
 / 176 tok/s sustained / 92 tok/s at n=2048** on Qwen3.5-0.8B-Q4_K_M via Metal
-under `QW36_METAL_QUANT_GPU=1 QW36_METAL_FAST=1` (vs llama.cpp 170 tok/s
+under `./qw36_metal --fast` / `QW36_PROFILE=fast` (vs llama.cpp 170 tok/s
 reference, MLX 244 tok/s reference, ~84% of MLX). The fastest path is opt-in
 and smoke-gated by `tests/quant_fastest_smoke.sh`, not fp32 bit-equal. Past
 the 200 tok/s target. The fp16 MPS path tops out at 119/103 tok/s — quant-
@@ -97,12 +97,7 @@ precision_cpu_vs_metal.sh byte-equal).
 
 **Fastest path today (opt-in, smoke-gated):**
 ```
-QW36_METAL_QUANT_GPU=1 \
-QW36_METAL_Q4K_AFFINE32=1 \
-QW36_METAL_Q5K_AFFINE32=1 \
-QW36_METAL_Q6K_SCALE16=1 \
-QW36_METAL_QUANT_GPU_LM_HEAD=1 \
-./qw36_metal -m <gguf> -p "Hello"
+./qw36_metal --fast -m <gguf> -p "Hello"
 ```
 → 208 tok/s peak short / 176 sustained.
 

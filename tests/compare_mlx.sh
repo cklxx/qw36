@@ -59,8 +59,7 @@ qw36_decode_tps() {
     local samples=()
     for _ in $(seq "$REPEAT"); do
         local out tps
-        out=$(QW36_METAL_QUANT_GPU=1 QW36_METAL_FAST=1 \
-              ./qw36_metal -m "$QW36_MODEL" -p "$prompt" -n "$n" 2>&1) || true
+        out=$(./qw36_metal --fast -m "$QW36_MODEL" -p "$prompt" -n "$n" 2>&1) || true
         tps=$(echo "$out" | grep -oE "generated [0-9]+ tokens in [0-9.]+s \([0-9.]+ tok/s" \
               | tail -1 | grep -oE "[0-9.]+ tok/s" | grep -oE "[0-9.]+" | head -1)
         [ -n "$tps" ] && samples+=("$tps")
@@ -119,7 +118,7 @@ done
 
 echo ""
 echo "Methodology"
-echo "- qw36 env: QW36_METAL_QUANT_GPU=1 QW36_METAL_FAST=1"
+echo "- qw36:     ./qw36_metal --fast"
 echo "- MLX:      mlx_lm.generate --temp 0 --ignore-chat-template"
 echo "- Both:     greedy decode, decode tok/s (excludes prefill)"
 echo "- median of $REPEAT runs reported"

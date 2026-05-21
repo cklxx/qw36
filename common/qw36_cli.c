@@ -3,6 +3,7 @@
  * Owner: Claude. CPU-only path works when qw36_backend_create() returns NULL.
  */
 
+#include "qw36_internal.h"
 #include "qw36.h"
 #include "qw36_gpu.h"
 #include "qw36_gguf.h"
@@ -23,6 +24,7 @@ static void usage(const char *prog) {
         "usage: %s -m <model.gguf> [-p <prompt>] [-n <max_new_tokens>]\n"
         "          [-t <temperature>] [--top-p <p>] [--top-k <k>] [--seed <u64>]\n"
         "          [--seq <capacity>] [--interactive] [--no-special]\n"
+        "          [--profile reference|fp16|lowmem|fast] [--fast] [--strict]\n"
         "          [--layer-trace <L> --layer-trace-out <path>] [--layer-trace-pos <pos>]\n"
         "          [--info]    print config + tokenizer summary and exit\n"
         "\n"
@@ -45,6 +47,9 @@ typedef struct {
     int   dump_tokens;   /* tokenize the prompt and exit */
     int   layer_trace;   /* vanilla layer index to dump, -1 disables */
     int   layer_trace_pos; /* optional seq_pos filter for trace */
+    const char *profile;
+    int   fast_profile;
+    int   strict_profile;
     const char *layer_trace_out;
 } qw36_cli_args;
 
@@ -71,6 +76,9 @@ static int parse_args(int argc, char **argv, qw36_cli_args *a) {
         else if (!strcmp(s, "--interactive")) a->interactive = 1;
         else if (!strcmp(s, "--info"))        a->info_only = 1;
         else if (!strcmp(s, "--no-special"))  a->no_special = 1;
+        else if (!strcmp(s, "--profile"))     a->profile = EAT();
+        else if (!strcmp(s, "--fast"))        a->fast_profile = 1;
+        else if (!strcmp(s, "--strict"))      a->strict_profile = 1;
         else if (!strcmp(s, "--debug-top"))   a->debug_top = atoi(EAT());
         else if (!strcmp(s, "--dump-tokens")) a->dump_tokens = 1;
         else if (!strcmp(s, "--layer-trace")) a->layer_trace = atoi(EAT());
@@ -81,6 +89,53 @@ static int parse_args(int argc, char **argv, qw36_cli_args *a) {
         #undef EAT
     }
     if (!a->model_path) { usage(argv[0]); return -1; }
+    return 0;
+}
+
+static int apply_profile_args(const qw36_cli_args *a)
+{
+    const char *profile = a->profile;
+    if (a->fast_profile) profile = "fast";
+    if (a->strict_profile) {
+        if (a->fast_profile || a->profile) {
+            fprintf(stderr, "qw36: --strict cannot be combined with --fast/--profile\n");
+            return -1;
+        }
+        profile = "reference";
+    }
+    if (!profile) return 0;
+    if (!qw36__profile_name_is_valid(profile)) {
+        fprintf(stderr,
+                "qw36: unknown profile '%s' (expected reference, fp16, lowmem, fast)\n",
+                profile);
+        return -1;
+    }
+    setenv("QW36_PROFILE", profile, 1);
+    if (!strcmp(profile, "fast") || !strcmp(profile, "serving")) {
+        setenv("QW36_METAL_FAST", "1", 1);
+        setenv("QW36_METAL_QUANT_GPU", "1", 1);
+        setenv("QW36_METAL_Q4K_AFFINE32", "1", 1);
+        setenv("QW36_METAL_Q5K_AFFINE32", "1", 1);
+        setenv("QW36_METAL_Q6K_SCALE16", "1", 1);
+        setenv("QW36_METAL_QUANT_GPU_LM_HEAD", "1", 1);
+    } else if (!strcmp(profile, "lowmem") || !strcmp(profile, "quant")) {
+        setenv("QW36_METAL_FAST", "0", 1);
+        setenv("QW36_METAL_QUANT_GPU", "1", 1);
+        setenv("QW36_METAL_FP16_WEIGHTS", "0", 1);
+    } else if (!strcmp(profile, "fp16")) {
+        setenv("QW36_METAL_FAST", "0", 1);
+        setenv("QW36_METAL_QUANT_GPU", "0", 1);
+        setenv("QW36_METAL_FP16_WEIGHTS", "1", 1);
+    } else if (!strcmp(profile, "reference") || !strcmp(profile, "strict") ||
+               !strcmp(profile, "balanced") || !strcmp(profile, "default")) {
+        setenv("QW36_METAL_FAST", "0", 1);
+        setenv("QW36_METAL_QUANT_GPU", "0", 1);
+        setenv("QW36_METAL_FP16_WEIGHTS", "0", 1);
+        setenv("QW36_METAL_Q4K_AFFINE32", "0", 1);
+        setenv("QW36_METAL_Q5K_AFFINE32", "0", 1);
+        setenv("QW36_METAL_Q6K_SCALE16", "0", 1);
+        setenv("QW36_METAL_QUANT_GPU_LM_HEAD", "0", 1);
+    }
     return 0;
 }
 
@@ -146,6 +201,7 @@ int main(int argc, char **argv) {
     qw36_cli_args a = {0};
     int rc = parse_args(argc, argv, &a);
     if (rc) return rc < 0 ? 1 : 0;
+    if (apply_profile_args(&a)) return 1;
 
     /* Backend: NULL ⇒ CPU reference path. */
     qw36_gpu_backend *be = qw36_backend_create();

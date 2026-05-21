@@ -126,6 +126,7 @@ Runtime and debug knobs are read at startup unless noted otherwise:
 
 | var                          | effect                                                                                          |
 |------------------------------|-------------------------------------------------------------------------------------------------|
+| `QW36_PROFILE=reference|fp16|lowmem|fast` | Backend policy profile. `reference` is conservative and precision-test friendly; `fp16` uses MPS fp16 materialized weights; `lowmem` uses native quant GPU kernels; `fast` enables the smoke-gated Metal serving bundle. CLI aliases: `--strict`, `--profile <name>`, `--fast`. |
 | `QW36_METAL_FP16_WEIGHTS=1`  | Metal only. Materialize large lazy weights as fp16 and dispatch MPS half GEMV. Typical Qwen3.5-0.8B-Q4_K_M decode improves from ~55 tok/s to ~83 tok/s. |
 | `QW36_METAL_FP16_KV=1`       | Metal only. Store the persistent KV cache as fp16. Long-context decode benefits because attention scans half the cache bytes. Enabled by default when fp16 weights are enabled unless explicitly set to `0`. |
 | `QW36_METAL_FP16_EDGES=1`    | Metal diagnostic. Store `x_rms_dev` and `q_dev` as fp16 when fp16 weights are enabled. Currently reproduces the #46 step-0 divergence, so it is off by default. |
@@ -137,7 +138,7 @@ Runtime and debug knobs are read at startup unless noted otherwise:
 | `QW36_METAL_Q4K_AFFINE32=1` / `QW36_METAL_Q5K_AFFINE32=1` | Metal diagnostics. Enable only one affine32 repack family for bisecting Q4_K or Q5_K kernels. |
 | `QW36_METAL_Q6K_SCALE16=1`   | Metal opt-in quant path. Repack Q6_K into a scale16 qmv layout. It is faster, but intentionally separate from `QW36_METAL_QK_REPACK=1`; run `tests/quant_fastest_smoke.sh` when using it as part of the fastest path. |
 | `QW36_METAL_QUANT_GPU_LM_HEAD=1` | Metal opt-in quant path. When `lm_head` aliases `embed_tokens`, split a Q5_K/Q6_K lm_head descriptor so output projection can stay quantized while embedding lookup remains materialized. Used with Q4/Q5 affine32 plus Q6 scale16 for the fastest smoke-gated path. |
-| `QW36_METAL_FAST=1`          | Convenience umbrella: under `QW36_METAL_QUANT_GPU=1`, defaults `Q4K_AFFINE32`, `Q5K_AFFINE32`, `Q6K_SCALE16`, and `QUANT_GPU_LM_HEAD` to on. Individual flags still override (`=0` to opt out of a single component). Smoke gate: `tests/quant_fastest_smoke.sh`. |
+| `QW36_METAL_FAST=1`          | Legacy convenience umbrella equivalent to the Metal `fast` profile. Defaults `QUANT_GPU`, `Q4K_AFFINE32`, `Q5K_AFFINE32`, `Q6K_SCALE16`, and `QUANT_GPU_LM_HEAD` to on. Individual flags still override (`=0` to opt out of a single component). Prefer CLI `--fast`. |
 | `QW36_DEBUG_LAYER=1`         | Per-layer trace: prints `||x||` and the first residual components before/after each block. Useful for bisecting the first divergent layer. |
 | `QW36_MAX_LAYERS=<n>`        | Stop forward after the first `n` layers. Used with layer traces for range bisection. |
 | `QW36_BYPASS_LAYERS=<spec>`  | Bypass selected layer ids or ranges during forward. Used to isolate a bad block without changing model loading. |
