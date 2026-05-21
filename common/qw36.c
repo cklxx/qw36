@@ -1387,13 +1387,13 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             be->name && strcmp(be->name, "metal") == 0 && gpu_weights_path;
         /* Q8_0 KV: 8-bit quant with per-32-element block half-scale.
          * Requires head_dim % 32 == 0 (Qwen3.5/3.6 always 128 or 256).
-         * Keep it opt-in until 35B and 0.8B smoke both agree with the
-         * fp16/bf16 KV path. */
+         * It is the fastest-path default under --fast; set
+         * QW36_METAL_Q8_KV=0 only for bisection. */
         const int q8_kv_eligible =
             metal_path && (c->head_dim % 32u) == 0u;
         const int use_q8_dev_kv =
             q8_kv_eligible &&
-            q8_kv_env && atoi(q8_kv_env) != 0;
+            (!q8_kv_env || atoi(q8_kv_env) != 0);
         const int use_bf16_dev_kv =
             metal_path && !use_q8_dev_kv &&
             bf16_kv_env && atoi(bf16_kv_env) != 0;
@@ -1407,7 +1407,7 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         if (use_q8_dev_kv) {
             fprintf(stderr,
                 "qw36: KV cache dtype = Q8_0 (per-32-block fp16 scale; "
-                "~50%% memory vs fp16; opt-in via QW36_METAL_Q8_KV=1)\n");
+                "~50%% memory vs fp16; set QW36_METAL_Q8_KV=0 to disable)\n");
         } else if (use_bf16_dev_kv) {
             fprintf(stderr,
                 "qw36: KV cache dtype = bf16 (opt-in via "

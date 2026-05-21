@@ -1159,6 +1159,7 @@ static qw36_gpu_buf *metal_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dty
     if (!buf->mtl) { free(buf); return NULL; }
     buf->bytes = bytes;
     buf->dtype = dtype;
+    buf->pooled = 1;
     return buf;
 }
 
@@ -1803,6 +1804,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         const int kvq8_kv =
             k_cache->dtype == v_cache->dtype &&
             k_cache->dtype == QW36_DTYPE_Q8_0;
+        if (kvq8_kv) kv_transposed = 0;
         /* x4 batched scoring variant: cuts barriers 4× per K reduction
          * iteration but measured win is within noise (~0-2% at long
          * context) because attention is K-cache-bandwidth-bound on this
