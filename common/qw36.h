@@ -286,6 +286,16 @@ void qw36_engine_attach_kv_cache(qw36_engine *eng,
                                  struct qw36_kv_prefix_cache *cache);
 struct qw36_kv_prefix_cache *qw36_engine_kv_cache(const qw36_engine *eng);
 
+/* Serialize / restore qw36_state (KV cache + DN state + seq_pos)
+ * into an opaque byte blob. The KV prefix cache stores these blobs
+ * keyed by token prefix; qw36_prefill calls snapshot on exit and
+ * hydrate on entry. See docs/state_snapshot_plan.md. */
+size_t qw36_state_blob_size(const qw36_state *st, const qw36_engine *eng);
+size_t qw36_state_snapshot(const qw36_state *st, const qw36_engine *eng,
+                           void *buf, size_t buf_cap);
+int    qw36_state_hydrate(qw36_state *st, const qw36_engine *eng,
+                          const void *buf, size_t bytes);
+
 /* --------------------------------------------------------------------- */
 /* Sampling                                                               */
 /* --------------------------------------------------------------------- */

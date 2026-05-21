@@ -1747,41 +1747,290 @@ struct qw36_kv_prefix_cache *qw36_engine_kv_cache(const qw36_engine *eng)
     return eng ? (struct qw36_kv_prefix_cache *)eng->kv_cache : NULL;
 }
 
+/* ----------------------------------------------------------------- */
+/* qw36_state_snapshot / qw36_state_hydrate (Roadmap 2.1 follow-up). */
+/*                                                                   */
+/* Serialize KV cache + DN state + seq_pos into a self-describing    */
+/* blob. The cache stores opaque bytes; only this code knows the     */
+/* layout. v0 covers the device path (k_cache_dev / v_cache_dev /    */
+/* conv_state_dev / delta_state_dev). Mixed paths or host-only       */
+/* sessions fall back gracefully: snapshot returns 0 (cache stores   */
+/* an empty entry; hydrate sees a size mismatch on the way back and  */
+/* counts as a miss).                                                */
+/* ----------------------------------------------------------------- */
+#define QW36_STATE_BLOB_MAGIC   0x51564B53u  /* 'SKVQ' little-endian */
+#define QW36_STATE_BLOB_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t seq_pos;
+    uint32_t num_layers;
+    uint32_t hidden_size;
+    uint32_t n_kv;
+    uint32_t head_dim;
+    uint32_t dn_conv_window;   /* (kernel - 1) or 0 if no DN */
+    uint32_t dn_qkv_dim;        /* 0 if no DN */
+    uint32_t dn_v_dim;          /* 0 if no DN */
+    uint32_t dn_n_value_heads;  /* 0 if no DN */
+    uint32_t dn_key_dim;        /* 0 if no DN */
+    uint32_t dn_val_dim;        /* 0 if no DN */
+    uint32_t kv_dtype;          /* qw36_dtype of the KV cache */
+    uint32_t reserved[2];
+} qw36_state_blob_hdr;
+
+/* Per-layer flag in the layer_flags[] array following the header. */
+#define QW36_LAYER_FLAG_VANILLA  0x1u
+#define QW36_LAYER_FLAG_DN       0x2u
+
+static size_t qw36__kv_elem_bytes(qw36_dtype dt) {
+    switch (dt) {
+        case QW36_DTYPE_F32: return 4;
+        case QW36_DTYPE_F16:
+        case QW36_DTYPE_BF16: return 2;
+        default: return 0;
+    }
+}
+
+/* Heuristic: a DN layer has the conv_state buffer allocated. */
+static int qw36__layer_is_dn(const qw36_state *st, size_t l) {
+    return st->conv_state && st->conv_state[l] != NULL;
+}
+static int qw36__layer_is_vanilla(const qw36_state *st, size_t l) {
+    return st->k_cache && st->k_cache[l] != NULL;
+}
+
+size_t qw36_state_blob_size(const qw36_state *st, const qw36_engine *eng)
+{
+    if (!st || !eng) return 0;
+    const qw36_config *c = &eng->cfg;
+    size_t kv_eb = qw36__kv_elem_bytes(st->kv_dtype);
+    if (!kv_eb) return 0;
+    size_t bytes = sizeof(qw36_state_blob_hdr);
+    bytes += (size_t)st->num_layers * sizeof(uint32_t);  /* layer_flags */
+    const size_t kv_per_token = (size_t)c->num_key_value_heads
+                              * (size_t)c->head_dim
+                              * kv_eb;
+    const size_t dn_conv_bytes = c->dn_num_value_heads
+        ? (size_t)(c->dn_conv_kernel_size ? c->dn_conv_kernel_size - 1 : 0)
+          * (size_t)(2u * c->dn_num_key_heads * c->dn_key_head_dim
+                     +     c->dn_num_value_heads * c->dn_value_head_dim)
+          * sizeof(float)
+        : 0;
+    const size_t dn_delta_bytes = c->dn_num_value_heads
+        ? (size_t)c->dn_num_value_heads * c->dn_key_head_dim
+          * c->dn_value_head_dim * sizeof(float)
+        : 0;
+    for (uint32_t l = 0; l < st->num_layers; l++) {
+        if (qw36__layer_is_vanilla(st, l)) bytes += 2 * (size_t)st->seq_pos * kv_per_token;
+        if (qw36__layer_is_dn(st, l))      bytes += dn_conv_bytes + dn_delta_bytes;
+    }
+    return bytes;
+}
+
+size_t qw36_state_snapshot(const qw36_state *st, const qw36_engine *eng,
+                           void *buf, size_t buf_cap)
+{
+    if (!st || !eng || !buf) return 0;
+    size_t need = qw36_state_blob_size(st, eng);
+    if (!need || need > buf_cap) return 0;
+    const qw36_config *c = &eng->cfg;
+    qw36_gpu_backend *be = eng->backend;
+    qw36_gpu_ctx *ctx = eng->ctx;
+
+    uint8_t *out = (uint8_t *)buf;
+    qw36_state_blob_hdr hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic           = QW36_STATE_BLOB_MAGIC;
+    hdr.version         = QW36_STATE_BLOB_VERSION;
+    hdr.seq_pos         = st->seq_pos;
+    hdr.num_layers      = st->num_layers;
+    hdr.hidden_size     = c->hidden_size;
+    hdr.n_kv            = c->num_key_value_heads;
+    hdr.head_dim        = c->head_dim;
+    hdr.dn_conv_window  = c->dn_num_value_heads && c->dn_conv_kernel_size
+                          ? c->dn_conv_kernel_size - 1 : 0;
+    hdr.dn_qkv_dim      = c->dn_num_value_heads
+        ? 2u * c->dn_num_key_heads * c->dn_key_head_dim
+          +    c->dn_num_value_heads * c->dn_value_head_dim
+        : 0;
+    hdr.dn_v_dim        = c->dn_num_value_heads
+        ? c->dn_num_value_heads * c->dn_value_head_dim : 0;
+    hdr.dn_n_value_heads = c->dn_num_value_heads;
+    hdr.dn_key_dim      = c->dn_key_head_dim;
+    hdr.dn_val_dim      = c->dn_value_head_dim;
+    hdr.kv_dtype        = (uint32_t)st->kv_dtype;
+    memcpy(out, &hdr, sizeof(hdr)); out += sizeof(hdr);
+
+    /* layer_flags */
+    uint32_t *flags = (uint32_t *)out;
+    for (uint32_t l = 0; l < st->num_layers; l++) {
+        flags[l] = (qw36__layer_is_vanilla(st, l) ? QW36_LAYER_FLAG_VANILLA : 0u)
+                 | (qw36__layer_is_dn(st, l)      ? QW36_LAYER_FLAG_DN      : 0u);
+    }
+    out += (size_t)st->num_layers * sizeof(uint32_t);
+
+    const size_t kv_eb = qw36__kv_elem_bytes(st->kv_dtype);
+    const size_t kv_per_token = (size_t)c->num_key_value_heads
+                              * (size_t)c->head_dim * kv_eb;
+    const size_t dn_conv_bytes = (size_t)hdr.dn_conv_window
+                               * (size_t)hdr.dn_qkv_dim * sizeof(float);
+    const size_t dn_delta_bytes = (size_t)hdr.dn_n_value_heads
+                                * (size_t)hdr.dn_key_dim
+                                * (size_t)hdr.dn_val_dim * sizeof(float);
+
+    for (uint32_t l = 0; l < st->num_layers; l++) {
+        if (flags[l] & QW36_LAYER_FLAG_VANILLA) {
+            const size_t bytes = (size_t)st->seq_pos * kv_per_token;
+            if (st->k_cache_dev && st->k_cache_dev[l] && be && be->download) {
+                be->download(ctx, (qw36_gpu_buf *)st->k_cache_dev[l], out, bytes);
+            } else if (st->k_cache && st->k_cache[l]) {
+                memcpy(out, st->k_cache[l], bytes);
+            } else { return 0; }
+            out += bytes;
+            if (st->v_cache_dev && st->v_cache_dev[l] && be && be->download) {
+                be->download(ctx, (qw36_gpu_buf *)st->v_cache_dev[l], out, bytes);
+            } else if (st->v_cache && st->v_cache[l]) {
+                memcpy(out, st->v_cache[l], bytes);
+            } else { return 0; }
+            out += bytes;
+        }
+        if (flags[l] & QW36_LAYER_FLAG_DN) {
+            if (st->conv_state_dev && st->conv_state_dev[l] && be && be->download) {
+                be->download(ctx, (qw36_gpu_buf *)st->conv_state_dev[l],
+                             out, dn_conv_bytes);
+            } else if (st->conv_state && st->conv_state[l]) {
+                memcpy(out, st->conv_state[l], dn_conv_bytes);
+            }
+            out += dn_conv_bytes;
+            if (st->delta_state_dev && st->delta_state_dev[l] && be && be->download) {
+                be->download(ctx, (qw36_gpu_buf *)st->delta_state_dev[l],
+                             out, dn_delta_bytes);
+            } else if (st->delta_state && st->delta_state[l]) {
+                memcpy(out, st->delta_state[l], dn_delta_bytes);
+            }
+            out += dn_delta_bytes;
+        }
+    }
+    return (size_t)(out - (uint8_t *)buf);
+}
+
+int qw36_state_hydrate(qw36_state *st, const qw36_engine *eng,
+                       const void *buf, size_t bytes)
+{
+    if (!st || !eng || !buf || bytes < sizeof(qw36_state_blob_hdr)) return -1;
+    const qw36_config *c = &eng->cfg;
+    qw36_gpu_backend *be = eng->backend;
+    qw36_gpu_ctx *ctx = eng->ctx;
+
+    const uint8_t *in = (const uint8_t *)buf;
+    qw36_state_blob_hdr hdr;
+    memcpy(&hdr, in, sizeof(hdr)); in += sizeof(hdr);
+    if (hdr.magic != QW36_STATE_BLOB_MAGIC) return -1;
+    if (hdr.version != QW36_STATE_BLOB_VERSION) return -1;
+
+    /* Reject any model / config mismatch — catastrophic if we don't. */
+    if (hdr.num_layers != st->num_layers)               return -1;
+    if (hdr.hidden_size != c->hidden_size)              return -1;
+    if (hdr.n_kv != c->num_key_value_heads)             return -1;
+    if (hdr.head_dim != c->head_dim)                    return -1;
+    if (hdr.dn_n_value_heads != c->dn_num_value_heads)  return -1;
+    if (hdr.kv_dtype != (uint32_t)st->kv_dtype)         return -1;
+    if (hdr.seq_pos > st->seq_capacity)                 return -1;
+
+    const uint32_t *flags = (const uint32_t *)in;
+    in += (size_t)st->num_layers * sizeof(uint32_t);
+
+    const size_t kv_eb = qw36__kv_elem_bytes(st->kv_dtype);
+    const size_t kv_per_token = (size_t)c->num_key_value_heads
+                              * (size_t)c->head_dim * kv_eb;
+    const size_t dn_conv_bytes = (size_t)hdr.dn_conv_window
+                               * (size_t)hdr.dn_qkv_dim * sizeof(float);
+    const size_t dn_delta_bytes = (size_t)hdr.dn_n_value_heads
+                                * (size_t)hdr.dn_key_dim
+                                * (size_t)hdr.dn_val_dim * sizeof(float);
+
+    for (uint32_t l = 0; l < hdr.num_layers; l++) {
+        if (flags[l] & QW36_LAYER_FLAG_VANILLA) {
+            const size_t kv_bytes = (size_t)hdr.seq_pos * kv_per_token;
+            if (st->k_cache_dev && st->k_cache_dev[l] && be && be->copy_from_host) {
+                be->copy_from_host(ctx, (qw36_gpu_buf *)st->k_cache_dev[l],
+                                   in, kv_bytes);
+            } else if (st->k_cache && st->k_cache[l]) {
+                memcpy(st->k_cache[l], in, kv_bytes);
+            } else { return -1; }
+            in += kv_bytes;
+            if (st->v_cache_dev && st->v_cache_dev[l] && be && be->copy_from_host) {
+                be->copy_from_host(ctx, (qw36_gpu_buf *)st->v_cache_dev[l],
+                                   in, kv_bytes);
+            } else if (st->v_cache && st->v_cache[l]) {
+                memcpy(st->v_cache[l], in, kv_bytes);
+            } else { return -1; }
+            in += kv_bytes;
+        }
+        if (flags[l] & QW36_LAYER_FLAG_DN) {
+            if (st->conv_state_dev && st->conv_state_dev[l] && be && be->copy_from_host) {
+                be->copy_from_host(ctx, (qw36_gpu_buf *)st->conv_state_dev[l],
+                                   in, dn_conv_bytes);
+            } else if (st->conv_state && st->conv_state[l]) {
+                memcpy(st->conv_state[l], in, dn_conv_bytes);
+            }
+            in += dn_conv_bytes;
+            if (st->delta_state_dev && st->delta_state_dev[l] && be && be->copy_from_host) {
+                be->copy_from_host(ctx, (qw36_gpu_buf *)st->delta_state_dev[l],
+                                   in, dn_delta_bytes);
+            } else if (st->delta_state && st->delta_state[l]) {
+                memcpy(st->delta_state[l], in, dn_delta_bytes);
+            }
+            in += dn_delta_bytes;
+        }
+    }
+    st->seq_pos = hdr.seq_pos;
+    return 0;
+}
+
 int qw36_prefill(qw36_engine *eng, qw36_state *st,
                  const uint32_t *tokens, size_t length)
 {
-    /* KV prefix cache consult (Roadmap 2.1). The lookup walks tier-by-
-     * tier looking for the longest matching prefix. v0 of the engine
-     * wiring: we count the hit but do NOT yet hydrate qw36_state from
-     * the blob — full snapshot/hydrate of per-layer KV / conv / delta
-     * state is the follow-up PR. The lookup counters move so smoke
-     * tests can verify the path is exercised; behaviourally this is
-     * still "miss + full prefill" today. */
+    /* KV prefix cache consult (Roadmap 2.1). Lookup walks tier-by-tier
+     * for the longest matching prefix. On hit, hydrate state and skip
+     * the prefill loop for the matched region. After prefill completes,
+     * snapshot the state and insert into the cache. */
     qw36_kv_prefix_cache *cache = eng ? (qw36_kv_prefix_cache *)eng->kv_cache : NULL;
+    size_t start = 0;
     if (cache) {
         const void *blob = NULL;
         size_t blob_bytes = 0;
         size_t matched = qw36_kv_cache_lookup(cache, tokens, length,
                                               &blob, &blob_bytes);
-        (void)matched; (void)blob; (void)blob_bytes;
-        /* TODO(PR follow-up): if (matched > 0 && qw36_state_hydrate(st, blob, blob_bytes) == 0) {
-         *     start = matched;
-         *     st->seq_pos = matched;
-         * } */
+        if (matched > 0 && blob && blob_bytes &&
+            matched < length &&    /* always need at least one forward to land logits */
+            qw36_state_hydrate(st, eng, blob, blob_bytes) == 0) {
+            start = matched;
+        }
     }
 
-    for (size_t i = 0; i < length; i++) {
+    for (size_t i = start; i < length; i++) {
         qw36__skip_logits_this_forward = (i + 1 < length);
         int rc = qw36_forward(eng, st, tokens[i]);
         qw36__skip_logits_this_forward = 0;
         if (rc) return rc;
     }
 
-    /* Post-prefill insert. v0: empty payload — the cache records the
-     * prefix token vector and counter moves, but no engine state is
-     * stored yet. Full state snapshot is the follow-up PR. */
+    /* Post-prefill insert. Snapshot the state into a fresh blob and
+     * hand it to the cache (the cache copies bytes; we keep ownership). */
     if (cache && length) {
-        qw36_kv_cache_insert(cache, tokens, length, NULL, 0);
+        size_t need = qw36_state_blob_size(st, eng);
+        if (need) {
+            void *blob = malloc(need);
+            if (blob) {
+                size_t wrote = qw36_state_snapshot(st, eng, blob, need);
+                if (wrote == need) {
+                    qw36_kv_cache_insert(cache, tokens, length, blob, wrote);
+                }
+                free(blob);
+            }
+        }
     }
     return 0;
 }
