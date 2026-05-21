@@ -310,6 +310,21 @@ kernel void qw36_moe_down_combine_f32(
     y[d] = out;
 }
 
+kernel void qw36_moe_scale_add_f32(
+    device uchar       *y          [[buffer(0)]],
+    device const float *shared     [[buffer(1)]],
+    device const float *scale_raw  [[buffer(2)]],
+    constant uint      &hidden     [[buffer(3)]],
+    constant uint      &has_scale  [[buffer(4)]],
+    constant uint      &y_dtype    [[buffer(5)]],
+    uint                tid        [[thread_position_in_grid]])
+{
+    if (tid >= hidden) return;
+    float scale = has_scale ? (1.0f / (1.0f + exp(-scale_raw[0]))) : 1.0f;
+    float v = qw36_load_scalar(y, y_dtype, tid) + scale * shared[tid];
+    qw36_store_scalar(y, y_dtype, tid, v);
+}
+
 /* ---------------------------------------------------------------- */
 /* DeltaNet decode helpers. State layout follows common/qw36.c:      */
 /* conv_state [kernel-1, channels], delta_state [Hv, Dk, Dv].        */
@@ -365,7 +380,9 @@ kernel void qw36_dn_gated_delta_f32(
 
     uint v = gid / val_dim;
     uint d = gid - v * val_dim;
-    uint kh = v % n_key;
+    uint group = (n_key && n_value % n_key == 0) ? n_value / n_key : 1;
+    if (group == 0) group = 1;
+    uint kh = (n_value >= n_key && n_value % n_key == 0) ? v / group : v % n_key;
     uint q_dim_total = n_key * key_dim;
     uint k_dim_total = q_dim_total;
 
@@ -379,8 +396,8 @@ kernel void qw36_dn_gated_delta_f32(
         qss += qv * qv;
         kss += kv * kv;
     }
-    float q_scale = rsqrt(qss + 1.0e-12f) / sqrt(float(key_dim));
-    float k_scale = rsqrt(kss + 1.0e-12f);
+    float q_scale = rsqrt(qss + float(key_dim) * 1.0e-6f) / sqrt(float(key_dim));
+    float k_scale = rsqrt(kss + float(key_dim) * 1.0e-6f);
 
     float av = alpha_raw[v] + dt_bias[v];
     float softplus = av > 20.0f ? av : log(1.0f + exp(av));
@@ -511,6 +528,15 @@ kernel void qw36_dn_gated_rmsnorm_matmul_f32(
     if (tid == 0) qw36_store_scalar(y, y_dtype, row, partial[0]);
 }
 
+static inline uint qw36_dn_raw_v_head(uint grouped_v, uint Hk, uint Hv)
+{
+    uint group = (Hk == 0) ? 1 : (Hv / Hk);
+    if (group == 0) group = 1;
+    if (Hk != 0 && Hv % Hk == 0)
+        return (grouped_v % group) * Hk + grouped_v / group;
+    return grouped_v;
+}
+
 kernel void qw36_compute_g_beta_norm_qk(
     device float       *q_out     [[buffer(0)]],
     device float       *k_out     [[buffer(1)]],
@@ -545,23 +571,46 @@ kernel void qw36_compute_g_beta_norm_qk(
             qss += qv * qv;
             kss += kv * kv;
         }
-        q_out[gid] = qh[d] * rsqrt(qss + 1.0e-12f) / sqrt(float(Dk));
-        k_out[gid] = kh[d] * rsqrt(kss + 1.0e-12f);
+        q_out[gid] = qh[d] * rsqrt(qss + float(Dk) * 1.0e-6f) / sqrt(float(Dk));
+        k_out[gid] = kh[d] * rsqrt(kss + float(Dk) * 1.0e-6f);
     }
 
     if (gid < v_total) {
         uint v = gid / Dv;
         uint d = gid - v * Dv;
-        v_out[v * Dv + d] = qkv[q_total + k_total + v * Dv + d];
+        uint raw_v = qw36_dn_raw_v_head(v, Hk, Hv);
+        v_out[v * Dv + d] = qkv[q_total + k_total + raw_v * Dv + d];
     }
 
     if (gid < Hv) {
         uint v = gid;
-        float av = alpha_raw[v] + dt_bias[v];
+        uint raw_v = qw36_dn_raw_v_head(v, Hk, Hv);
+        float av = alpha_raw[raw_v] + dt_bias[v];
         float softplus = av > 20.0f ? av : log(1.0f + exp(av));
         g_out[v] = exp(-exp(a_log[v]) * softplus);
-        beta_out[v] = 1.0f / (1.0f + exp(-beta_raw[v]));
+        beta_out[v] = 1.0f / (1.0f + exp(-beta_raw[raw_v]));
     }
+}
+
+static inline float qw36_dn_conv1d_silu_value_at(device const float *x,
+                                                  device const float *conv_w,
+                                                  device const float *conv_state,
+                                                  uint channels,
+                                                  uint kernel_size,
+                                                  uint c_state,
+                                                  uint c_x)
+{
+    float acc = 0.0f;
+    if (kernel_size == 0) {
+        acc = x[c_x];
+    } else {
+        device const float *wt = conv_w + c_state * kernel_size;
+        for (uint t = 0; t + 1 < kernel_size; ++t) {
+            acc += wt[t] * conv_state[t * channels + c_state];
+        }
+        acc += wt[kernel_size - 1] * x[c_x];
+    }
+    return acc / (1.0f + exp(-acc));
 }
 
 static inline float qw36_dn_conv1d_silu_value(device const float *x,
@@ -571,17 +620,23 @@ static inline float qw36_dn_conv1d_silu_value(device const float *x,
                                                uint kernel_size,
                                                uint c)
 {
-    float acc = 0.0f;
-    if (kernel_size == 0) {
-        acc = x[c];
-    } else {
-        device const float *wt = conv_w + c * kernel_size;
-        for (uint t = 0; t + 1 < kernel_size; ++t) {
-            acc += wt[t] * conv_state[t * channels + c];
-        }
-        acc += wt[kernel_size - 1] * x[c];
+    return qw36_dn_conv1d_silu_value_at(x, conv_w, conv_state,
+                                        channels, kernel_size, c, c);
+}
+
+static inline void qw36_dn_conv1d_update_state_at(device float *conv_state,
+                                                   device const float *x,
+                                                   uint channels,
+                                                   uint kernel_size,
+                                                   uint c_state,
+                                                   uint c_x)
+{
+    if (kernel_size <= 1) return;
+    for (uint t = 0; t + 2 < kernel_size; ++t) {
+        conv_state[t * channels + c_state] =
+            conv_state[(t + 1) * channels + c_state];
     }
-    return acc / (1.0f + exp(-acc));
+    conv_state[(kernel_size - 2) * channels + c_state] = x[c_x];
 }
 
 static inline void qw36_dn_conv1d_update_state(device float *conv_state,
@@ -590,11 +645,8 @@ static inline void qw36_dn_conv1d_update_state(device float *conv_state,
                                                 uint kernel_size,
                                                 uint c)
 {
-    if (kernel_size <= 1) return;
-    for (uint t = 0; t + 2 < kernel_size; ++t) {
-        conv_state[t * channels + c] = conv_state[(t + 1) * channels + c];
-    }
-    conv_state[(kernel_size - 2) * channels + c] = x[c];
+    qw36_dn_conv1d_update_state_at(conv_state, x, channels,
+                                   kernel_size, c, c);
 }
 
 /* Fused DeltaNet prep: inline depthwise conv1d+silu before q/k L2 norm,
@@ -661,8 +713,8 @@ kernel void qw36_compute_g_beta_norm_qk_conv1d(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        float q_scale = rsqrt(q_part[0] + 1.0e-12f) / sqrt(float(Dk));
-        float k_scale = rsqrt(k_part[0] + 1.0e-12f);
+        float q_scale = rsqrt(q_part[0] + float(Dk) * 1.0e-6f) / sqrt(float(Dk));
+        float k_scale = rsqrt(k_part[0] + float(Dk) * 1.0e-6f);
         for (uint d = tid; d < Dk; d += tg_size) {
             uint qc = head * Dk + d;
             uint kc = q_total + head * Dk + d;
@@ -676,18 +728,21 @@ kernel void qw36_compute_g_beta_norm_qk_conv1d(
     }
 
     if (head < Hv) {
+        uint raw_head = qw36_dn_raw_v_head(head, Hk, Hv);
         for (uint d = tid; d < Dv; d += tg_size) {
             uint vc = q_total + k_total + head * Dv + d;
-            v_out[head * Dv + d] = qw36_dn_conv1d_silu_value(
-                qkv_raw, conv_w, conv_state, channels, kernel_size, vc);
-            qw36_dn_conv1d_update_state(conv_state, qkv_raw, channels,
-                                         kernel_size, vc);
+            uint raw_vc = q_total + k_total + raw_head * Dv + d;
+            v_out[head * Dv + d] = qw36_dn_conv1d_silu_value_at(
+                qkv_raw, conv_w, conv_state, channels, kernel_size,
+                vc, raw_vc);
+            qw36_dn_conv1d_update_state_at(conv_state, qkv_raw, channels,
+                                            kernel_size, vc, raw_vc);
         }
         if (tid == 0) {
-            float av = alpha_raw[head] + dt_bias[head];
+            float av = alpha_raw[raw_head] + dt_bias[head];
             float softplus = av > 20.0f ? av : log(1.0f + exp(av));
             g_out[head] = exp(-exp(a_log[head]) * softplus);
-            beta_out[head] = 1.0f / (1.0f + exp(-beta_raw[head]));
+            beta_out[head] = 1.0f / (1.0f + exp(-beta_raw[raw_head]));
         }
     }
 }

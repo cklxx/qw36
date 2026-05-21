@@ -96,7 +96,6 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
 
     if (fc->gpu_state && !mlp_gpu_done && L->moe_router &&
         L->moe_expert_gate && L->moe_expert_up && L->moe_expert_down &&
-        !L->moe_shared_gate_inp &&
         eng->backend && eng->backend->rmsnorm &&
         eng->backend->moe_forward && eng->backend->residual_add) {
         const qw36_lazy_w *router = (const qw36_lazy_w *)L->moe_router;
@@ -106,11 +105,16 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
         const qw36_lazy_w *sg = (const qw36_lazy_w *)L->moe_shared_gate;
         const qw36_lazy_w *su = (const qw36_lazy_w *)L->moe_shared_up;
         const qw36_lazy_w *sd = (const qw36_lazy_w *)L->moe_shared_down;
+        const qw36_lazy_w *sgi = (const qw36_lazy_w *)L->moe_shared_gate_inp;
         const uint32_t mi = c->moe_intermediate_size
                           ? c->moe_intermediate_size
                           : (uint32_t)eg->rows;
+        const uint32_t si = c->moe_shared_expert_intermediate_size
+                          ? c->moe_shared_expert_intermediate_size
+                          : mi;
         if (router->gpu_buf && eg->gpu_buf && eu->gpu_buf && ed->gpu_buf &&
-            (!sg || (sg->gpu_buf && su && su->gpu_buf && sd && sd->gpu_buf))) {
+            (!sg || (sg->gpu_buf && su && su->gpu_buf && sd && sd->gpu_buf)) &&
+            (!sgi || sgi->gpu_buf)) {
             int erc = qw36__ensure_x_dev(fc);
             if (erc) return erc;
             int grc = 0;
@@ -127,7 +131,8 @@ int qw36__mlp_forward(qw36_forward_ctx *fc,
                     sg ? sg->gpu_buf : NULL,
                     su ? su->gpu_buf : NULL,
                     sd ? sd->gpu_buf : NULL,
-                    (uint32_t)hidden, mi, c->moe_num_experts,
+                    sgi ? sgi->gpu_buf : NULL,
+                    (uint32_t)hidden, mi, si, c->moe_num_experts,
                     c->moe_experts_per_tok, c->moe_norm_topk_prob);
                 const qw36_layer_weights *L_next_moe =
                     (layer_idx + 1 < fc->cfg->num_hidden_layers)

@@ -213,8 +213,7 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
     const uint32_t kd = c->dn_key_head_dim;
     const uint32_t vd = c->dn_value_head_dim;
     if (!n_v || !n_k || !kd || !vd) return -1;
-    if (n_v > n_k && n_v % n_k == 0 && n_v / n_k > 1)
-        return -1;
+    const uint32_t vpk = (n_k && n_v % n_k == 0) ? n_v / n_k : 1;
     const uint32_t qkv_dim = n_k * kd * 2 + n_v * vd;
     const uint32_t z_dim = n_v * vd;
     const uint32_t alpha_offset = fused_proj ? qkv_dim + z_dim : 0;
@@ -259,6 +258,8 @@ int qw36__deltanet_dispatch_dev(qw36_state *st,
         const char *e = getenv("QW36_METAL_FUSE_DN_CONV");
         fuse_dn_conv = (!e || atoi(e) != 0) ? 1 : 0;
     }
+    if (vpk > 1 && (!fuse_dn_conv || !be->dn_gated_delta_conv1d))
+        return -1;
     if (fuse_dn_conv && be->dn_gated_delta_conv1d) {
         be->dn_gated_delta_conv1d(
             ctx, (qw36_gpu_buf *)st->dn_gout_dev,

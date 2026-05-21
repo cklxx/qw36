@@ -164,7 +164,9 @@ typedef struct qw36_gpu_backend {
                         qw36_gpu_buf *shared_gate,
                         qw36_gpu_buf *shared_up,
                         qw36_gpu_buf *shared_down,
+                        qw36_gpu_buf *shared_gate_inp,
                         uint32_t hidden, uint32_t inter,
+                        uint32_t shared_inter,
                         uint32_t num_experts, uint32_t experts_per_tok,
                         uint8_t  norm_topk);
 
