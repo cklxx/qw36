@@ -1730,6 +1730,12 @@ static void metal_attention(qw36_gpu_ctx *ctx,
                  wv->dtype == QW36_DTYPE_Q6_K ||
                  wv->dtype == QW36_DTYPE_Q6K_SCALE16 ||
                  wv->dtype == QW36_DTYPE_Q8_0);
+    static int kv_transposed_env_cached = -1;
+    if (kv_transposed_env_cached < 0) {
+        const char *e = getenv("QW36_METAL_KV_TRANSPOSED");
+        kv_transposed_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    uint32_t kv_transposed = kv_transposed_env_cached ? 1u : 0u;
     if (wq_ok && wk_ok && wv_ok &&
         tg_size <= 256 &&
         tg_size <= ctx->attn_decode_fused.maxTotalThreadsPerThreadgroup &&
@@ -1794,14 +1800,19 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             [enc setBytes:&q_elem_offset length:sizeof(q_elem_offset) atIndex:23];
             [enc setBytes:&k_elem_offset length:sizeof(k_elem_offset) atIndex:24];
             [enc setBytes:&v_elem_offset length:sizeof(v_elem_offset) atIndex:25];
+            [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:26];
         } else {
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:19];
             [enc setBytes:&y_dtype length:sizeof(y_dtype) atIndex:20];
             [enc setBytes:&q_elem_offset length:sizeof(q_elem_offset) atIndex:21];
             [enc setBytes:&k_elem_offset length:sizeof(k_elem_offset) atIndex:22];
             [enc setBytes:&v_elem_offset length:sizeof(v_elem_offset) atIndex:23];
+            [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:24];
         }
-        [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
+        NSUInteger scratch_floats = (NSUInteger)tg_size + positions;
+        if (f16_kv && kv_transposed && !use_x4)
+            scratch_floats += (NSUInteger)tg_size;
+        [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
@@ -1833,6 +1844,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:16];
         [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:17];
         [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:18];
+        [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:19];
     });
 
     if (tg_size <= 256 &&
@@ -1856,6 +1868,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:9];
         [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:10];
         [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:11];
+        [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:12];
         [enc setThreadgroupMemoryLength:((NSUInteger)tg_size + positions) * sizeof(float)
                                 atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
@@ -1882,6 +1895,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:6];
         [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:7];
         [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:8];
+        [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:9];
     });
     metal_dispatch_1d(ctx, ctx->attn_softmax, n_heads, ^(id<MTLComputeCommandEncoder> enc) {
         [enc setBuffer:scores->mtl offset:0 atIndex:0];
@@ -1898,6 +1912,7 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&seq_pos length:sizeof(seq_pos) atIndex:6];
         [enc setBytes:&seq_capacity length:sizeof(seq_capacity) atIndex:7];
         [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:8];
+        [enc setBytes:&kv_transposed length:sizeof(kv_transposed) atIndex:9];
     });
 }
 

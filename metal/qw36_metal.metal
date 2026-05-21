@@ -48,6 +48,15 @@ static inline void qw36_store_scalar(device uchar *ptr, uint dtype, uint i, floa
     }
 }
 
+static inline uint qw36_kv_cache_offset(uint t, uint kvh, uint lane,
+                                        uint head_dim, uint seq_capacity,
+                                        uint kv_len, uint kv_transposed)
+{
+    uint head_lane = kvh * head_dim + lane;
+    return kv_transposed ? head_lane * seq_capacity + t
+                         : t * kv_len + head_lane;
+}
+
 /* ---------------------------------------------------------------- */
 /* RMSNorm: out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i]            */
 /* ---------------------------------------------------------------- */
@@ -726,10 +735,15 @@ kernel void qw36_kv_append_f32(
     constant uint      &kv_len       [[buffer(6)]],
     constant uint      &k_cache_dtype [[buffer(7)]],
     constant uint      &v_cache_dtype [[buffer(8)]],
+    constant uint      &head_dim     [[buffer(9)]],
+    constant uint      &kv_transposed [[buffer(10)]],
     uint                tid          [[thread_position_in_grid]])
 {
     if (tid >= kv_len || seq_pos >= seq_capacity) return;
-    uint off = seq_pos * kv_len + tid;
+    uint kvh = tid / head_dim;
+    uint lane = tid - kvh * head_dim;
+    uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                    seq_capacity, kv_len, kv_transposed);
     qw36_store_scalar(k_cache, k_cache_dtype, off, k[tid]);
     qw36_store_scalar(v_cache, v_cache_dtype, off, v[tid]);
 }
@@ -747,6 +761,7 @@ kernel void qw36_attn_scores_f32(
     constant uint      &seq_pos      [[buffer(6)]],
     constant uint      &seq_capacity [[buffer(7)]],
     constant uint      &k_cache_dtype [[buffer(8)]],
+    constant uint      &kv_transposed [[buffer(9)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint count = seq_pos + 1;
@@ -757,10 +772,12 @@ kernel void qw36_attn_scores_f32(
     uint kv_h = h * n_kv / n_heads;
     uint kv_len = n_kv * head_dim;
     device const float *qh = q + h * head_dim;
-    uint k_base = pos * kv_len + kv_h * head_dim;
     float acc = 0.0f;
-    for (uint d = 0; d < head_dim; ++d)
-        acc += qh[d] * qw36_load_scalar(k_cache, k_cache_dtype, k_base + d);
+    for (uint d = 0; d < head_dim; ++d) {
+        uint off = qw36_kv_cache_offset(pos, kv_h, d, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
+        acc += qh[d] * qw36_load_scalar(k_cache, k_cache_dtype, off);
+    }
     scores[gid] = acc / sqrt(float(head_dim));
 }
 
@@ -801,6 +818,7 @@ kernel void qw36_attn_combine_f32(
     constant uint      &seq_pos      [[buffer(6)]],
     constant uint      &seq_capacity [[buffer(7)]],
     constant uint      &v_cache_dtype [[buffer(8)]],
+    constant uint      &kv_transposed [[buffer(9)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint hidden = n_heads * head_dim;
@@ -813,7 +831,8 @@ kernel void qw36_attn_combine_f32(
     device const float *score_row = scores + h * count;
     float acc = 0.0f;
     for (uint pos = 0; pos < count; ++pos) {
-        uint off = pos * kv_len + kv_h * head_dim + d;
+        uint off = qw36_kv_cache_offset(pos, kv_h, d, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
         acc += score_row[pos] * qw36_load_scalar(v_cache, v_cache_dtype, off);
     }
     y[gid] = acc;
@@ -843,6 +862,7 @@ kernel void qw36_attn_prep_decode_f32(
     constant uint      &k_w_dtype    [[buffer(16)]],
     constant uint      &k_cache_dtype [[buffer(17)]],
     constant uint      &v_cache_dtype [[buffer(18)]],
+    constant uint      &kv_transposed [[buffer(19)]],
     uint                gid          [[thread_position_in_grid]])
 {
     uint rot_dim = uint(float(head_dim) * partial);
@@ -895,11 +915,12 @@ kernel void qw36_attn_prep_decode_f32(
 
     if (seq_pos >= seq_capacity) return;
     uint kv_len = n_kv * head_dim;
-    uint cache_base = seq_pos * kv_len + kvh * head_dim;
     device const float *vh = v + kvh * head_dim;
     for (uint d = 0; d < head_dim; ++d) {
-        qw36_store_scalar(k_cache, k_cache_dtype, cache_base + d, kh[d]);
-        qw36_store_scalar(v_cache, v_cache_dtype, cache_base + d, vh[d]);
+        uint off = qw36_kv_cache_offset(seq_pos, kvh, d, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
+        qw36_store_scalar(k_cache, k_cache_dtype, off, kh[d]);
+        qw36_store_scalar(v_cache, v_cache_dtype, off, vh[d]);
     }
 }
 
@@ -916,6 +937,7 @@ kernel void qw36_attn_score_combine_tg_f32(
     constant uint      &tg_size      [[buffer(9)]],
     constant uint      &k_cache_dtype [[buffer(10)]],
     constant uint      &v_cache_dtype [[buffer(11)]],
+    constant uint      &kv_transposed [[buffer(12)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -932,9 +954,11 @@ kernel void qw36_attn_score_combine_tg_f32(
     float inv_sqrt_d = rsqrt(float(head_dim));
 
     for (uint t = 0; t < count; ++t) {
-        uint k_base = t * kv_len + kvh * head_dim;
         partials[lane] = (lane < head_dim)
-            ? qh[lane] * qw36_load_scalar(k_cache, k_cache_dtype, k_base + lane)
+            ? qh[lane] * qw36_load_scalar(
+                k_cache, k_cache_dtype,
+                qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                     seq_capacity, kv_len, kv_transposed))
             : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
@@ -962,7 +986,9 @@ kernel void qw36_attn_score_combine_tg_f32(
     if (lane < head_dim) {
         float acc = 0.0f;
         for (uint t = 0; t < count; ++t) {
-            uint off = t * kv_len + kvh * head_dim + lane;
+            uint off = qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                            seq_capacity, kv_len,
+                                            kv_transposed);
             acc += scores[t] * qw36_load_scalar(v_cache, v_cache_dtype, off);
         }
         y[h * head_dim + lane] = acc;
@@ -996,6 +1022,7 @@ kernel void qw36_attn_decode_fused_f32(
     constant uint      &q_offset      [[buffer(23)]],
     constant uint      &k_offset      [[buffer(24)]],
     constant uint      &v_offset      [[buffer(25)]],
+    constant uint      &kv_transposed [[buffer(26)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1067,7 +1094,8 @@ kernel void qw36_attn_decode_fused_f32(
     }
 
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
-        uint off = seq_pos * kv_len + kvh * head_dim + lane;
+        uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
         qw36_store_scalar(k_cache, k_cache_dtype, off, kv);
         qw36_store_scalar(v_cache, v_cache_dtype, off, v_base[kvh * head_dim + lane]);
     }
@@ -1080,7 +1108,9 @@ kernel void qw36_attn_decode_fused_f32(
             kval = (t == seq_pos)
                 ? kv
                 : qw36_load_scalar(k_cache, k_cache_dtype,
-                                   t * kv_len + kvh * head_dim + lane);
+                                   qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                                        seq_capacity, kv_len,
+                                                        kv_transposed));
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0) partials[simd_id] = dot;
@@ -1110,7 +1140,9 @@ kernel void qw36_attn_decode_fused_f32(
             float vv = (t == seq_pos)
                 ? v_base[kvh * head_dim + lane]
                 : qw36_load_scalar(v_cache, v_cache_dtype,
-                                   t * kv_len + kvh * head_dim + lane);
+                                   qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                                        seq_capacity, kv_len,
+                                                        kv_transposed));
             acc += scores[t] * vv;
         }
         if (q_has_gate) {
@@ -1146,6 +1178,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     constant uint      &q_offset     [[buffer(21)]],
     constant uint      &k_offset     [[buffer(22)]],
     constant uint      &v_offset     [[buffer(23)]],
+    constant uint      &kv_transposed [[buffer(24)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1162,7 +1195,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     uint half_dim = rot_dim / 2;
 
     threadgroup float *partials = scratch;
-    threadgroup float *scores = scratch + tg_size;
+    threadgroup float *q_vec = scratch;
+    threadgroup float *k_vec = scratch + tg_size;
+    threadgroup float *scores = scratch + (kv_transposed ? 2u * tg_size : tg_size);
     uint simd_lane = lane & 31u;
     uint simd_id = lane >> 5;
     uint simd_count = (tg_size + 31u) >> 5;
@@ -1217,19 +1252,76 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     }
 
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
-        uint off = seq_pos * kv_len + kvh * head_dim + lane;
+        uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
         k_cache[off] = half(kv);
         v_cache[off] = half(v_base[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float inv_sqrt_d = rsqrt(float(head_dim));
+    if (kv_transposed) {
+        if (lane < head_dim) {
+            q_vec[lane] = qv;
+            k_vec[lane] = kv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint t0 = 0; t0 < count; t0 += tg_size) {
+            uint t = t0 + lane;
+            if (t < count) {
+                float dot = 0.0f;
+                for (uint d = 0; d < head_dim; ++d) {
+                    float kval = (t == seq_pos)
+                        ? k_vec[d]
+                        : float(k_cache[qw36_kv_cache_offset(
+                            t, kvh, d, head_dim, seq_capacity, kv_len, 1u)]);
+                    dot += q_vec[d] * kval;
+                }
+                scores[t] = dot * inv_sqrt_d;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane == 0) {
+            float maxv = scores[0];
+            for (uint t = 1; t < count; ++t) maxv = max(maxv, scores[t]);
+            float sum = 0.0f;
+            for (uint t = 0; t < count; ++t) {
+                float e = exp(scores[t] - maxv);
+                scores[t] = e;
+                sum += e;
+            }
+            float inv_sum = 1.0f / sum;
+            for (uint t = 0; t < count; ++t) scores[t] *= inv_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lane < head_dim) {
+            float acc = 0.0f;
+            for (uint t = 0; t < count; ++t) {
+                float vv = (t == seq_pos)
+                    ? v_base[kvh * head_dim + lane]
+                    : float(v_cache[qw36_kv_cache_offset(
+                        t, kvh, lane, head_dim, seq_capacity, kv_len, 1u)]);
+                acc += scores[t] * vv;
+            }
+            if (q_has_gate) {
+                float g = gate_base[lane];
+                acc *= 1.0f / (1.0f + exp(-g));
+            }
+            qw36_store_scalar(y, y_dtype, h * head_dim + lane, acc);
+        }
+        return;
+    }
+
     for (uint t = 0; t < count; ++t) {
         float kval = 0.0f;
         if (lane < head_dim) {
             kval = (t == seq_pos)
                 ? kv
-                : float(k_cache[t * kv_len + kvh * head_dim + lane]);
+                : float(k_cache[qw36_kv_cache_offset(
+                    t, kvh, lane, head_dim, seq_capacity, kv_len, 0u)]);
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0) partials[simd_id] = dot;
@@ -1258,7 +1350,8 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
                 ? v_base[kvh * head_dim + lane]
-                : float(v_cache[t * kv_len + kvh * head_dim + lane]);
+                : float(v_cache[qw36_kv_cache_offset(
+                    t, kvh, lane, head_dim, seq_capacity, kv_len, 0u)]);
             acc += scores[t] * vv;
         }
         if (q_has_gate) {
@@ -1308,6 +1401,7 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     constant uint      &q_offset     [[buffer(21)]],
     constant uint      &k_offset     [[buffer(22)]],
     constant uint      &v_offset     [[buffer(23)]],
+    constant uint      &kv_transposed [[buffer(24)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1382,7 +1476,8 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     }
 
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
-        uint off = seq_pos * kv_len + kvh * head_dim + lane;
+        uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                        seq_capacity, kv_len, kv_transposed);
         k_cache[off] = half(kv);
         v_cache[off] = half(v_base[kvh * head_dim + lane]);
     }
@@ -1397,11 +1492,18 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     for (uint t0 = 0; t0 < t_full; t0 += 4u) {
         float k0val = 0.0f, k1val = 0.0f, k2val = 0.0f, k3val = 0.0f;
         if (lane < head_dim) {
-            uint base = kvh * head_dim + lane;
-            k0val = ((t0 + 0u) == seq_pos) ? kv : float(k_cache[(t0 + 0u) * kv_len + base]);
-            k1val = ((t0 + 1u) == seq_pos) ? kv : float(k_cache[(t0 + 1u) * kv_len + base]);
-            k2val = ((t0 + 2u) == seq_pos) ? kv : float(k_cache[(t0 + 2u) * kv_len + base]);
-            k3val = ((t0 + 3u) == seq_pos) ? kv : float(k_cache[(t0 + 3u) * kv_len + base]);
+            k0val = ((t0 + 0u) == seq_pos) ? kv : float(k_cache[
+                qw36_kv_cache_offset(t0 + 0u, kvh, lane, head_dim,
+                                      seq_capacity, kv_len, kv_transposed)]);
+            k1val = ((t0 + 1u) == seq_pos) ? kv : float(k_cache[
+                qw36_kv_cache_offset(t0 + 1u, kvh, lane, head_dim,
+                                      seq_capacity, kv_len, kv_transposed)]);
+            k2val = ((t0 + 2u) == seq_pos) ? kv : float(k_cache[
+                qw36_kv_cache_offset(t0 + 2u, kvh, lane, head_dim,
+                                      seq_capacity, kv_len, kv_transposed)]);
+            k3val = ((t0 + 3u) == seq_pos) ? kv : float(k_cache[
+                qw36_kv_cache_offset(t0 + 3u, kvh, lane, head_dim,
+                                      seq_capacity, kv_len, kv_transposed)]);
         }
         float d0 = simd_sum((lane < head_dim) ? qv * k0val : 0.0f);
         float d1 = simd_sum((lane < head_dim) ? qv * k1val : 0.0f);
@@ -1429,7 +1531,9 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
         if (lane < head_dim) {
             kval = (t == seq_pos)
                 ? kv
-                : float(k_cache[t * kv_len + kvh * head_dim + lane]);
+                : float(k_cache[qw36_kv_cache_offset(
+                    t, kvh, lane, head_dim, seq_capacity, kv_len,
+                    kv_transposed)]);
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0u) partials[simd_id] = dot;
@@ -1458,7 +1562,9 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
                 ? v_base[kvh * head_dim + lane]
-                : float(v_cache[t * kv_len + kvh * head_dim + lane]);
+                : float(v_cache[qw36_kv_cache_offset(
+                    t, kvh, lane, head_dim, seq_capacity, kv_len,
+                    kv_transposed)]);
             acc += scores[t] * vv;
         }
         if (q_has_gate) {

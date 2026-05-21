@@ -1390,6 +1390,8 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
             use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
         const size_t dev_kv_elem_bytes =
             use_fp16_dev_kv ? sizeof(uint16_t) : sizeof(float);
+        /* QW36_METAL_KV_TRANSPOSED only changes Metal-side indexing:
+         * [t, kv] and [kv, t] layouts have identical capacity in bytes. */
         const size_t cache_bytes =
             (size_t)seq_capacity * kv_dim * dev_kv_elem_bytes;
         for (size_t l = 0; l < L; l++) {
