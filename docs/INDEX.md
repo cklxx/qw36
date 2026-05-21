@@ -10,6 +10,8 @@ future contributors.
 | file | what it is |
 |------|------------|
 | [`README.md`](../README.md) | user-facing intro — install, build, CLI flags, env knobs |
+| [`ROADMAP.md`](../ROADMAP.md) | 4–8 week plan: themes, tasks, owner, definition-of-done, next 5 PRs |
+| [`CONTRIBUTING.md`](../CONTRIBUTING.md) | how to land a useful PR — build, test, perf discipline, commit style |
 | [`AGENTS.md`](../AGENTS.md) / `CLAUDE.md` symlink | project contract — execution phases, editing rules, codex/claude delegation, perf benchmarking discipline |
 | [`FINAL_STATUS.md`](../FINAL_STATUS.md) | running perf ladder + MLX comparison + the levers we tried |
 | [`CHANGELOG.md`](../CHANGELOG.md) | release notes |
@@ -19,11 +21,19 @@ future contributors.
 
 | file | what it is |
 |------|------------|
-| [`kvcache_design.md`](kvcache_design.md) | L1/L2/L3 prefix cache for KV reuse (new) |
+| [`kvcache_design.md`](kvcache_design.md) | tier-composing KV prefix cache (vtable per medium; ram_lru + disk on Mac, future vram + redis) |
 | [`q4k_kernel_design_v2.md`](q4k_kernel_design_v2.md) | Q4_K affine32 + qmv_fast kernel design, the lever that unlocked >170 tok/s |
 | [`q4k_qmv_quad_design.md`](q4k_qmv_quad_design.md) | early qmv_quad-style Q4_K design notes (predecessor to v2) |
 | [`q4k_kernel_research_task.md`](q4k_kernel_research_task.md) | research brief that triggered task R |
 | [`quant_matmul_research_brief.md`](quant_matmul_research_brief.md) | how qw36 reasons about quant matmul performance |
+
+## Reference (`docs/`)
+
+| file | what it is |
+|------|------------|
+| [`env_knobs.md`](env_knobs.md) | every `QW36_*` env knob the engine reads, with file:line, default, and lifecycle (stable / internal / research) |
+| [`performance_methodology.md`](performance_methodology.md) | how qw36 measures, why median-of-N + wallclock-not-gpu_ms, what counts as a real win |
+| [`troubleshooting.md`](troubleshooting.md) | top failure modes (build, runtime, perf) with concrete checks |
 
 ## Post-mortems / negative results (`docs/`)
 

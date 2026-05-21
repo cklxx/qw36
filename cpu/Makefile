@@ -27,14 +27,20 @@ COMMON_SRC := \
 
 BACKEND_SRC := qw36_cpu_stub.c
 
-OUT := $(ROOT)/qw36_cpu
+OUT ?= $(ROOT)/qw36_cpu
 
-.PHONY: all clean
+.PHONY: all clean cpu_with_extra
 
 all: $(OUT)
 
 $(OUT): $(COMMON_SRC) $(BACKEND_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h $(COMMON)/qw36_internal.h
 	$(CC) $(CFLAGS) $(INCLUDES) $(COMMON_SRC) $(BACKEND_SRC) -o $@ $(LDLIBS)
+
+# Target used by top-level `make asan` / `make ubsan`. Caller sets
+# CFLAGS_EXTRA, LDFLAGS_EXTRA, and OUT to override the release config.
+cpu_with_extra: $(COMMON_SRC) $(BACKEND_SRC) $(COMMON)/qw36.h $(COMMON)/qw36_gpu.h $(COMMON)/qw36_internal.h
+	$(CC) $(CFLAGS) $(CFLAGS_EXTRA) $(INCLUDES) $(COMMON_SRC) $(BACKEND_SRC) \
+	    $(LDFLAGS_EXTRA) -o $(OUT) $(LDLIBS)
 
 clean:
 	rm -f $(OUT)

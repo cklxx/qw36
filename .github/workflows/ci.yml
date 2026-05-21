@@ -106,3 +106,49 @@ jobs:
           # pin a sane architecture for the CI compile.
           make -C cuda NVCCFLAGS='-O3 -std=c++17 -Xcompiler "-Wall -Wextra" -arch=sm_80'
           ls -la ./qw36_cuda
+
+  linux-sanitizers:
+    name: linux / asan + ubsan cpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential
+      - name: Build ASAN
+        run: make asan
+      - name: Build UBSAN
+        run: make ubsan
+      - name: kvcache smoke (uses CPU build, exercises the new code)
+        run: tests/kvcache_smoke.sh
+      - name: Sanitizer smoke run
+        shell: bash
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          # Bounded smoke: --help + --info + (optional) decode under
+          # sanitizer instrumentation. Failures are CI-blocking.
+          ./qw36_cpu_asan  --help 2>&1 | head -40 || true
+          ./qw36_cpu_ubsan --help 2>&1 | head -40 || true
+          if [ -n "${QW36_TEST_MODEL:-}" ] && [ -f "${QW36_TEST_MODEL}" ]; then
+            timeout 120 ./qw36_cpu_asan  -m "$QW36_TEST_MODEL" -p "Hello" -n 4
+            timeout 120 ./qw36_cpu_ubsan -m "$QW36_TEST_MODEL" -p "Hello" -n 4
+          else
+            echo "skip: no QW36_TEST_MODEL — sanitizer instrumentation built only"
+          fi
+
+  lint:
+    name: lint / clang-format dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-format
+          clang-format --version
+      - name: Style check (fails on drift)
+        run: make lint

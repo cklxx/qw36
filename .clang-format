@@ -1,0 +1,72 @@
+# qw36 — clang-format config
+#
+# Goal: enforce the style the codebase already uses, not impose a new
+# one. Extracted from common/qw36.c (the largest file, established
+# style). Run as:
+#   clang-format --dry-run -Werror common/*.c common/*.h
+#
+# Notes:
+#   - We are C99/C11. No "modernize-*" — the codebase is C, not C++.
+#   - Brace style is K&R but with else-on-new-line for short ifs in
+#     hot paths (we don't enforce that with clang-format — too
+#     style-sensitive; clang-format would normalise it).
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++03
+
+ColumnLimit: 80
+IndentWidth: 4
+UseTab: Never
+TabWidth: 4
+
+# Match the existing K&R-ish brace style across the codebase.
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeElse: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+
+PointerAlignment: Right          # `float *p`, not `float* p`
+DerivePointerAlignment: false
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 1
+
+# Don't aggressively reflow comments — engineering memory in
+# comments is intentional.
+ReflowComments: false
+AlwaysBreakBeforeMultilineStrings: false
+
+# Header includes: keep author's order; sorting them across the C/H
+# boundary risks reordering platform-specific includes.
+SortIncludes: Never
+IncludeBlocks: Preserve
+
+# Function-arg packing: preserve author intent.
+BinPackArguments: false
+BinPackParameters: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AlignAfterOpenBracket: Align
+
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignConsecutiveMacros:    true
+
+# Switches: case bodies aren't double-indented.
+IndentCaseLabels: false
+
+# Don't try to merge short forms — explicit is fine.
+AllowShortBlocksOnASingleLine: Empty
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+
+# Inline assembly / Metal MSL files are auto-skipped by extension.

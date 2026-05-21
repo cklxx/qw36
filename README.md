@@ -12,19 +12,28 @@ between vanilla **Grouped-Query Attention** (Q-/K-norm + partial mRoPE) and
 SwiGLU MLP, optional Top-K **MoE** with shared expert, tied or untied
 `lm_head`.
 
-Current decode throughput on `Qwen3.5-0.8B-Q4_K_M.gguf` (Apple M-class GPU):
+Current decode throughput on `Qwen3.5-0.8B-Q4_K_M.gguf` (Apple M-class
+GPU; load avg < 3; 5-run median):
 
-| build                                  | decode tok/s |
-|----------------------------------------|--------------|
-| CPU reference (`qw36_cpu`)             |  1.7         |
-| Metal, fp32 weights                    | 55           |
-| Metal, `QW36_METAL_FP16_WEIGHTS=1`     | **81**       |
-| llama.cpp reference, same model        | 170          |
+| build                                  | n=64 short | n=256 sustained | n=2048 |
+|----------------------------------------|-----------:|----------------:|-------:|
+| CPU reference (`qw36_cpu`)             |        1.7 |               — |      — |
+| Metal, fp32 weights                    |         55 |              50 |      — |
+| Metal, `QW36_METAL_FP16_WEIGHTS=1`     |        119 |             103 |      — |
+| **Metal, `--fast` (opt-in path)**      |   **204**  |        **176**  | **92** |
+| llama.cpp reference, same model        |        170 |             170 |     — |
+| MLX-LM reference (4-bit, same machine) |        290 |             290 |     — |
 
-The full perf ladder lives in [`DIVISION_OF_WORK.md`](DIVISION_OF_WORK.md).
+The full perf ladder + every lever (Q4/Q5/Q6 affine repack, lm_head
+quant, KV transposed) lives in [`FINAL_STATUS.md`](FINAL_STATUS.md).
+The methodology lives in [`docs/performance_methodology.md`](docs/performance_methodology.md).
+
 The Qwen3.5 Q-gate fix makes the 0.8B baseline produce coherent text on
 both CPU and Metal; `tests/precision_cpu_vs_metal.sh` keeps the fp32 Metal
-path bit-identical to CPU at step 0.
+path bit-identical to CPU at step 0. The `--fast` path is smoke-gated by
+`tests/quant_fastest_smoke.sh`, not fp32 bit-equal.
+
+The roadmap of what's coming next lives in [`ROADMAP.md`](ROADMAP.md).
 
 ---
 
