@@ -2,10 +2,12 @@
 
 ## TL;DR
 
-Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **85 tok/s
-sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal (vs llama.cpp's
-170 tok/s reference, ~50%). CPU baseline 1.7 tok/s. Multi-session push
-to 200 tok/s in progress (#30/#40).
+Pure-C Qwen 3.5/3.6 inference framework, 3 GPU backends, **170 tok/s
+short-form / 139 tok/s sustained decode** on Qwen3.5-0.8B-Q4_K_M via Metal
+under `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1 QW36_METAL_Q5K_AFFINE32=1 QW36_METAL_Q6K_SCALE16=1`
+(vs llama.cpp 170 tok/s reference). The fp16 MPS path tops out at 119/103
+tok/s — quant-path now wins because we halve bandwidth via affine repack.
+CPU baseline 1.7 tok/s.
 
 ## Decode throughput ladder (Metal, M-class GPU, Qwen3.5-0.8B-Q4_K_M)
 
@@ -31,8 +33,10 @@ to 200 tok/s in progress (#30/#40).
 | 21cedec            | 120    | DN 4-projection (qkv+z+a+b) concat |
 | 0ba7349            | 121    | DN gated rmsnorm tail fuse      |
 | aac7f50            | 121    | DN conv1d + gated_delta fuse     |
-| 112e85f            | **122** | **persistent compute encoder**  |
-| 766b7c0 + 90b1377  | 85 (opt-in) | Q4K → affine32 repack + qmv_fast kernel (+45% vs native Q4_K quant_gpu; still under fp16 ceiling) |
+| 112e85f            | **122** | **persistent compute encoder** (fp16 path peak) |
+| 766b7c0 + 90b1377  | 85 (opt-in) | Q4K → affine32 repack + qmv_fast kernel (Q4K only; still under fp16) |
+| 8d45cca + b5e0ecb  | **161 (opt-in)** | + Q5K → affine32 repack (gate_up is Q5K — dominant matmul class) |
+| b5e0ecb (triple)   | **170 short / 139 sustained** | **+ Q6K → scale16 (qkv = Q6K). Triple-affine wins through fp16 ceiling** |
 | (llama.cpp ref)    | 170    | upstream baseline                 |
 | (agent-infer ref)  | ~244   | MLX bf16 + custom Q4_K + compiled fused kernels |
 
@@ -49,16 +53,23 @@ of this M-class GPU bottoms out at **8 ms / token = 125 tok/s**. Our
 theoretical bw limit, i.e. 78 % bw efficient — and similar story per
 MLP / attention GEMV.
 
-### Why MLX gets 244 tok/s and we don't
+### Why MLX gets 244 tok/s and we don't — and what we just unlocked
 
 MLX-4bit reads ~0.4 GB per token (1.6 GB fp16 → ~0.4 GB at 4 bits), giving
 a 2 ms / token bw ceiling = ~500 tok/s. They get 244 = 49% of that with
-their hand-tuned `qmv_quad` quantised matmul. Our `QW36_METAL_QUANT_GPU=1`
-path (Q4_K + Q5_K + Q6_K kernels) is correct but the per-call cost is
-3-4× MPS-fp16's, so it lands at 58 tok/s — the bandwidth win is eaten by
-kernel overhead. Catching MLX requires a proper hand-tuned quant matmul
-that matches MLX's `qmv_quad` efficiency (multi-day kernel work; codex's
-generic 256-thread TG version isn't there).
+their hand-tuned `qmv_quad` quantised matmul.
+
+**Triple-affine repack unlocked the quant-path advantage (2026-05-21):**
+gate_up is Q5_K (the heaviest matmul class in Q4_K_M); we'd been
+testing Q4_K-only affine32 (worth +45% over native Q4_K but still slower
+than fp16 MPS because gate_up was unaffected). Adding Q5K_AFFINE32 +
+Q6K_SCALE16 jumps us from 85 → 170 short / 139 sustained, beating fp16
+MPS (119 short / 103 sustained) by 30-40%. Bandwidth math: ~0.5 GB at
+4-5 bits vs ~1.6 GB fp16 explains the win.
+
+The qmv_fast kernels (codex S2 + Q5K/Q6K follow-on) match MLX's qmv_fast
+pattern (uint16 packed reads, per-group scale+bias). MLX's qmv_quad
+geometry (4-lane simdgroup quad) didn't help — see `docs/q4k_qmv_quad_failed.md`.
 
 ### Optimisations we tried that did not beat MPS on this host
 
@@ -72,9 +83,20 @@ generic 256-thread TG version isn't there).
 | fp16 residual state (x_dev / x_rms fp16) | step-0 logit drift; left as opt-in |
 | persistent compute encoder (codex O)    | minimal — CPU encode already <0.1% of budget |
 | Q4K → affine32 + qmv_fast kernel (S2)   | +45% over native Q4_K quant_gpu (57→85 tok/s) but still under fp16 MPS ceiling (115). Kept as opt-in: `QW36_METAL_QUANT_GPU=1 QW36_METAL_Q4K_AFFINE32=1`. Sanity passes (max_abs 1e-4 vs Q4_K original). |
+| MLX-style qmv variant for Q4K affine32 (8d45cca) | Slower than codex's variant on n=256 (78 vs 87 tok/s). MLX pre-scales x_thread but TG geometry (4×4 rows × 16 vpt) loses to codex's per-row TG on our shape. Kept as `QW36_METAL_Q4K_AFFINE32_MLX=1` opt-in for future revisit. |
 
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
+
+**Fastest path today:**
+```
+QW36_METAL_QUANT_GPU=1 \
+QW36_METAL_Q4K_AFFINE32=1 \
+QW36_METAL_Q5K_AFFINE32=1 \
+QW36_METAL_Q6K_SCALE16=1 \
+./qw36_metal -m <gguf> -p "Hello"
+```
+→ 170 tok/s short / 139 sustained.
 
 ## Coverage
 
