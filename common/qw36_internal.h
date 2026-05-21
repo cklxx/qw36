@@ -11,7 +11,7 @@
 
 #include "qw36.h"
 #include "qw36_gpu.h"
-#include "qw36_gguf.h"
+#include "qw36_model.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -53,7 +53,7 @@ struct qw36_engine {
     qw36_weights      weights;
     qw36_gpu_backend *backend;
     qw36_gpu_ctx     *ctx;
-    qw36_gguf_file   *gguf;
+    qw36_model_file  *model;
     void             **owned;
     size_t             owned_n;
     size_t             owned_cap;

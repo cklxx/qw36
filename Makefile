@@ -20,8 +20,11 @@ ROOT := $(CURDIR)
 COMMON_SRC := common/qw36.c common/qw36_ops.c common/qw36_attn_vanilla.c \
               common/qw36_attn_deltanet.c common/qw36_mlp.c common/qw36_moe.c \
               common/qw36_kvcache.c \
-              common/qw36_gguf.c common/qw36_tokenizer.c common/qw36_cli.c
+              common/qw36_gguf.c common/qw36_model.c \
+              common/qw36_safetensors.c \
+              common/qw36_tokenizer.c common/qw36_cli.c
 COMMON_HDR := common/qw36.h common/qw36_gpu.h common/qw36_gguf.h \
+              common/qw36_model.h common/qw36_safetensors.h \
               common/qw36_kvcache.h \
               common/qw36_tokenizer.h common/qw36_internal.h
 export ROOT COMMON_SRC COMMON_HDR

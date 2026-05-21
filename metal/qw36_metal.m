@@ -41,6 +41,12 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> moe_route;
     id<MTLComputePipelineState> moe_gate_up;
     id<MTLComputePipelineState> moe_down_combine;
+    id<MTLComputePipelineState> moe_route_topk;
+    id<MTLComputePipelineState> moe_gate_up_q4k_affine32;
+    id<MTLComputePipelineState> moe_gate_up_q5k_affine32;
+    id<MTLComputePipelineState> moe_down_q4k_affine32;
+    id<MTLComputePipelineState> moe_down_q5k_affine32;
+    id<MTLComputePipelineState> moe_down_q6k_scale16;
     id<MTLComputePipelineState> moe_scale_add;
     id<MTLComputePipelineState> dn_conv1d_silu;
     id<MTLComputePipelineState> dn_prep_gdr;
@@ -743,6 +749,22 @@ static id<MTLComputePipelineState> metal_make_pipeline(qw36_gpu_ctx *ctx,
     return pipe;
 }
 
+static id<MTLComputePipelineState> metal_make_optional_pipeline(qw36_gpu_ctx *ctx,
+                                                                NSString *name)
+{
+    if (!ctx || !ctx->library || !ctx->device) return nil;
+    id<MTLFunction> fn = [ctx->library newFunctionWithName:name];
+    if (!fn) return nil;
+
+    NSError *ns_err = nil;
+    id<MTLComputePipelineState> pipe =
+        [ctx->device newComputePipelineStateWithFunction:fn error:&ns_err];
+    (void)ns_err;
+    if (pipe && ctx->pipeline_labels)
+        ctx->pipeline_labels[[NSValue valueWithNonretainedObject:pipe]] = name;
+    return pipe;
+}
+
 static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
 {
     qw36_gpu_ctx *ctx = (qw36_gpu_ctx *)calloc(1, sizeof(*ctx));
@@ -785,6 +807,17 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->moe_route        = metal_make_pipeline(ctx, @"qw36_moe_route_f32", err, err_cap);
     ctx->moe_gate_up      = metal_make_pipeline(ctx, @"qw36_moe_gate_up_f32", err, err_cap);
     ctx->moe_down_combine = metal_make_pipeline(ctx, @"qw36_moe_down_combine_f32", err, err_cap);
+    ctx->moe_route_topk   = metal_make_optional_pipeline(ctx, @"qw36_moe_route_topk_f32");
+    ctx->moe_gate_up_q4k_affine32 =
+        metal_make_optional_pipeline(ctx, @"qw36_moe_gate_up_q4k_affine32_mlx_f32");
+    ctx->moe_gate_up_q5k_affine32 =
+        metal_make_optional_pipeline(ctx, @"qw36_moe_gate_up_q5k_affine32_mlx_f32");
+    ctx->moe_down_q4k_affine32 =
+        metal_make_optional_pipeline(ctx, @"qw36_moe_down_q4k_affine32_mlx_f32");
+    ctx->moe_down_q5k_affine32 =
+        metal_make_optional_pipeline(ctx, @"qw36_moe_down_q5k_affine32_mlx_f32");
+    ctx->moe_down_q6k_scale16 =
+        metal_make_optional_pipeline(ctx, @"qw36_moe_down_q6k_scale16_mlx_f32");
     ctx->moe_scale_add    = metal_make_pipeline(ctx, @"qw36_moe_scale_add_f32", err, err_cap);
     ctx->dn_conv1d_silu   = metal_make_pipeline(ctx, @"qw36_dn_conv1d_silu_f32", err, err_cap);
     ctx->dn_prep_gdr      = metal_make_pipeline(ctx, @"qw36_compute_g_beta_norm_qk", err, err_cap);
@@ -862,8 +895,14 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
         ctx->dn_prep_gdr = nil;
         ctx->dn_conv1d_silu = nil;
         ctx->moe_down_combine = nil;
+        ctx->moe_down_q6k_scale16 = nil;
+        ctx->moe_down_q5k_affine32 = nil;
+        ctx->moe_down_q4k_affine32 = nil;
         ctx->moe_scale_add = nil;
         ctx->moe_gate_up = nil;
+        ctx->moe_gate_up_q5k_affine32 = nil;
+        ctx->moe_gate_up_q4k_affine32 = nil;
+        ctx->moe_route_topk = nil;
         ctx->moe_route = nil;
         ctx->silu_mul = nil;
         ctx->f16_to_f32 = nil;
@@ -946,8 +985,14 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->dn_prep_gdr = nil;
     ctx->dn_conv1d_silu = nil;
     ctx->moe_down_combine = nil;
+    ctx->moe_down_q6k_scale16 = nil;
+    ctx->moe_down_q5k_affine32 = nil;
+    ctx->moe_down_q4k_affine32 = nil;
     ctx->moe_scale_add = nil;
     ctx->moe_gate_up = nil;
+    ctx->moe_gate_up_q5k_affine32 = nil;
+    ctx->moe_gate_up_q4k_affine32 = nil;
+    ctx->moe_route_topk = nil;
     ctx->moe_route = nil;
     ctx->silu_mul = nil;
     ctx->f16_to_f32 = nil;
@@ -2368,6 +2413,167 @@ static void metal_dn_gated_rmsnorm_matmul(qw36_gpu_ctx *ctx,
 static void metal_residual_add(qw36_gpu_ctx *ctx, qw36_gpu_buf *x,
                                qw36_gpu_buf *y, uint32_t n);
 
+static int metal_moe_qk_fast_supported(qw36_gpu_ctx *ctx,
+                                       qw36_gpu_buf *y, qw36_gpu_buf *x,
+                                       qw36_gpu_buf *expert_gate,
+                                       qw36_gpu_buf *expert_up,
+                                       qw36_gpu_buf *expert_down,
+                                       uint32_t hidden, uint32_t inter,
+                                       uint32_t num_experts,
+                                       uint32_t experts_per_tok,
+                                       id<MTLComputePipelineState> *gate_pipe,
+                                       id<MTLComputePipelineState> *down_pipe)
+{
+    if (gate_pipe) *gate_pipe = nil;
+    if (down_pipe) *down_pipe = nil;
+    if (!ctx || !ctx->moe_route_topk || !y || !x || !expert_gate ||
+        !expert_up || !expert_down)
+        return 0;
+    if (x->dtype != QW36_DTYPE_F32 || y->dtype != QW36_DTYPE_F32)
+        return 0;
+    if (!expert_gate->mtl || !expert_up->mtl || !expert_down->mtl)
+        return 0;
+    if (!hidden || !inter || !num_experts || !experts_per_tok ||
+        experts_per_tok > num_experts)
+        return 0;
+    if ((hidden % 512u) != 0 || (inter % 512u) != 0)
+        return 0;
+    if (num_experts > 256u || experts_per_tok > 8u)
+        return 0;
+    if ((NSUInteger)experts_per_tok > NSUIntegerMax / (NSUInteger)inter)
+        return 0;
+
+    id<MTLComputePipelineState> gp = nil;
+    if (expert_gate->dtype == QW36_DTYPE_Q4K_AFFINE32 &&
+        expert_up->dtype == QW36_DTYPE_Q4K_AFFINE32) {
+        gp = ctx->moe_gate_up_q4k_affine32;
+    } else if (expert_gate->dtype == QW36_DTYPE_Q5K_AFFINE32 &&
+               expert_up->dtype == QW36_DTYPE_Q5K_AFFINE32) {
+        gp = ctx->moe_gate_up_q5k_affine32;
+    }
+
+    id<MTLComputePipelineState> dp = nil;
+    if (expert_down->dtype == QW36_DTYPE_Q4K_AFFINE32) {
+        dp = ctx->moe_down_q4k_affine32;
+    } else if (expert_down->dtype == QW36_DTYPE_Q5K_AFFINE32) {
+        dp = ctx->moe_down_q5k_affine32;
+    } else if (expert_down->dtype == QW36_DTYPE_Q6K_SCALE16) {
+        dp = ctx->moe_down_q6k_scale16;
+    }
+
+    if (!gp || !dp)
+        return 0;
+    if (ctx->moe_route_topk.maxTotalThreadsPerThreadgroup < 256u ||
+        gp.maxTotalThreadsPerThreadgroup < 128u ||
+        dp.maxTotalThreadsPerThreadgroup < 128u)
+        return 0;
+    if (gate_pipe) *gate_pipe = gp;
+    if (down_pipe) *down_pipe = dp;
+    return 1;
+}
+
+static void metal_moe_route_topk_dispatch(qw36_gpu_ctx *ctx,
+                                          qw36_gpu_buf *r,
+                                          qw36_gpu_buf *p,
+                                          qw36_gpu_buf *idx,
+                                          uint32_t num_experts,
+                                          uint32_t experts_per_tok)
+{
+    if (!ctx || !ctx->moe_route_topk || !r || !p || !idx) return;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
+    [enc setComputePipelineState:ctx->moe_route_topk];
+    [enc setBuffer:r->mtl   offset:0 atIndex:0];
+    [enc setBuffer:p->mtl   offset:0 atIndex:1];
+    [enc setBuffer:idx->mtl offset:0 atIndex:2];
+    [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
+    [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
+    [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
+    [enc setThreadgroupMemoryLength:(8u + 256u) * sizeof(uint32_t) atIndex:1];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              metal_pipeline_label(ctx, ctx->moe_route_topk),
+                              start_us);
+}
+
+static void metal_moe_gate_up_qk_dispatch(qw36_gpu_ctx *ctx,
+                                          id<MTLComputePipelineState> pipe,
+                                          qw36_gpu_buf *act,
+                                          qw36_gpu_buf *x,
+                                          qw36_gpu_buf *expert_gate,
+                                          qw36_gpu_buf *expert_up,
+                                          qw36_gpu_buf *idx,
+                                          uint32_t hidden,
+                                          uint32_t inter,
+                                          uint32_t experts_per_tok)
+{
+    if (!ctx || !pipe || !act || !x || !expert_gate ||
+        !expert_up || !idx || !inter || !experts_per_tok)
+        return;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:act->mtl         offset:0 atIndex:0];
+    [enc setBuffer:x->mtl           offset:0 atIndex:1];
+    [enc setBuffer:expert_gate->mtl offset:metal_buf_offset(expert_gate, 0) atIndex:2];
+    [enc setBuffer:expert_up->mtl   offset:metal_buf_offset(expert_up, 0) atIndex:3];
+    [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+    [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+    [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+    [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((inter + 15u) / 16u,
+                                          experts_per_tok, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              metal_pipeline_label(ctx, pipe),
+                              start_us);
+}
+
+static void metal_moe_down_qk_dispatch(qw36_gpu_ctx *ctx,
+                                       id<MTLComputePipelineState> pipe,
+                                       qw36_gpu_buf *y,
+                                       qw36_gpu_buf *act,
+                                       qw36_gpu_buf *expert_down,
+                                       qw36_gpu_buf *p,
+                                       qw36_gpu_buf *idx,
+                                       uint32_t hidden,
+                                       uint32_t inter,
+                                       uint32_t experts_per_tok)
+{
+    if (!ctx || !pipe || !y || !act || !expert_down ||
+        !p || !idx)
+        return;
+    double start_us = ctx->perf_enabled ? metal_perf_now_us() : 0.0;
+    int owns_cb = 0;
+    id<MTLCommandBuffer> cb = metal_cb_for_op(ctx, &owns_cb);
+    id<MTLComputeCommandEncoder> enc =
+        metal_compute_encoder_for_op(ctx, cb, owns_cb);
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:y->mtl           offset:0 atIndex:0];
+    [enc setBuffer:act->mtl         offset:0 atIndex:1];
+    [enc setBuffer:expert_down->mtl offset:metal_buf_offset(expert_down, 0) atIndex:2];
+    [enc setBuffer:p->mtl           offset:0 atIndex:3];
+    [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+    [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+    [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+    [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((hidden + 15u) / 16u, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    metal_finish_compute_encoder(ctx, enc, owns_cb);
+    metal_commit_wait_profile(ctx, cb, owns_cb,
+                              metal_pipeline_label(ctx, pipe),
+                              start_us);
+}
+
 static void metal_moe_forward(qw36_gpu_ctx *ctx,
                               qw36_gpu_buf *y, qw36_gpu_buf *x,
                               qw36_gpu_buf *router,
@@ -2388,6 +2594,11 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
         !expert_down || !hidden || !inter || !num_experts || !experts_per_tok)
         return;
     if (experts_per_tok > num_experts) experts_per_tok = num_experts;
+    if ((NSUInteger)experts_per_tok > NSUIntegerMax / (NSUInteger)inter)
+        return;
+    const NSUInteger act_n = (NSUInteger)experts_per_tok * (NSUInteger)inter;
+    if (act_n > (NSUInteger)(((size_t)-1) / sizeof(float)))
+        return;
 
     qw36_gpu_buf *r = metal_scratch(ctx, &ctx->moe_router_scratch,
         (size_t)num_experts * sizeof(float), QW36_DTYPE_F32);
@@ -2396,33 +2607,57 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
     qw36_gpu_buf *idx = metal_scratch(ctx, &ctx->moe_idx_scratch,
         (size_t)experts_per_tok * sizeof(uint32_t), QW36_DTYPE_F32);
     qw36_gpu_buf *act = metal_scratch(ctx, &ctx->moe_act_scratch,
-        (size_t)experts_per_tok * inter * sizeof(float), QW36_DTYPE_F32);
+        (size_t)act_n * sizeof(float), QW36_DTYPE_F32);
     if (!r || !p || !idx || !act) return;
 
-    if (metal_matmul(ctx, r, x, router, 1, num_experts, hidden)) return;
-    metal_dispatch_1d(ctx, ctx->moe_route, 1, ^(id<MTLComputeCommandEncoder> enc) {
-        [enc setBuffer:r->mtl   offset:0 atIndex:0];
-        [enc setBuffer:p->mtl   offset:0 atIndex:1];
-        [enc setBuffer:idx->mtl offset:0 atIndex:2];
-        [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
-        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
-    });
+    static int moe_qk_cached = -1;
+    if (moe_qk_cached < 0) {
+        const char *e = getenv("QW36_METAL_MOE_QK");
+        moe_qk_cached = e ? (atoi(e) != 0 ? 1 : 0) : 1;
+    }
 
-    NSUInteger act_n = (NSUInteger)experts_per_tok * inter;
-    metal_dispatch_1d(ctx, ctx->moe_gate_up, act_n, ^(id<MTLComputeCommandEncoder> enc) {
-        uint32_t gate_dtype = (uint32_t)expert_gate->dtype;
-        uint32_t up_dtype = (uint32_t)expert_up->dtype;
-        [enc setBuffer:act->mtl         offset:0 atIndex:0];
-        [enc setBuffer:x->mtl           offset:0 atIndex:1];
-        [enc setBuffer:expert_gate->mtl offset:metal_buf_offset(expert_gate, 0) atIndex:2];
-        [enc setBuffer:expert_up->mtl   offset:metal_buf_offset(expert_up, 0) atIndex:3];
-        [enc setBuffer:idx->mtl         offset:0 atIndex:4];
-        [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
-        [enc setBytes:&inter length:sizeof(inter) atIndex:6];
-        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
-        [enc setBytes:&gate_dtype length:sizeof(gate_dtype) atIndex:8];
-        [enc setBytes:&up_dtype length:sizeof(up_dtype) atIndex:9];
-    });
+    id<MTLComputePipelineState> moe_gate_pipe = nil;
+    id<MTLComputePipelineState> moe_down_pipe = nil;
+    const int use_moe_qk = moe_qk_cached &&
+        metal_moe_qk_fast_supported(ctx, y, x, expert_gate, expert_up,
+                                    expert_down, hidden, inter, num_experts,
+                                    experts_per_tok, &moe_gate_pipe,
+                                    &moe_down_pipe);
+
+    if (metal_matmul(ctx, r, x, router, 1, num_experts, hidden)) return;
+    if (use_moe_qk) {
+        metal_moe_route_topk_dispatch(ctx, r, p, idx, num_experts,
+                                      experts_per_tok);
+    } else {
+        metal_dispatch_1d(ctx, ctx->moe_route, 1, ^(id<MTLComputeCommandEncoder> enc) {
+            [enc setBuffer:r->mtl   offset:0 atIndex:0];
+            [enc setBuffer:p->mtl   offset:0 atIndex:1];
+            [enc setBuffer:idx->mtl offset:0 atIndex:2];
+            [enc setBytes:&num_experts length:sizeof(num_experts) atIndex:3];
+            [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:4];
+        });
+    }
+
+    if (use_moe_qk) {
+        metal_moe_gate_up_qk_dispatch(ctx, moe_gate_pipe, act, x,
+                                      expert_gate, expert_up, idx, hidden,
+                                      inter, experts_per_tok);
+    } else {
+        metal_dispatch_1d(ctx, ctx->moe_gate_up, act_n, ^(id<MTLComputeCommandEncoder> enc) {
+            uint32_t gate_dtype = (uint32_t)expert_gate->dtype;
+            uint32_t up_dtype = (uint32_t)expert_up->dtype;
+            [enc setBuffer:act->mtl         offset:0 atIndex:0];
+            [enc setBuffer:x->mtl           offset:0 atIndex:1];
+            [enc setBuffer:expert_gate->mtl offset:metal_buf_offset(expert_gate, 0) atIndex:2];
+            [enc setBuffer:expert_up->mtl   offset:metal_buf_offset(expert_up, 0) atIndex:3];
+            [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+            [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+            [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+            [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+            [enc setBytes:&gate_dtype length:sizeof(gate_dtype) atIndex:8];
+            [enc setBytes:&up_dtype length:sizeof(up_dtype) atIndex:9];
+        });
+    }
 
     qw36_gpu_buf *shared = NULL;
     qw36_gpu_buf *shared_gate_scalar = NULL;
@@ -2443,18 +2678,23 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
     }
 
     metal_invalidate_matmul_xh(ctx);
-    metal_dispatch_1d(ctx, ctx->moe_down_combine, hidden, ^(id<MTLComputeCommandEncoder> enc) {
-        uint32_t down_dtype = (uint32_t)expert_down->dtype;
-        [enc setBuffer:y->mtl           offset:0 atIndex:0];
-        [enc setBuffer:act->mtl         offset:0 atIndex:1];
-        [enc setBuffer:expert_down->mtl offset:metal_buf_offset(expert_down, 0) atIndex:2];
-        [enc setBuffer:p->mtl           offset:0 atIndex:3];
-        [enc setBuffer:idx->mtl         offset:0 atIndex:4];
-        [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
-        [enc setBytes:&inter length:sizeof(inter) atIndex:6];
-        [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
-        [enc setBytes:&down_dtype length:sizeof(down_dtype) atIndex:8];
-    });
+    if (use_moe_qk) {
+        metal_moe_down_qk_dispatch(ctx, moe_down_pipe, y, act, expert_down,
+                                   p, idx, hidden, inter, experts_per_tok);
+    } else {
+        metal_dispatch_1d(ctx, ctx->moe_down_combine, hidden, ^(id<MTLComputeCommandEncoder> enc) {
+            uint32_t down_dtype = (uint32_t)expert_down->dtype;
+            [enc setBuffer:y->mtl           offset:0 atIndex:0];
+            [enc setBuffer:act->mtl         offset:0 atIndex:1];
+            [enc setBuffer:expert_down->mtl offset:metal_buf_offset(expert_down, 0) atIndex:2];
+            [enc setBuffer:p->mtl           offset:0 atIndex:3];
+            [enc setBuffer:idx->mtl         offset:0 atIndex:4];
+            [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
+            [enc setBytes:&inter length:sizeof(inter) atIndex:6];
+            [enc setBytes:&experts_per_tok length:sizeof(experts_per_tok) atIndex:7];
+            [enc setBytes:&down_dtype length:sizeof(down_dtype) atIndex:8];
+        });
+    }
 
     if (shared) {
         uint32_t has_scale = shared_gate_scalar ? 1u : 0u;

@@ -95,6 +95,32 @@ geometry (4-lane simdgroup quad) didn't help — see `docs/q4k_qmv_quad_failed.m
 | MoE 1-row-per-TG simdgroup GEMV          | 24× slower on 35B-A3B. 4096 separate threadgroups × 32 lanes dominated by per-TG launch overhead; replaced by MLX SwitchGLU with ROWS_PER_SIMD. See `docs/moe_kernel_failed.md`. |
 | MoE Q8-only fast path (Q8 activation × Q8 weight) | Wrong direction: 35B expert weights are Q4/Q5, repacking to Q8 doubles bytes read with no compute win. Kernel should operate on native quant dtype. Deleted; replaced by SwitchGLU gather_qmm on Q4/Q5/Q6 directly. |
 
+### 2026-05-21 35B-A3B Metal + MLX loader checkpoint
+
+35B-A3B GGUF now stays fully on Metal for the coherent path and uses
+selected-expert MoE kernels for the Q4/Q5 gate/up and Q4/Q5/Q6 down
+expert dtypes. The old Q8-only MoE experiment was removed. This is still
+far below MLX because the GGUF path repacks K-quants into an internal
+affine layout at load time; the next performance lever is loading MLX's
+native `weight/scales/biases` safetensors affine layout directly.
+
+Evidence (`./qw36_metal --fast --no-special`, 35B GGUF, prompt `Hello`,
+`n=8`, `seq=256`):
+
+| mode | output sanity | decode tok/s |
+|------|---------------|-------------:|
+| default selected-expert MoE | `,\n\nI am trying to use the` | noisy 3-run: 3.0 / 1.2 / 5.2 |
+| `QW36_METAL_MOE_QK=0` fallback | `,\n\nI am trying to use the` | 3.1 single run |
+
+Loader progress for the MLX path: `common/qw36_model.*` now owns the
+engine-facing tensor/metadata source API, and `common/qw36_safetensors.*`
+can mmap and enumerate the local
+`mlx-community/Qwen3.6-35B-A3B-4bit` shards. Verified against shard 1
+tensors:
+`language_model.model.embed_tokens.weight`,
+`language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight`, and
+`...gate_proj.scales`.
+
 `QW36_METAL_FP16_WEIGHTS=1` to opt in to fp16 weights (default fp32 keeps
 precision_cpu_vs_metal.sh byte-equal).
 

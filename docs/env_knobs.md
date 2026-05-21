@@ -63,6 +63,7 @@ coherent CPU 35B path (`,\n\nI am trying to use the`).
 | `QW36_METAL_FUSE_QKV` | toggle the vanilla QKV concat-into-one-matmul fusion. Defaults on when fp16-weights + non-quant. | `common/qw36.c:935` |
 | `QW36_METAL_FUSE_DN_QKVZAB` | toggle the DN 4-projection concat fusion. Defaults on under fp16 + non-quant. | `common/qw36.c:940` |
 | `QW36_METAL_DN_TAIL_DIRECT` | dispatch DN tail (gated_rmsnorm + dn_out) directly without the fused kernel. Debug. | `metal/qw36_metal.m:2235` |
+| `QW36_METAL_MOE_QK` | toggle selected-expert MoE kernels for Q4/Q5 affine32 gate/up and Q4/Q5/Q6 down on 35B-A3B. Defaults on; set `0` for generic MoE fallback. | `metal/qw36_metal.m` |
 
 ## Tracing / debug
 

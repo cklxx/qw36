@@ -22,6 +22,8 @@ COMMON_SRC := \
     $(COMMON)/qw36_moe.c \
     $(COMMON)/qw36_kvcache.c \
     $(COMMON)/qw36_gguf.c \
+    $(COMMON)/qw36_model.c \
+    $(COMMON)/qw36_safetensors.c \
     $(COMMON)/qw36_tokenizer.c \
     $(COMMON)/qw36_cli.c
 

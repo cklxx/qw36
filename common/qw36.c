@@ -115,25 +115,25 @@ int qw36__state_download_to_host(qw36_state *st, void *src_dev,
 }
 
 /* --------------------------------------------------------------------- */
-/* GGUF → config + weights binding                                        */
+/* Model source -> config + weights binding                               */
 /* --------------------------------------------------------------------- */
 
 static int eng_get_u32(const qw36_engine *eng, const char *suffix, uint32_t *out) {
     char key[128];
     snprintf(key, sizeof(key), "%s.%s", eng->arch, suffix);
-    return qw36_gguf_get_u32(eng->gguf, key, out);
+    return qw36_model_get_u32(eng->model, key, out);
 }
 static int eng_get_f32(const qw36_engine *eng, const char *suffix, float *out) {
     char key[128];
     snprintf(key, sizeof(key), "%s.%s", eng->arch, suffix);
-    return qw36_gguf_get_f32(eng->gguf, key, out);
+    return qw36_model_get_f32(eng->model, key, out);
 }
 
 /* Materialize a small tensor (norm-sized) to fp32. Used for layernorms,
  * biases, A_log — anything small enough that the dequant pass is cheap. */
 static float *bind_tensor_f32(qw36_engine *eng, const char *name) {
-    qw36_gguf_tensor t;
-    if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
+    qw36_tensor_view t;
+    if (qw36_model_get_tensor(eng->model, name, &t)) return NULL;
     size_t numel = 1;
     for (uint32_t d = 0; d < t.n_dims; d++) numel *= (size_t)t.dims[d];
     float *p = qw36__materialize_f32(t.data, t.dtype, numel);
@@ -143,8 +143,8 @@ static float *bind_tensor_f32(qw36_engine *eng, const char *name) {
 }
 
 static float *bind_tensor_f32_opt(qw36_engine *eng, const char *name) {
-    qw36_gguf_tensor t;
-    if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
+    qw36_tensor_view t;
+    if (qw36_model_get_tensor(eng->model, name, &t)) return NULL;
     return bind_tensor_f32(eng, name);
 }
 
@@ -555,13 +555,13 @@ static int lazy_fuse_dn_qkvzab(qw36_engine *eng, qw36_layer_weights *L,
 /* Lazy bind for big tensors: keep a pointer into mmap + shape + dtype,
  * to be dequantized block-by-block during matmul. */
 static qw36_lazy_w *bind_tensor_lazy(qw36_engine *eng, const char *name) {
-    qw36_gguf_tensor t;
-    if (qw36_gguf_get_tensor(eng->gguf, name, &t)) return NULL;
+    qw36_tensor_view t;
+    if (qw36_model_get_tensor(eng->model, name, &t)) return NULL;
     qw36_lazy_w *lw = (qw36_lazy_w *)calloc(1, sizeof(*lw));
     if (!lw) return NULL;
     lw->data      = t.data;
     lw->dtype     = t.dtype;
-    lw->ggml_type = t.ggml_type;
+    lw->ggml_type = t.storage_type;
     lw->cols      = t.n_dims >= 1 ? t.dims[0] : 0;
     lw->rows      = t.n_dims >= 2 ? t.dims[1] :
                     (t.n_dims == 1 ? 1 : 0);
@@ -585,12 +585,12 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     }
     eng->backend = backend;
 
-    eng->gguf = qw36_gguf_open(gguf_path, err, err_cap);
-    if (!eng->gguf) { free(eng); return NULL; }
+    eng->model = qw36_model_open(gguf_path, err, err_cap);
+    if (!eng->model) { free(eng); return NULL; }
 
     /* Detect architecture. We accept any qwen3-family string. */
     const char *arch = NULL;
-    if (qw36_gguf_get_str(eng->gguf, "general.architecture", &arch) || !arch) {
+    if (qw36_model_get_str(eng->model, "general.architecture", &arch) || !arch) {
         if (err && err_cap) snprintf(err, err_cap, "missing general.architecture");
         qw36_engine_close(eng); return NULL;
     }
@@ -636,13 +636,13 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     }
     /* vocab — read from the tokens array via the gguf module. */
     {
-        qw36_gguf_tensor unused;
+        qw36_tensor_view unused;
         (void)unused;
         /* Best-effort: many qwen models also set <arch>.vocab_size. */
         if (eng_get_u32(eng, "vocab_size", &c->vocab_size) != 0) {
             /* Fallback to the embedding table row count. */
-            qw36_gguf_tensor t;
-            if (qw36_gguf_get_tensor(eng->gguf, "token_embd.weight", &t) == 0
+            qw36_tensor_view t;
+            if (qw36_model_get_tensor(eng->model, "token_embd.weight", &t) == 0
                 && t.n_dims >= 2) {
                 c->vocab_size = (uint32_t)t.dims[1];
             }
@@ -672,8 +672,8 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     {
         char key[128];
         snprintf(key, sizeof(key), "%s.rope.dimension_sections", eng->arch);
-        int n = qw36_gguf_get_u32_array(eng->gguf, key,
-                                        c->rope_sections, 4);
+        int n = qw36_model_get_u32_array(eng->model, key,
+                                         c->rope_sections, 4);
         /* Agent-infer's MLX text-decode path calls fast::rope with
          * rotary_dim from GGUF/config (qwen35.rope.dimension_count = 64
          * for the 0.8B model), traditional=false. We use plain NEOX by
@@ -706,13 +706,13 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
      *   inner_size  = value_heads * value_head_dim
      * Tensor-shape fallback keeps older experimental files loadable. */
     {
-        qw36_gguf_tensor t;
+        qw36_tensor_view t;
         uint32_t inner_size = 0;
         eng_get_u32(eng, "ssm.group_count", &c->dn_num_key_heads);
         eng_get_u32(eng, "ssm.state_size",  &c->dn_key_head_dim);
         eng_get_u32(eng, "ssm.inner_size",  &inner_size);
         if (eng_get_u32(eng, "ssm.conv_kernel", &c->dn_conv_kernel_size)) {
-            if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
+            if (qw36_model_get_tensor(eng->model, "blk.0.ssm_conv1d.weight", &t) == 0) {
                 /* GGUF stores dims innermost-first. ssm_conv1d shape is
                  * [k, channels] in numpy -> dims[0]=k, dims[1]=channels. */
                 c->dn_conv_kernel_size = (uint32_t)t.dims[0];
@@ -723,14 +723,14 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
             c->dn_num_value_heads = inner_size / c->dn_value_head_dim;
         }
         if (!c->dn_num_value_heads &&
-            qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_a", &t) == 0)
+            qw36_model_get_tensor(eng->model, "blk.0.ssm_a", &t) == 0)
             c->dn_num_value_heads = (uint32_t)t.dims[0];
         if (!c->dn_value_head_dim &&
-            qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_norm.weight", &t) == 0)
+            qw36_model_get_tensor(eng->model, "blk.0.ssm_norm.weight", &t) == 0)
             c->dn_value_head_dim = (uint32_t)t.dims[0];
         if (!c->dn_key_head_dim) c->dn_key_head_dim = c->dn_value_head_dim;
         if (!c->dn_num_key_heads &&
-            qw36_gguf_get_tensor(eng->gguf, "blk.0.attn_qkv.weight", &t) == 0 &&
+            qw36_model_get_tensor(eng->model, "blk.0.attn_qkv.weight", &t) == 0 &&
             t.n_dims >= 2 && c->dn_key_head_dim &&
             c->dn_num_value_heads && c->dn_value_head_dim) {
             uint64_t v_dim = (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
@@ -740,7 +740,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                     c->dn_num_key_heads = (uint32_t)(qk_dim / c->dn_key_head_dim);
             }
         }
-        if (qw36_gguf_get_tensor(eng->gguf, "blk.0.ssm_conv1d.weight", &t) == 0) {
+        if (qw36_model_get_tensor(eng->model, "blk.0.ssm_conv1d.weight", &t) == 0) {
             uint64_t qkv_dim = (uint64_t)c->dn_num_key_heads * c->dn_key_head_dim * 2
                              + (uint64_t)c->dn_num_value_heads * c->dn_value_head_dim;
             if (qkv_dim && t.n_dims >= 2 && t.dims[1] != qkv_dim) {
@@ -764,10 +764,10 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
     c->has_q_gate = 0;
     {
         char nm[128];
-        qw36_gguf_tensor t;
+        qw36_tensor_view t;
         for (uint32_t l = 0; l < c->num_hidden_layers; l++) {
             snprintf(nm, sizeof(nm), "blk.%u.attn_q.weight", l);
-            if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
+            if (qw36_model_get_tensor(eng->model, nm, &t) == 0) {
                 uint64_t out_dim = t.dims[1];
                 if (out_dim == (uint64_t)c->num_attention_heads * c->head_dim * 2) {
                     c->has_q_gate = 1;
@@ -791,7 +791,7 @@ qw36_engine *qw36_engine_open(const char *gguf_path,
                 }
                 /* K projection (no gate, just GQA factor). */
                 snprintf(nm, sizeof(nm), "blk.%u.attn_k.weight", l);
-                if (qw36_gguf_get_tensor(eng->gguf, nm, &t) == 0) {
+                if (qw36_model_get_tensor(eng->model, nm, &t) == 0) {
                     uint32_t real_kv = (uint32_t)(t.dims[1] / c->head_dim);
                     if (real_kv && real_kv != c->num_key_value_heads) {
                         fprintf(stderr,
@@ -1256,13 +1256,15 @@ void qw36_engine_close(qw36_engine *eng)
     }
     free(eng->cfg.layer_types);
     free(eng->weights.layers);
-    if (eng->gguf) qw36_gguf_close(eng->gguf);
+    if (eng->model) qw36_model_close(eng->model);
     free(eng);
 }
 
 const qw36_config  *qw36_engine_config(const qw36_engine *eng)  { return &eng->cfg; }
 const qw36_weights *qw36_engine_weights(const qw36_engine *eng) { return &eng->weights; }
-const struct qw36_gguf_file *qw36_engine_gguf(const qw36_engine *eng) { return eng->gguf; }
+const struct qw36_gguf_file *qw36_engine_gguf(const qw36_engine *eng) {
+    return qw36_model_as_gguf(eng ? eng->model : NULL);
+}
 
 /* --------------------------------------------------------------------- */
 /* State                                                                  */

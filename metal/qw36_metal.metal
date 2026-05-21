@@ -285,6 +285,88 @@ kernel void qw36_moe_route_f32(
     for (uint k = 0; k < top_k; ++k) top_probs[k] *= inv_sum;
 }
 
+/* Fast MoE router for Qwen3.6-35B-A3B decode.
+ *
+ * Host launch contract:
+ *   grid:  one threadgroup
+ *   tg:    256 threads
+ *   tgm0:  256 floats for score reduction
+ *   tgm1:  8 + 256 uints; first 8 hold selected top-k indices, rest reduce
+ *
+ * Buffers match qw36_moe_route_f32: router_logits[num_experts] in, then
+ * normalized top_probs[top_k] and top_idx[top_k] out. top_k is expected <= 8.
+ */
+kernel void qw36_moe_route_topk_f32(
+    device const float *router_logits [[buffer(0)]],
+    device float       *top_probs     [[buffer(1)]],
+    device uint        *top_idx       [[buffer(2)]],
+    constant uint      &num_experts   [[buffer(3)]],
+    constant uint      &top_k         [[buffer(4)]],
+    threadgroup float  *score_scratch [[threadgroup(0)]],
+    threadgroup uint   *idx_storage   [[threadgroup(1)]],
+    uint                tid           [[thread_position_in_threadgroup]],
+    uint                tg_size       [[threads_per_threadgroup]])
+{
+    if (top_k == 0u || num_experts == 0u) return;
+
+    threadgroup uint *selected = idx_storage;
+    threadgroup uint *idx_scratch = idx_storage + 8u;
+    uint tk = min(top_k, 8u);
+
+    for (uint k = 0; k < tk; ++k) {
+        float best = -INFINITY;
+        uint best_i = 0u;
+
+        for (uint e = tid; e < num_experts; e += tg_size) {
+            bool used = false;
+            for (uint j = 0; j < k; ++j) used = used || (selected[j] == e);
+            float v = used ? -INFINITY : router_logits[e];
+            if (v > best || (v == best && e < best_i)) {
+                best = v;
+                best_i = e;
+            }
+        }
+
+        score_scratch[tid] = best;
+        idx_scratch[tid] = best_i;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = tg_size >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                float other = score_scratch[tid + stride];
+                uint other_i = idx_scratch[tid + stride];
+                float cur = score_scratch[tid];
+                uint cur_i = idx_scratch[tid];
+                if (other > cur || (other == cur && other_i < cur_i)) {
+                    score_scratch[tid] = other;
+                    idx_scratch[tid] = other_i;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0u) {
+            selected[k] = idx_scratch[0];
+            top_idx[k] = idx_scratch[0];
+            top_probs[k] = score_scratch[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        float maxv = top_probs[0];
+        for (uint k = 1u; k < tk; ++k) maxv = max(maxv, top_probs[k]);
+        float sum = 0.0f;
+        for (uint k = 0u; k < tk; ++k) {
+            float p = exp(top_probs[k] - maxv);
+            top_probs[k] = p;
+            sum += p;
+        }
+        float inv_sum = 1.0f / sum;
+        for (uint k = 0u; k < tk; ++k) top_probs[k] *= inv_sum;
+    }
+}
+
 kernel void qw36_moe_gate_up_f32(
     device float       *act          [[buffer(0)]],
     device const float *x            [[buffer(1)]],
@@ -2528,6 +2610,391 @@ static inline float qw36_load_x_for_q6_scale16_16(device const float *x,
         x_thread[i + 3u] = x3 * (1.0f / 4.0f);
     }
     return sum_x;
+}
+
+static inline float qw36_load_x_for_q4_affine32_16(device const float *x,
+                                                   uint k,
+                                                   thread float *x_thread)
+{
+    float xsum = 0.0f;
+    for (uint i = 0; i < 16u; i += 4u) {
+        float x0 = x[k + i + 0u];
+        float x1 = x[k + i + 1u];
+        float x2 = x[k + i + 2u];
+        float x3 = x[k + i + 3u];
+        xsum += x0 + x1 + x2 + x3;
+        x_thread[i + 0u] = x0;
+        x_thread[i + 1u] = x1 * (1.0f / 16.0f);
+        x_thread[i + 2u] = x2 * (1.0f / 256.0f);
+        x_thread[i + 3u] = x3 * (1.0f / 4096.0f);
+    }
+    return xsum;
+}
+
+/* MLX SwitchGLU shape for 35B MoE:
+ *   selected expert rows only, 4 rows per simdgroup, 16 rows per threadgroup.
+ * Gate and up are fused so x and selected expert row metadata are reused.
+ */
+kernel void qw36_moe_gate_up_q4k_affine32_mlx_f32(
+    device float       *act         [[buffer(0)]],
+    device const float *x           [[buffer(1)]],
+    device const uchar *expert_gate [[buffer(2)]],
+    device const uchar *expert_up   [[buffer(3)]],
+    device const uint  *top_idx     [[buffer(4)]],
+    constant uint      &hidden      [[buffer(5)]],
+    constant uint      &inter       [[buffer(6)]],
+    constant uint      &top_k       [[buffer(7)]],
+    uint3               tg          [[threadgroup_position_in_grid]],
+    uint                simd_gid    [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid    [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint t = tg.y;
+    if (t >= top_k) return;
+    uint e = top_idx[t];
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (hidden >> 8) * 160u;
+
+    float gacc[rows_per_simd];
+    float uacc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        gacc[r] = 0.0f;
+        uacc[r] = 0.0f;
+        active[r] = row < inter;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint k0 = 0; k0 < hidden; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > hidden) continue;
+
+        float xsum = qw36_load_x_for_q4_affine32_16(x, k, x_thread);
+        uint group = k >> 5;
+        uint block = group >> 3;
+        uint sub = group & 7u;
+        uint qbyte_offset = (k & 31u) >> 1;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            ulong row_id = ((ulong)e * (ulong)inter) + (ulong)row;
+            device const uchar *gblk =
+                expert_gate + row_id * (ulong)row_bytes + (ulong)block * 160u;
+            device const uchar *ublk =
+                expert_up + row_id * (ulong)row_bytes + (ulong)block * 160u;
+            float g_scale = qw36_affine32_half(gblk, sub);
+            float g_bias = qw36_affine32_half(gblk + 16u, sub);
+            float u_scale = qw36_affine32_half(ublk, sub);
+            float u_bias = qw36_affine32_half(ublk + 16u, sub);
+            device const uchar *gq = gblk + 32u + sub * 16u + qbyte_offset;
+            device const uchar *uq = ublk + 32u + sub * 16u + qbyte_offset;
+            gacc[r] += qw36_qdot4_affine32_16_mlx(gq, x_thread, g_scale,
+                                                   g_bias, xsum);
+            uacc[r] += qw36_qdot4_affine32_16_mlx(uq, x_thread, u_scale,
+                                                   u_bias, xsum);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        float g = simd_sum(gacc[r]);
+        float u = simd_sum(uacc[r]);
+        if (simd_lid == 0u && row < inter) {
+            act[(ulong)t * (ulong)inter + (ulong)row] =
+                (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+kernel void qw36_moe_down_q5k_affine32_mlx_f32(
+    device float       *y           [[buffer(0)]],
+    device const float *act         [[buffer(1)]],
+    device const uchar *expert_down [[buffer(2)]],
+    device const float *top_probs   [[buffer(3)]],
+    device const uint  *top_idx     [[buffer(4)]],
+    constant uint      &hidden      [[buffer(5)]],
+    constant uint      &inter       [[buffer(6)]],
+    constant uint      &top_k       [[buffer(7)]],
+    uint3               tg          [[threadgroup_position_in_grid]],
+    uint                simd_gid    [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid    [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (inter >> 8) * 192u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < hidden;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint t = 0; t < top_k; ++t) {
+        uint e = top_idx[t];
+        float prob = top_probs[t];
+        device const float *a = act + (ulong)t * (ulong)inter;
+        for (uint k0 = 0; k0 < inter; k0 += block_k) {
+            uint k = k0 + simd_lid * values_per_thread;
+            if (k + values_per_thread > inter) continue;
+
+            float xsum = qw36_load_x_for_q5_affine32_16(a, k, x_thread);
+            uint group = k >> 5;
+            uint block = group >> 3;
+            uint sub = group & 7u;
+            uint qbyte_offset = ((k & 31u) >> 3) * 5u;
+
+            for (uint r = 0; r < rows_per_simd; ++r) {
+                if (!active[r]) continue;
+                uint row = row0 + r;
+                ulong row_id = ((ulong)e * (ulong)hidden) + (ulong)row;
+                device const uchar *blk =
+                    expert_down + row_id * (ulong)row_bytes + (ulong)block * 192u;
+                float scale = qw36_affine32_half(blk, sub);
+                float bias = qw36_affine32_half(blk + 16u, sub);
+                device const uchar *qbytes =
+                    blk + 32u + sub * 20u + qbyte_offset;
+                acc[r] += prob * qw36_qdot5_affine32_16_mlx(qbytes, x_thread,
+                                                             scale, bias, xsum);
+            }
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        float v = simd_sum(acc[r]);
+        if (simd_lid == 0u && row < hidden) y[row] = v;
+    }
+}
+
+kernel void qw36_moe_down_q4k_affine32_mlx_f32(
+    device float       *y           [[buffer(0)]],
+    device const float *act         [[buffer(1)]],
+    device const uchar *expert_down [[buffer(2)]],
+    device const float *top_probs   [[buffer(3)]],
+    device const uint  *top_idx     [[buffer(4)]],
+    constant uint      &hidden      [[buffer(5)]],
+    constant uint      &inter       [[buffer(6)]],
+    constant uint      &top_k       [[buffer(7)]],
+    uint3               tg          [[threadgroup_position_in_grid]],
+    uint                simd_gid    [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid    [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (inter >> 8) * 160u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < hidden;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint t = 0; t < top_k; ++t) {
+        uint e = top_idx[t];
+        float prob = top_probs[t];
+        device const float *a = act + (ulong)t * (ulong)inter;
+        for (uint k0 = 0; k0 < inter; k0 += block_k) {
+            uint k = k0 + simd_lid * values_per_thread;
+            if (k + values_per_thread > inter) continue;
+
+            float xsum = qw36_load_x_for_q4_affine32_16(a, k, x_thread);
+            uint group = k >> 5;
+            uint block = group >> 3;
+            uint sub = group & 7u;
+            uint qbyte_offset = (k & 31u) >> 1;
+
+            for (uint r = 0; r < rows_per_simd; ++r) {
+                if (!active[r]) continue;
+                uint row = row0 + r;
+                ulong row_id = ((ulong)e * (ulong)hidden) + (ulong)row;
+                device const uchar *blk =
+                    expert_down + row_id * (ulong)row_bytes + (ulong)block * 160u;
+                float scale = qw36_affine32_half(blk, sub);
+                float bias = qw36_affine32_half(blk + 16u, sub);
+                device const uchar *qbytes =
+                    blk + 32u + sub * 16u + qbyte_offset;
+                acc[r] += prob * qw36_qdot4_affine32_16_mlx(qbytes, x_thread,
+                                                             scale, bias, xsum);
+            }
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        float v = simd_sum(acc[r]);
+        if (simd_lid == 0u && row < hidden) y[row] = v;
+    }
+}
+
+kernel void qw36_moe_gate_up_q5k_affine32_mlx_f32(
+    device float       *act         [[buffer(0)]],
+    device const float *x           [[buffer(1)]],
+    device const uchar *expert_gate [[buffer(2)]],
+    device const uchar *expert_up   [[buffer(3)]],
+    device const uint  *top_idx     [[buffer(4)]],
+    constant uint      &hidden      [[buffer(5)]],
+    constant uint      &inter       [[buffer(6)]],
+    constant uint      &top_k       [[buffer(7)]],
+    uint3               tg          [[threadgroup_position_in_grid]],
+    uint                simd_gid    [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid    [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u;
+
+    uint t = tg.y;
+    if (t >= top_k) return;
+    uint e = top_idx[t];
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (hidden >> 8) * 192u;
+
+    float gacc[rows_per_simd];
+    float uacc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        gacc[r] = 0.0f;
+        uacc[r] = 0.0f;
+        active[r] = row < inter;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint k0 = 0; k0 < hidden; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > hidden) continue;
+
+        float xsum = qw36_load_x_for_q5_affine32_16(x, k, x_thread);
+        uint group = k >> 5;
+        uint block = group >> 3;
+        uint sub = group & 7u;
+        uint qbyte_offset = ((k & 31u) >> 3) * 5u;
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            ulong row_id = ((ulong)e * (ulong)inter) + (ulong)row;
+            device const uchar *gblk =
+                expert_gate + row_id * (ulong)row_bytes + (ulong)block * 192u;
+            device const uchar *ublk =
+                expert_up + row_id * (ulong)row_bytes + (ulong)block * 192u;
+            float g_scale = qw36_affine32_half(gblk, sub);
+            float g_bias = qw36_affine32_half(gblk + 16u, sub);
+            float u_scale = qw36_affine32_half(ublk, sub);
+            float u_bias = qw36_affine32_half(ublk + 16u, sub);
+            device const uchar *gq = gblk + 32u + sub * 20u + qbyte_offset;
+            device const uchar *uq = ublk + 32u + sub * 20u + qbyte_offset;
+            gacc[r] += qw36_qdot5_affine32_16_mlx(gq, x_thread, g_scale,
+                                                   g_bias, xsum);
+            uacc[r] += qw36_qdot5_affine32_16_mlx(uq, x_thread, u_scale,
+                                                   u_bias, xsum);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        float g = simd_sum(gacc[r]);
+        float u = simd_sum(uacc[r]);
+        if (simd_lid == 0u && row < inter) {
+            act[(ulong)t * (ulong)inter + (ulong)row] =
+                (g / (1.0f + exp(-g))) * u;
+        }
+    }
+}
+
+kernel void qw36_moe_down_q6k_scale16_mlx_f32(
+    device float       *y           [[buffer(0)]],
+    device const float *act         [[buffer(1)]],
+    device const uchar *expert_down [[buffer(2)]],
+    device const float *top_probs   [[buffer(3)]],
+    device const uint  *top_idx     [[buffer(4)]],
+    constant uint      &hidden      [[buffer(5)]],
+    constant uint      &inter       [[buffer(6)]],
+    constant uint      &top_k       [[buffer(7)]],
+    uint3               tg          [[threadgroup_position_in_grid]],
+    uint                simd_gid    [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid    [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u;
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (inter >> 8) * 224u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < hidden;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint t = 0; t < top_k; ++t) {
+        uint e = top_idx[t];
+        float prob = top_probs[t];
+        device const float *a = act + (ulong)t * (ulong)inter;
+        for (uint k0 = 0; k0 < inter; k0 += block_k) {
+            uint k = k0 + simd_lid * values_per_thread;
+            if (k + values_per_thread > inter) continue;
+
+            float xsum = qw36_load_x_for_q6_scale16_16(a, k, x_thread);
+            uint group = k >> 4;
+            uint block = group >> 4;
+            uint sub = group & 15u;
+
+            for (uint r = 0; r < rows_per_simd; ++r) {
+                if (!active[r]) continue;
+                uint row = row0 + r;
+                ulong row_id = ((ulong)e * (ulong)hidden) + (ulong)row;
+                device const uchar *blk =
+                    expert_down + row_id * (ulong)row_bytes + (ulong)block * 224u;
+                float scale = qw36_affine32_half(blk, sub);
+                device const uchar *qbytes = blk + 32u + sub * 12u;
+                acc[r] += prob * qw36_qdot6_scale16_16_mlx(qbytes, x_thread,
+                                                            scale, xsum);
+            }
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        float v = simd_sum(acc[r]);
+        if (simd_lid == 0u && row < hidden) y[row] = v;
+    }
 }
 
 /* Q4K_AFFINE32 qmv_fast-style matmul.

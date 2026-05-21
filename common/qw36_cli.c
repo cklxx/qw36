@@ -110,6 +110,8 @@ static const qw36_env_knob_doc qw36_env_knobs[] = {
       "fused gated_rmsnorm + dn_out tail kernel" },
     { "QW36_METAL_DN_TAIL_DIRECT",    "research",
       "dispatch DN tail without the fused kernel (debug)" },
+    { "QW36_METAL_MOE_QK",            "internal",
+      "selected-expert MoE Q4/Q5/Q6 kernels (35B-A3B)" },
     { "QW36_SKIP_DN",                 "debug",
       "skip all DeltaNet layers (vanilla-only forward)" },
     { "QW36_SKIP_CONV1D",             "debug",

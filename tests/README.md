@@ -27,6 +27,7 @@ QW36_TEST_MODEL=<path> make check  # same, with model-dependent gates exercised
 | [`kernel_golden.sh`](kernel_golden.sh) | per-tensor Q8_0 dequant matches `gguf-py` reference (35B-specific) | manual / 35B bring-up |
 | [`q8_0_golden.sh`](q8_0_golden.sh) | Q8_0 dequant on 35B's `token_embd.weight` row 9419 + `output.weight` rows match `gguf-py` exactly | manual / 35B-specific |
 | [`f16_materialize_audit.sh`](f16_materialize_audit.sh) | `output.weight` row count + byte size after `lazy_materialize_f16` | manual |
+| [`mlx_safetensors_smoke.sh`](mlx_safetensors_smoke.sh) | C safetensors reader parses the local MLX 35B-A3B shard and validates representative affine tensor shapes | manual / MLX-loader bring-up |
 
 ### KV cache — CI blocking
 
@@ -42,7 +43,7 @@ QW36_TEST_MODEL=<path> make check  # same, with model-dependent gates exercised
 | [`perf_gate.sh`](perf_gate.sh) | wallclock tok/s within ±10% of `perf_baseline.json` on `(fast, n=64)` and `(fast, n=256)`; retests once on regress | macos-metal CI `perf-gate` job when `QW36_TEST_MODEL` set |
 | [`compare_mlx.sh`](compare_mlx.sh) | side-by-side qw36 vs `mlx_lm.generate` median tok/s, `short` / `long` / `full` scopes | manual / `make perf` |
 | [`quant_kernel_bench.sh`](quant_kernel_bench.sh) | single-layer quantized matmul microbench (no harness, manual output parse) | manual |
-| [`metal_35b_moe_perf.sh`](metal_35b_moe_perf.sh) | 35B-A3B per-kernel PERF profile (codex's MoE-perf bring-up tool) | manual |
+| [`metal_35b_moe_perf.sh`](metal_35b_moe_perf.sh) | 35B-A3B Metal-only MoE wallclock/perf helper | manual |
 
 ### Informational — not CI blocking
 
