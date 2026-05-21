@@ -10,7 +10,7 @@ shipping today, what's planned, and what each costs to implement.
 | fp32  | ✓ default reference path            | (none — set by `dev_kv_dtype`)       | 4 | shipped |
 | fp16  | ✓ default under `--fast` / `QUANT_GPU` | `QW36_METAL_FP16_KV=1` (auto)     | 2 | shipped |
 | bf16  | ✓ opt-in (#73 AB)                    | `QW36_METAL_BF16_KV=1`               | 2 | shipped |
-| Q8_0  | 🚧 designed below                    | `QW36_METAL_Q8_KV=1`                 | 1.06 | future task |
+| Q8_0  | ✓ **default under --fast** (#83)     | `QW36_METAL_Q8_KV=0` to disable      | 1.06 | shipped |
 | Q4_0  | 🚧 sketched below                    | `QW36_METAL_Q4_KV=1`                 | 0.56 | future task |
 
 "Bytes/elem" for Q8/Q4 includes the per-32-element fp16 scale block.

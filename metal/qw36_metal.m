@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct {
     uint64_t calls;
@@ -132,9 +133,10 @@ struct qw36_gpu_ctx {
 
 struct qw36_gpu_buf {
     id<MTLBuffer> mtl;
-    void         *host_copy;
     size_t        bytes;
+    NSUInteger    offset;
     qw36_dtype    dtype;
+    int           pooled;
 };
 
 static void metal_flush_compute_encoder(qw36_gpu_ctx *ctx);
@@ -153,8 +155,18 @@ static void metal_release_buf(qw36_gpu_buf *buf)
 {
     if (!buf) return;
     buf->mtl = nil;
-    free(buf->host_copy);
     free(buf);
+}
+
+static inline NSUInteger metal_buf_offset(const qw36_gpu_buf *buf,
+                                          NSUInteger extra)
+{
+    return (buf ? buf->offset : 0) + extra;
+}
+
+static inline void *metal_buf_contents(qw36_gpu_buf *buf)
+{
+    return buf && buf->mtl ? (uint8_t *)[buf->mtl contents] + buf->offset : NULL;
 }
 
 static double metal_perf_now_us(void)
@@ -287,6 +299,11 @@ static int metal_dtype_is_host_dequant(qw36_dtype dtype)
            dtype == QW36_DTYPE_Q6_K ||
            dtype == QW36_DTYPE_Q6K_SCALE16 ||
            dtype == QW36_DTYPE_Q8_0;
+}
+
+static int metal_dtype_is_quant_storage(qw36_dtype dtype)
+{
+    return metal_dtype_is_host_dequant(dtype);
 }
 
 static float metal_f16_to_f32(uint16_t h)
@@ -630,11 +647,11 @@ static uint32_t metal_matrix_rows_from_bytes(const qw36_gpu_buf *buf, uint32_t c
 static int metal_dequant_row(const qw36_gpu_buf *buf, size_t row_idx,
                              size_t cols, float *out)
 {
-    if (!buf || !buf->host_copy) return -1;
+    if (!buf || !buf->mtl) return -1;
     size_t qk, bpb;
     if (metal_quant_geom(buf->dtype, &qk, &bpb) || cols % qk != 0) return -1;
     const size_t blocks_per_row = cols / qk;
-    const uint8_t *row = (const uint8_t *)buf->host_copy
+    const uint8_t *row = (const uint8_t *)metal_buf_contents((qw36_gpu_buf *)buf)
                        + row_idx * blocks_per_row * bpb;
     switch (buf->dtype) {
         case QW36_DTYPE_Q2_K: metal_dq_q2_K(row, out, cols); return 0;
@@ -1092,21 +1109,26 @@ static qw36_gpu_buf *metal_upload(qw36_gpu_ctx *ctx, const void *host,
     if (!ctx || !host) return NULL;
     qw36_gpu_buf *buf = (qw36_gpu_buf *)calloc(1, sizeof(*buf));
     if (!buf) return NULL;
-    buf->mtl = metal_pool_take(ctx, bytes);
+    if (bytes && metal_dtype_is_quant_storage(dtype)) {
+        const size_t page = (size_t)getpagesize();
+        const uintptr_t addr = (uintptr_t)host;
+        const uintptr_t base = addr & ~(uintptr_t)(page - 1u);
+        const size_t delta = (size_t)(addr - base);
+        if (bytes <= (size_t)NSUIntegerMax - delta) {
+            buf->mtl = [ctx->device newBufferWithBytesNoCopy:(void *)base
+                                                      length:(NSUInteger)(bytes + delta)
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+            if (buf->mtl) buf->offset = (NSUInteger)delta;
+        }
+    } else {
+        buf->mtl = metal_pool_take(ctx, bytes);
+        buf->pooled = 1;
+        if (buf->mtl && bytes) memcpy(metal_buf_contents(buf), host, bytes);
+    }
     if (!buf->mtl) { free(buf); return NULL; }
-    if (bytes) memcpy([buf->mtl contents], host, bytes);
     buf->bytes = bytes;
     buf->dtype = dtype;
-    if (metal_dtype_is_host_dequant(dtype) && bytes) {
-        buf->host_copy = malloc(bytes);
-        if (!buf->host_copy) {
-            metal_pool_release(ctx, buf->mtl);
-            buf->mtl = nil;
-            free(buf);
-            return NULL;
-        }
-        memcpy(buf->host_copy, host, bytes);
-    }
     return buf;
 }
 
@@ -1116,7 +1138,7 @@ static void metal_download(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
     if (!buf || !host) return;
     metal_flush_batch(ctx);
     if (bytes > buf->bytes) bytes = buf->bytes;
-    memcpy(host, [buf->mtl contents], bytes);
+    memcpy(host, metal_buf_contents(buf), bytes);
 }
 
 static void metal_copy_from_host(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
@@ -1125,7 +1147,7 @@ static void metal_copy_from_host(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf,
     if (!buf || !host) return;
     metal_flush_batch(ctx);
     if (bytes > buf->bytes) bytes = buf->bytes;
-    memcpy([buf->mtl contents], host, bytes);
+    memcpy(metal_buf_contents(buf), host, bytes);
 }
 
 static qw36_gpu_buf *metal_alloc(qw36_gpu_ctx *ctx, size_t bytes, qw36_dtype dtype)
@@ -1146,9 +1168,9 @@ static void metal_free(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf)
     /* Don't recycle buffers while a command buffer is still being encoded:
      * a later op in the same batch could otherwise alias a resource that an
      * earlier encoded op has not consumed yet. */
-    if (ctx && buf->mtl && !ctx->batch_active) metal_pool_release(ctx, buf->mtl);
+    if (ctx && buf->mtl && buf->pooled && !ctx->batch_active)
+        metal_pool_release(ctx, buf->mtl);
     buf->mtl = nil;
-    if (buf->host_copy) { free(buf->host_copy); buf->host_copy = NULL; }
     free(buf);
 }
 
@@ -1169,7 +1191,7 @@ static void metal_zero_output(qw36_gpu_ctx *ctx, qw36_gpu_buf *buf, size_t bytes
     metal_flush_batch(ctx);
     if (bytes > buf->bytes) bytes = buf->bytes;
     if (!bytes) return;
-    memset([buf->mtl contents], 0, bytes);
+    memset(metal_buf_contents(buf), 0, bytes);
 }
 
 /* --------------------------------------------------------------------- */
@@ -1223,7 +1245,7 @@ static void metal_rmsnorm(qw36_gpu_ctx *ctx, qw36_gpu_buf *out, qw36_gpu_buf *x,
         uint32_t out_dtype = (uint32_t)out->dtype;
         [enc setBuffer:out->mtl offset:0 atIndex:0];
         [enc setBuffer:x->mtl   offset:0 atIndex:1];
-        [enc setBuffer:w->mtl   offset:0 atIndex:2];
+        [enc setBuffer:w->mtl   offset:metal_buf_offset(w, 0) atIndex:2];
         [enc setBytes:&hidden length:sizeof(hidden) atIndex:3];
         [enc setBytes:&eps    length:sizeof(eps)    atIndex:4];
         [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
@@ -1325,7 +1347,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setComputePipelineState:affine_pipe];
             [enc setBuffer:y->mtl offset:0 atIndex:0];
             [enc setBuffer:x->mtl offset:0 atIndex:1];
-            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
             [enc setBytes:&cols length:sizeof(cols) atIndex:3];
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
             [enc dispatchThreadgroups:MTLSizeMake((rows + 15u) / 16u, 1, 1)
@@ -1368,7 +1390,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                 [enc setComputePipelineState:ctx->matmul_q4_k_quad];
                 [enc setBuffer:y->mtl offset:0 atIndex:0];
                 [enc setBuffer:x->mtl offset:0 atIndex:1];
-                [enc setBuffer:w->mtl offset:0 atIndex:2];
+                [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
                 [enc setBytes:&cols length:sizeof(cols) atIndex:3];
                 [enc setBytes:&rows length:sizeof(rows) atIndex:4];
                 [enc dispatchThreadgroups:MTLSizeMake(1, (rows + 63u) / 64u, 1)
@@ -1400,7 +1422,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             [enc setComputePipelineState:qpipe];
             [enc setBuffer:y->mtl offset:0 atIndex:0];
             [enc setBuffer:x->mtl offset:0 atIndex:1];
-            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
             [enc setBytes:&cols length:sizeof(cols) atIndex:3];
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
             [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
@@ -1461,7 +1483,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             uint32_t y_dtype = (uint32_t)y->dtype;
             [enc setBuffer:y->mtl offset:0 atIndex:0];
             [enc setBuffer:x->mtl offset:0 atIndex:1];
-            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
             [enc setBytes:&cols length:sizeof(cols) atIndex:3];
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
             [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
@@ -1505,7 +1527,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             uint32_t y_dtype = (uint32_t)y->dtype;
             [enc setBuffer:y->mtl offset:0 atIndex:0];
             [enc setBuffer:x->mtl offset:0 atIndex:1];
-            [enc setBuffer:w->mtl offset:0 atIndex:2];
+            [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
             [enc setBytes:&cols length:sizeof(cols) atIndex:3];
             [enc setBytes:&rows length:sizeof(rows) atIndex:4];
             [enc setBytes:&x_dtype length:sizeof(x_dtype) atIndex:5];
@@ -1629,7 +1651,7 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
         uint32_t w_dtype = (uint32_t)w->dtype;
         [enc setBuffer:y->mtl offset:0 atIndex:0];
         [enc setBuffer:x->mtl offset:0 atIndex:1];
-        [enc setBuffer:w->mtl offset:0 atIndex:2];
+        [enc setBuffer:w->mtl offset:metal_buf_offset(w, 0) atIndex:2];
         [enc setBytes:&rows  length:sizeof(rows)  atIndex:3];
         [enc setBytes:&cols  length:sizeof(cols)  atIndex:4];
         [enc setBytes:&batch length:sizeof(batch) atIndex:5];
@@ -1778,6 +1800,9 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             k_cache->dtype == v_cache->dtype &&
             (k_cache->dtype == QW36_DTYPE_F16 ||
              k_cache->dtype == QW36_DTYPE_BF16);
+        const int kvq8_kv =
+            k_cache->dtype == v_cache->dtype &&
+            k_cache->dtype == QW36_DTYPE_Q8_0;
         /* x4 batched scoring variant: cuts barriers 4× per K reduction
          * iteration but measured win is within noise (~0-2% at long
          * context) because attention is K-cache-bandwidth-bound on this
@@ -1805,7 +1830,10 @@ static void metal_attention(qw36_gpu_ctx *ctx,
             const char *e = getenv("QW36_METAL_FLASH_ATTN");
             flash_attn_env_cached = (e && atoi(e) == 0) ? 0 : 1;
         }
-        const int use_flash = kv16_kv && flash_attn_env_cached &&
+        /* Q8 KV always routes through the flash kernel (it's the only
+         * one with a per-32-block Q8 write path).  fp16 / bf16 KV can
+         * still pick between flash and the legacy fused kernel. */
+        const int use_flash = ((kv16_kv && flash_attn_env_cached) || kvq8_kv) &&
                               ctx->attn_decode_flash_f16kv;
         const int use_x4 = !use_flash && kv16_kv && attn_x4_env_cached &&
                            ctx->attn_decode_fused_f16kv_x4 &&
@@ -1848,7 +1876,13 @@ static void metal_attention(qw36_gpu_ctx *ctx,
         [enc setBytes:&k_w_dtype length:sizeof(k_w_dtype) atIndex:17];
         [enc setBytes:&tg_size length:sizeof(tg_size) atIndex:18];
         uint32_t y_dtype = (uint32_t)y->dtype;
-        if (!kv16_kv) {
+        /* The kv16-style kernels (fused_f16kv, fused_f16kv_x4, flash) and
+         * the Q8 KV path (flash with kvq8_kv) all use the SAME buffer
+         * layout: dtype constants go at the END (index 25). Only the
+         * legacy fp32-KV fused kernel uses the older layout with cache
+         * dtypes at index 19/20. */
+        const int kv16_layout = kv16_kv || kvq8_kv;
+        if (!kv16_layout) {
             [enc setBytes:&k_cache_dtype length:sizeof(k_cache_dtype) atIndex:19];
             [enc setBytes:&v_cache_dtype length:sizeof(v_cache_dtype) atIndex:20];
             [enc setBytes:&q_has_gate length:sizeof(q_has_gate) atIndex:21];
@@ -2378,8 +2412,8 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
         uint32_t up_dtype = (uint32_t)expert_up->dtype;
         [enc setBuffer:act->mtl         offset:0 atIndex:0];
         [enc setBuffer:x->mtl           offset:0 atIndex:1];
-        [enc setBuffer:expert_gate->mtl offset:0 atIndex:2];
-        [enc setBuffer:expert_up->mtl   offset:0 atIndex:3];
+        [enc setBuffer:expert_gate->mtl offset:metal_buf_offset(expert_gate, 0) atIndex:2];
+        [enc setBuffer:expert_up->mtl   offset:metal_buf_offset(expert_up, 0) atIndex:3];
         [enc setBuffer:idx->mtl         offset:0 atIndex:4];
         [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
         [enc setBytes:&inter length:sizeof(inter) atIndex:6];
@@ -2411,7 +2445,7 @@ static void metal_moe_forward(qw36_gpu_ctx *ctx,
         uint32_t down_dtype = (uint32_t)expert_down->dtype;
         [enc setBuffer:y->mtl           offset:0 atIndex:0];
         [enc setBuffer:act->mtl         offset:0 atIndex:1];
-        [enc setBuffer:expert_down->mtl offset:0 atIndex:2];
+        [enc setBuffer:expert_down->mtl offset:metal_buf_offset(expert_down, 0) atIndex:2];
         [enc setBuffer:p->mtl           offset:0 atIndex:3];
         [enc setBuffer:idx->mtl         offset:0 atIndex:4];
         [enc setBytes:&hidden length:sizeof(hidden) atIndex:5];
@@ -2508,7 +2542,7 @@ static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_
             return;
         }
         if (metal_dequant_row(embed, token, hidden, row) == 0) {
-            memcpy([y->mtl contents], row, (size_t)hidden * sizeof(float));
+            memcpy(metal_buf_contents(y), row, (size_t)hidden * sizeof(float));
         } else {
             metal_zero_output(ctx, y, (size_t)hidden * sizeof(float));
         }
@@ -2520,7 +2554,7 @@ static void metal_embedding_lookup(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_
         uint32_t embed_dtype = (uint32_t)embed->dtype;
         uint32_t y_dtype = (uint32_t)y->dtype;
         [enc setBuffer:y->mtl     offset:0 atIndex:0];
-        [enc setBuffer:embed->mtl offset:0 atIndex:1];
+        [enc setBuffer:embed->mtl offset:metal_buf_offset(embed, 0) atIndex:1];
         [enc setBytes:&token  length:sizeof(token)  atIndex:2];
         [enc setBytes:&hidden length:sizeof(hidden) atIndex:3];
         [enc setBytes:&embed_dtype length:sizeof(embed_dtype) atIndex:4];

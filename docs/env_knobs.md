@@ -22,6 +22,7 @@ Conventions:
 | `QW36_METAL_FP16_WEIGHTS` | `0|1` | materialize quant weights to fp16 before upload. Conflicts with `QW36_METAL_QUANT_GPU`. `common/qw36.c:1332`. |
 | `QW36_METAL_FP16_KV` | `0|1` | fp16 K/V cache. Defaults on when `QW36_METAL_FP16_WEIGHTS` or `QW36_METAL_QUANT_GPU` is on. `common/qw36.c:1335`. |
 | `QW36_METAL_BF16_KV` | `0|1` | bf16 K/V cache (opt-in, task #73 AB). Wider exponent range than fp16, same 2 bytes/elem. Metal fused attention writes and reads bf16 when enabled. See `docs/kv_quant_plan.md`. |
+| `QW36_METAL_Q8_KV` | `1` (default under `--fast` when `head_dim % 32 == 0`) | Q8_0 K/V cache: 8-bit quantized with per-32-element fp16 scale block. **~50% memory vs fp16** (1.0625 B/elem vs 2 B/elem). Routes through the flash-attn kernel (single-pass online softmax). Forces `kv_transposed=0` (v0 packs blocks along the d-axis only). Set to `0` to fall back to bf16/fp16/fp32. Canonical Hello smoke passes 5/5 with the default. See `docs/kv_quant_plan.md`. |
 
 ## Profile-driven (internal)
 

@@ -1378,34 +1378,58 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         const char *fp16_weights_env = getenv("QW36_METAL_FP16_WEIGHTS");
         const char *fp16_kv_env = getenv("QW36_METAL_FP16_KV");
         const char *bf16_kv_env = getenv("QW36_METAL_BF16_KV");
+        const char *q8_kv_env   = getenv("QW36_METAL_Q8_KV");
         const char *quant_gpu_env = getenv("QW36_METAL_QUANT_GPU");
         const int gpu_weights_path =
             (fp16_weights_env && atoi(fp16_weights_env) != 0) ||
             (quant_gpu_env && atoi(quant_gpu_env) != 0);
+        const int metal_path =
+            be->name && strcmp(be->name, "metal") == 0 && gpu_weights_path;
+        /* Q8_0 KV: 8-bit quant with per-32-element block half-scale.
+         * Requires head_dim % 32 == 0 (Qwen3.5/3.6 always 128 or 256).
+         * Keep it opt-in until 35B and 0.8B smoke both agree with the
+         * fp16/bf16 KV path. */
+        const int q8_kv_eligible =
+            metal_path && (c->head_dim % 32u) == 0u;
+        const int use_q8_dev_kv =
+            q8_kv_eligible &&
+            q8_kv_env && atoi(q8_kv_env) != 0;
         const int use_bf16_dev_kv =
-            be->name && strcmp(be->name, "metal") == 0 &&
-            gpu_weights_path &&
+            metal_path && !use_q8_dev_kv &&
             bf16_kv_env && atoi(bf16_kv_env) != 0;
-        if (use_bf16_dev_kv) {
+        const int use_fp16_dev_kv =
+            metal_path && !use_q8_dev_kv && !use_bf16_dev_kv &&
+            (!fp16_kv_env || atoi(fp16_kv_env) != 0);
+        const qw36_dtype dev_kv_dtype =
+            use_q8_dev_kv   ? QW36_DTYPE_Q8_0 :
+            use_bf16_dev_kv ? QW36_DTYPE_BF16 :
+            use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
+        if (use_q8_dev_kv) {
+            fprintf(stderr,
+                "qw36: KV cache dtype = Q8_0 (per-32-block fp16 scale; "
+                "~50%% memory vs fp16; opt-in via QW36_METAL_Q8_KV=1)\n");
+        } else if (use_bf16_dev_kv) {
             fprintf(stderr,
                 "qw36: KV cache dtype = bf16 (opt-in via "
                 "QW36_METAL_BF16_KV; wider exponent range than fp16, "
                 "same 2 bytes/elem)\n");
         }
-        const int use_fp16_dev_kv =
-            be->name && strcmp(be->name, "metal") == 0 &&
-            gpu_weights_path &&
-            !use_bf16_dev_kv &&
-            (!fp16_kv_env || atoi(fp16_kv_env) != 0);
-        const qw36_dtype dev_kv_dtype =
-            use_bf16_dev_kv ? QW36_DTYPE_BF16 :
-            use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
-        const size_t dev_kv_elem_bytes =
-            dev_kv_dtype == QW36_DTYPE_F32 ? sizeof(float) : sizeof(uint16_t);
-        /* QW36_METAL_KV_TRANSPOSED only changes Metal-side indexing:
-         * [t, kv] and [kv, t] layouts have identical capacity in bytes. */
-        const size_t cache_bytes =
-            (size_t)seq_capacity * kv_dim * dev_kv_elem_bytes;
+        /* Cache byte sizing — Q8 packs 32 elements into 34 bytes, all
+         * other dtypes are flat. Sizing is per layer per (k or v); we
+         * allocate symmetrically. */
+        size_t cache_bytes;
+        if (dev_kv_dtype == QW36_DTYPE_Q8_0) {
+            cache_bytes = (size_t)seq_capacity * (kv_dim / 32u) * 34u;
+        } else {
+            const size_t dev_kv_elem_bytes =
+                dev_kv_dtype == QW36_DTYPE_F32 ? sizeof(float)
+                                                : sizeof(uint16_t);
+            cache_bytes = (size_t)seq_capacity * kv_dim * dev_kv_elem_bytes;
+        }
+        /* QW36_METAL_KV_TRANSPOSED only changes Metal-side indexing for
+         * non-Q8 dtypes. Q8 packs along the d-axis and does NOT support
+         * the [head][dim][t] transposed layout in v0 — Metal-side
+         * dispatch forces kv_transposed=0 when k_cache->dtype == Q8_0. */
         for (size_t l = 0; l < L; l++) {
             st->k_cache_dev[l] = be->alloc(ctx, cache_bytes, dev_kv_dtype);
             st->v_cache_dev[l] = be->alloc(ctx, cache_bytes, dev_kv_dtype);

@@ -118,6 +118,31 @@ static inline void qw36_store_scalar(device uchar *ptr, uint dtype, uint i, floa
     } else if (dtype == QW36_DTYPE_BF16) {
         ((device ushort *)ptr)[i] = qw36_f32_to_bf16(v);
     }
+    /* Q8_0 is intentionally NOT handled here: it needs a 32-wide block
+     * reduction to compute the scale, which is a kernel-level concern
+     * (simd_max). The KV append site does its own Q8 packing inline. */
+}
+
+/* Q8_0 block-pack helper for KV append. All 32 lanes in a simdgroup
+ * cooperate: simd_max gives the block's |max|, lane 0 stores the
+ * half scale, every lane stores its quantized int8. The caller must
+ * ensure threadgroup_size_x % 32 == 0 and simd_lane corresponds to
+ * the lane within the block we're writing. */
+static inline void qw36_q8_simd_pack_store(
+    device uchar *cache, uint flat_idx, uint simd_lane, float v)
+{
+    float abs_max = simd_max(fabs(v));
+    half scale = half(abs_max / 127.0f);
+    float inv = abs_max > 1e-30f ? 1.0f / float(scale) : 0.0f;
+    int q_int = int(round(clamp(v * inv, -127.0f, 127.0f)));
+    int8_t q  = (int8_t)q_int;
+    uint block = flat_idx >> 5u;
+    uint local = flat_idx & 31u;
+    device uchar *base = cache + block * 34u;
+    if (local == 0u) {
+        ((device half *)base)[0] = scale;
+    }
+    ((device char *)(base + 2))[local] = q;
 }
 
 static inline uint qw36_kv_cache_offset(uint t, uint kvh, uint lane,
@@ -1623,13 +1648,25 @@ kernel void qw36_attn_decode_flash_f16kv_f32(
         }
     }
 
-    /* Append current K/V to the cache. One lane per kv head per dim. */
+    /* Append current K/V to the cache. One lane per kv head per dim.
+     * For Q8_0 we go through qw36_q8_simd_pack_store which does the
+     * per-32-lane simd_max → scale → quantize → store. Layout MUST be
+     * legacy (host enforces kv_transposed=0 when k_cache->dtype==Q8_0)
+     * because the 32-element block is along the d axis. */
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
-        uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
-                                        seq_capacity, kv_len, kv_transposed);
-        qw36_store_scalar(k_cache, kv_dtype, off, kv);
-        qw36_store_scalar(v_cache, kv_dtype, off,
-                          v_base[kvh * head_dim + lane]);
+        if (kv_dtype == QW36_DTYPE_Q8_0) {
+            uint flat = seq_pos * kv_len + kvh * head_dim + lane;
+            uint simd_lane_local = lane & 31u;
+            qw36_q8_simd_pack_store(k_cache, flat, simd_lane_local, kv);
+            qw36_q8_simd_pack_store(v_cache, flat, simd_lane_local,
+                                    v_base[kvh * head_dim + lane]);
+        } else {
+            uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
+                                            seq_capacity, kv_len, kv_transposed);
+            qw36_store_scalar(k_cache, kv_dtype, off, kv);
+            qw36_store_scalar(v_cache, kv_dtype, off,
+                              v_base[kvh * head_dim + lane]);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
