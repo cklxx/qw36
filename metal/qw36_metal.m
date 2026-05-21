@@ -1260,10 +1260,13 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             const char *e = getenv("QW36_METAL_Q4K_AFFINE32_MLX");
             q4k_mlx_env_cached = (e && atoi(e) != 0) ? 1 : 0;
         }
+        /* Q6K MLX-style qmv is faster than the bit-shift fast variant on
+         * this host (+3-4% e2e, see commit 7550375). Default it on; opt out
+         * with QW36_METAL_Q6K_SCALE16_MLX=0 for bisecting. */
         static int q6k_mlx_env_cached = -1;
         if (q6k_mlx_env_cached < 0) {
             const char *e = getenv("QW36_METAL_Q6K_SCALE16_MLX");
-            q6k_mlx_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+            q6k_mlx_env_cached = e ? (atoi(e) != 0 ? 1 : 0) : 1;
         }
         static int q5k_mlx_env_cached = -1;
         if (q5k_mlx_env_cached < 0) {
