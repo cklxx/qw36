@@ -31,6 +31,13 @@ static inline float qw36_bf16_to_f32(ushort v)
     return as_type<float>(bits);
 }
 
+static inline ushort qw36_f32_to_bf16(float v)
+{
+    uint bits = as_type<uint>(v);
+    uint rounding_bias = ((bits >> 16) & 1u) + 0x7FFFu;
+    return ushort((bits + rounding_bias) >> 16);
+}
+
 static inline float qw36_load_scalar(device const uchar *ptr, uint dtype, uint i)
 {
     if (dtype == QW36_DTYPE_F32) {
@@ -109,8 +116,7 @@ static inline void qw36_store_scalar(device uchar *ptr, uint dtype, uint i, floa
     } else if (dtype == QW36_DTYPE_F16) {
         ((device half *)ptr)[i] = half(v);
     } else if (dtype == QW36_DTYPE_BF16) {
-        uint bits = as_type<uint>(v);
-        ((device ushort *)ptr)[i] = ushort(bits >> 16);
+        ((device ushort *)ptr)[i] = qw36_f32_to_bf16(v);
     }
 }
 
@@ -1279,8 +1285,8 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     device const float *q_raw        [[buffer(1)]],
     device const float *k_raw        [[buffer(2)]],
     device const float *v_raw        [[buffer(3)]],
-    device half        *k_cache      [[buffer(4)]],
-    device half        *v_cache      [[buffer(5)]],
+    device uchar       *k_cache      [[buffer(4)]],
+    device uchar       *v_cache      [[buffer(5)]],
     device const uchar *q_norm       [[buffer(6)]],
     device const uchar *k_norm       [[buffer(7)]],
     constant uint      &n_heads      [[buffer(8)]],
@@ -1300,6 +1306,7 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     constant uint      &k_offset     [[buffer(22)]],
     constant uint      &v_offset     [[buffer(23)]],
     constant uint      &kv_transposed [[buffer(24)]],
+    constant uint      &kv_dtype     [[buffer(25)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1375,8 +1382,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
         uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
                                         seq_capacity, kv_len, kv_transposed);
-        k_cache[off] = half(kv);
-        v_cache[off] = half(v_base[kvh * head_dim + lane]);
+        qw36_store_scalar(k_cache, kv_dtype, off, kv);
+        qw36_store_scalar(v_cache, kv_dtype, off,
+                          v_base[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1395,8 +1403,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
                 for (uint d = 0; d < head_dim; ++d) {
                     float kval = (t == seq_pos)
                         ? k_vec[d]
-                        : float(k_cache[qw36_kv_cache_offset(
-                            t, kvh, d, head_dim, seq_capacity, kv_len, 1u)]);
+                        : qw36_load_scalar(k_cache, kv_dtype,
+                            qw36_kv_cache_offset(t, kvh, d, head_dim,
+                                                 seq_capacity, kv_len, 1u));
                     dot += q_vec[d] * kval;
                 }
                 scores[t] = dot * inv_sqrt_d;
@@ -1423,8 +1432,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
             for (uint t = 0; t < count; ++t) {
                 float vv = (t == seq_pos)
                     ? v_base[kvh * head_dim + lane]
-                    : float(v_cache[qw36_kv_cache_offset(
-                        t, kvh, lane, head_dim, seq_capacity, kv_len, 1u)]);
+                    : qw36_load_scalar(v_cache, kv_dtype,
+                        qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                             seq_capacity, kv_len, 1u));
                 acc += scores[t] * vv;
             }
             if (q_has_gate) {
@@ -1441,8 +1451,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
         if (lane < head_dim) {
             kval = (t == seq_pos)
                 ? kv
-                : float(k_cache[qw36_kv_cache_offset(
-                    t, kvh, lane, head_dim, seq_capacity, kv_len, 0u)]);
+                : qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, 0u));
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0) partials[simd_id] = dot;
@@ -1471,8 +1482,9 @@ kernel void qw36_attn_decode_fused_f16kv_f32(
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
                 ? v_base[kvh * head_dim + lane]
-                : float(v_cache[qw36_kv_cache_offset(
-                    t, kvh, lane, head_dim, seq_capacity, kv_len, 0u)]);
+                : qw36_load_scalar(v_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, 0u));
             acc += scores[t] * vv;
         }
         if (q_has_gate) {
@@ -1502,8 +1514,8 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     device const float *q_raw        [[buffer(1)]],
     device const float *k_raw        [[buffer(2)]],
     device const float *v_raw        [[buffer(3)]],
-    device half        *k_cache      [[buffer(4)]],
-    device half        *v_cache      [[buffer(5)]],
+    device uchar       *k_cache      [[buffer(4)]],
+    device uchar       *v_cache      [[buffer(5)]],
     device const uchar *q_norm       [[buffer(6)]],
     device const uchar *k_norm       [[buffer(7)]],
     constant uint      &n_heads      [[buffer(8)]],
@@ -1523,6 +1535,7 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     constant uint      &k_offset     [[buffer(22)]],
     constant uint      &v_offset     [[buffer(23)]],
     constant uint      &kv_transposed [[buffer(24)]],
+    constant uint      &kv_dtype     [[buffer(25)]],
     threadgroup float  *scratch      [[threadgroup(0)]],
     uint                lane         [[thread_index_in_threadgroup]],
     uint3               tg_pos       [[threadgroup_position_in_grid]])
@@ -1599,8 +1612,9 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     if (lane < head_dim && h == kvh * n_heads / n_kv) {
         uint off = qw36_kv_cache_offset(seq_pos, kvh, lane, head_dim,
                                         seq_capacity, kv_len, kv_transposed);
-        k_cache[off] = half(kv);
-        v_cache[off] = half(v_base[kvh * head_dim + lane]);
+        qw36_store_scalar(k_cache, kv_dtype, off, kv);
+        qw36_store_scalar(v_cache, kv_dtype, off,
+                          v_base[kvh * head_dim + lane]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1613,18 +1627,22 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
     for (uint t0 = 0; t0 < t_full; t0 += 4u) {
         float k0val = 0.0f, k1val = 0.0f, k2val = 0.0f, k3val = 0.0f;
         if (lane < head_dim) {
-            k0val = ((t0 + 0u) == seq_pos) ? kv : float(k_cache[
-                qw36_kv_cache_offset(t0 + 0u, kvh, lane, head_dim,
-                                      seq_capacity, kv_len, kv_transposed)]);
-            k1val = ((t0 + 1u) == seq_pos) ? kv : float(k_cache[
-                qw36_kv_cache_offset(t0 + 1u, kvh, lane, head_dim,
-                                      seq_capacity, kv_len, kv_transposed)]);
-            k2val = ((t0 + 2u) == seq_pos) ? kv : float(k_cache[
-                qw36_kv_cache_offset(t0 + 2u, kvh, lane, head_dim,
-                                      seq_capacity, kv_len, kv_transposed)]);
-            k3val = ((t0 + 3u) == seq_pos) ? kv : float(k_cache[
-                qw36_kv_cache_offset(t0 + 3u, kvh, lane, head_dim,
-                                      seq_capacity, kv_len, kv_transposed)]);
+            k0val = ((t0 + 0u) == seq_pos) ? kv :
+                qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t0 + 0u, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
+            k1val = ((t0 + 1u) == seq_pos) ? kv :
+                qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t0 + 1u, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
+            k2val = ((t0 + 2u) == seq_pos) ? kv :
+                qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t0 + 2u, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
+            k3val = ((t0 + 3u) == seq_pos) ? kv :
+                qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t0 + 3u, kvh, lane, head_dim,
+                                         seq_capacity, kv_len, kv_transposed));
         }
         float d0 = simd_sum((lane < head_dim) ? qv * k0val : 0.0f);
         float d1 = simd_sum((lane < head_dim) ? qv * k1val : 0.0f);
@@ -1652,9 +1670,10 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
         if (lane < head_dim) {
             kval = (t == seq_pos)
                 ? kv
-                : float(k_cache[qw36_kv_cache_offset(
-                    t, kvh, lane, head_dim, seq_capacity, kv_len,
-                    kv_transposed)]);
+                : qw36_load_scalar(k_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len,
+                                         kv_transposed));
         }
         float dot = simd_sum((lane < head_dim) ? qv * kval : 0.0f);
         if (simd_lane == 0u) partials[simd_id] = dot;
@@ -1683,9 +1702,10 @@ kernel void qw36_attn_decode_fused_f16kv_x4_f32(
         for (uint t = 0; t < count; ++t) {
             float vv = (t == seq_pos)
                 ? v_base[kvh * head_dim + lane]
-                : float(v_cache[qw36_kv_cache_offset(
-                    t, kvh, lane, head_dim, seq_capacity, kv_len,
-                    kv_transposed)]);
+                : qw36_load_scalar(v_cache, kv_dtype,
+                    qw36_kv_cache_offset(t, kvh, lane, head_dim,
+                                         seq_capacity, kv_len,
+                                         kv_transposed));
             acc += scores[t] * vv;
         }
         if (q_has_gate) {

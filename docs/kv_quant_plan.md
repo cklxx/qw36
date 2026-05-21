@@ -9,7 +9,7 @@ shipping today, what's planned, and what each costs to implement.
 |-------|--------|-------------------------------------|------------|------|
 | fp32  | ✓ default reference path            | (none — set by `dev_kv_dtype`)       | 4 | shipped |
 | fp16  | ✓ default under `--fast` / `QUANT_GPU` | `QW36_METAL_FP16_KV=1` (auto)     | 2 | shipped |
-| bf16  | ⏳ planned (#73 AB)                  | `QW36_METAL_BF16_KV=1`               | 2 | this doc's PR |
+| bf16  | ✓ opt-in (#73 AB)                    | `QW36_METAL_BF16_KV=1`               | 2 | shipped |
 | Q8_0  | 🚧 designed below                    | `QW36_METAL_Q8_KV=1`                 | 1.06 | future task |
 | Q4_0  | 🚧 sketched below                    | `QW36_METAL_Q4_KV=1`                 | 0.56 | future task |
 
@@ -47,28 +47,21 @@ handles F16, BF16, Q4K_AFFINE32, Q5K_AFFINE32, Q6K_SCALE16, Q8_0
 (landed in commit `8db80b6`). So the SCORE and COMBINE paths in the
 attention kernels can already read bf16 cells today.
 
-The missing piece is **writing**. The current attention kernels store
-`half(value)` at the cache offset (e.g. `metal/qw36_metal.metal:1437`).
-For bf16 we need `bf16_pack(value)` — i.e. truncate the upper 16
-bits of a fp32:
+The shipped write path uses `bf16_pack(value)` in the Metal KV16
+attention kernels when `QW36_METAL_BF16_KV=1`:
 
 ```metal
 static inline ushort qw36_f32_to_bf16(float v) {
-    // round-to-nearest-even; ties-away is fine for our use
     uint bits = as_type<uint>(v);
-    uint rounding_bias = ((bits >> 16) & 1) + 0x7FFFu;
+    uint rounding_bias = ((bits >> 16) & 1u) + 0x7FFFu;
     return ushort((bits + rounding_bias) >> 16);
 }
 ```
 
-The kernel needs to know the dtype to choose between `half` store and
-`ushort` store. Cleanest: parametrise the f16kv kernel as a "kv16"
-kernel that branches on a `kv_dtype` constant. The variant name stays
-`_f16kv_` for the fp16 path and a sibling `_bf16kv_` for the bf16
-path until we converge on a unified `_kv16_` form.
-
-Same applies to the f32 fallback kernels for when QW36_METAL_QUANT_GPU
-is off.
+The fused `_f16kv_` kernels are now effectively KV16 kernels: host
+dispatch passes a `kv_dtype` constant, then the shader chooses `half`
+stores/loads for fp16 or bf16 pack/load for bf16. The f32 fallback
+kernels already use `qw36_store_scalar` / `qw36_load_scalar`.
 
 ## Allocator side (the easy half)
 
@@ -82,8 +75,7 @@ const size_t dev_kv_elem_bytes = (dev_kv_dtype == QW36_DTYPE_F32) ? 4 : 2;
 ```
 
 The `use_bf16_dev_kv` is decided from `QW36_METAL_BF16_KV` env. bf16
-and fp16 are mutually exclusive — last one wins, with a `--doctor`
-WARN when both are set.
+takes precedence over the fp16 KV default under `--fast`.
 
 ## Q8_0 plan (cost ≈ 2-3 days)
 
@@ -163,17 +155,15 @@ granularity.)
   bf16 won't change wallclock vs fp16 (same bytes), Q8 should help
   at n=2048+, Q4 should help more — but the bench data lands with
   each PR, not with this doc.
-- A timeline. bf16 is small (1-2 days codex brief). Q8 is several
-  days of careful kernel work. Q4 is research.
+- A timeline. Q8 is several days of careful kernel work. Q4 is
+  research.
 
 ## Next concrete steps
 
-1. **Implement bf16 KV** — `QW36_METAL_BF16_KV=1` opt-in. New kernel
-   variant `_bf16kv_f32` + dispatch. Smoke against fp16 baseline for
-   regression; smoke against fp32 reference for correctness. (#73 AB)
-2. **Implement Q8_0 KV** — kernel variant + block-stride offset
+1. **Implement Q8_0 KV** — kernel variant + block-stride offset
    helpers + write-side reduction. Likely a codex brief. (new task)
-3. **Implement Q4_0 KV** — research first; bisection harness before
+2. **Implement Q4_0 KV** — research first; bisection harness before
    default. (new task)
-4. **Cross-backend support** — port to CUDA/AMD once Metal lands.
+3. **Cross-backend support** — port KV quant paths to CUDA/AMD once
+   Metal support is stable.
    (folded into Roadmap theme 1.2)

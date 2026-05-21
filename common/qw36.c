@@ -1382,30 +1382,26 @@ qw36_state *qw36_state_new(const qw36_engine *eng, uint32_t seq_capacity)
         const int gpu_weights_path =
             (fp16_weights_env && atoi(fp16_weights_env) != 0) ||
             (quant_gpu_env && atoi(quant_gpu_env) != 0);
-        /* bf16 KV is design-locked (docs/kv_quant_plan.md) but the Metal
-         * attention kernels still hardcode `half` stores / `half *`
-         * reads. Recognise the env knob and warn loudly that we're
-         * falling back to fp16 until the kernel-side variant lands;
-         * silently corrupting K/V would be a worse outcome than
-         * documenting the gap. */
-        const int want_bf16_dev_kv =
+        const int use_bf16_dev_kv =
             be->name && strcmp(be->name, "metal") == 0 &&
             gpu_weights_path &&
             bf16_kv_env && atoi(bf16_kv_env) != 0;
-        if (want_bf16_dev_kv) {
+        if (use_bf16_dev_kv) {
             fprintf(stderr,
-                "qw36: QW36_METAL_BF16_KV=1 acknowledged but Metal kernel "
-                "support is not yet shipped (see docs/kv_quant_plan.md, "
-                "task #73 AB); falling back to fp16 KV.\n");
+                "qw36: KV cache dtype = bf16 (opt-in via "
+                "QW36_METAL_BF16_KV; wider exponent range than fp16, "
+                "same 2 bytes/elem)\n");
         }
         const int use_fp16_dev_kv =
             be->name && strcmp(be->name, "metal") == 0 &&
             gpu_weights_path &&
+            !use_bf16_dev_kv &&
             (!fp16_kv_env || atoi(fp16_kv_env) != 0);
         const qw36_dtype dev_kv_dtype =
+            use_bf16_dev_kv ? QW36_DTYPE_BF16 :
             use_fp16_dev_kv ? QW36_DTYPE_F16 : QW36_DTYPE_F32;
         const size_t dev_kv_elem_bytes =
-            use_fp16_dev_kv ? sizeof(uint16_t) : sizeof(float);
+            dev_kv_dtype == QW36_DTYPE_F32 ? sizeof(float) : sizeof(uint16_t);
         /* QW36_METAL_KV_TRANSPOSED only changes Metal-side indexing:
          * [t, kv] and [kv, t] layouts have identical capacity in bytes. */
         const size_t cache_bytes =

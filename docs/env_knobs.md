@@ -21,7 +21,7 @@ Conventions:
 | `QW36_METAL_QUANT_GPU` | `0|1` | keep K-quant blocks on GPU, dispatch via per-row dequant matmul kernels. Saves ~1 GB on the 0.8B model. `common/qw36.c:880`. |
 | `QW36_METAL_FP16_WEIGHTS` | `0|1` | materialize quant weights to fp16 before upload. Conflicts with `QW36_METAL_QUANT_GPU`. `common/qw36.c:1332`. |
 | `QW36_METAL_FP16_KV` | `0|1` | fp16 K/V cache. Defaults on when `QW36_METAL_FP16_WEIGHTS` or `QW36_METAL_QUANT_GPU` is on. `common/qw36.c:1335`. |
-| `QW36_METAL_BF16_KV` | `0|1` | bf16 K/V cache (opt-in, task #73 AB). Wider exponent range than fp16, same 2 bytes/elem. Allocator path is in tree; Metal kernel support is a follow-up — currently falls back to fp16 with a stderr warning. See `docs/kv_quant_plan.md`. |
+| `QW36_METAL_BF16_KV` | `0|1` | bf16 K/V cache (opt-in, task #73 AB). Wider exponent range than fp16, same 2 bytes/elem. Metal fused attention writes and reads bf16 when enabled. See `docs/kv_quant_plan.md`. |
 
 ## Profile-driven (internal)
 
