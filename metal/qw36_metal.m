@@ -78,6 +78,7 @@ struct qw36_gpu_ctx {
     id<MTLComputePipelineState> matmul_q4k_affine32;
     id<MTLComputePipelineState> matmul_q4k_affine32_mlx;
     id<MTLComputePipelineState> matmul_q5k_affine32;
+    id<MTLComputePipelineState> matmul_q5k_affine32_mlx;
     id<MTLComputePipelineState> matmul_q6k_scale16;
     id<MTLComputePipelineState> matmul_q6k_scale16_mlx;
     id<MTLComputePipelineState> matmul_q5_k;
@@ -790,6 +791,7 @@ static qw36_gpu_ctx *metal_init(char *err, size_t err_cap)
     ctx->matmul_q4k_affine32 = metal_make_pipeline(ctx, @"qw36_matmul_q4k_affine32_qmv_fast_f32", err, err_cap);
     ctx->matmul_q4k_affine32_mlx = metal_make_pipeline(ctx, @"qw36_matmul_q4k_affine32_qmv_mlx_f32", err, err_cap);
     ctx->matmul_q5k_affine32 = metal_make_pipeline(ctx, @"qw36_matmul_q5k_affine32_qmv_fast_f32", err, err_cap);
+    ctx->matmul_q5k_affine32_mlx = metal_make_pipeline(ctx, @"qw36_matmul_q5k_affine32_qmv_mlx_f32", err, err_cap);
     ctx->matmul_q6k_scale16 = metal_make_pipeline(ctx, @"qw36_matmul_q6k_scale16_qmv_fast_f32", err, err_cap);
     ctx->matmul_q6k_scale16_mlx = metal_make_pipeline(ctx, @"qw36_matmul_q6k_scale16_qmv_mlx_f32", err, err_cap);
     ctx->matmul_q5_k = metal_make_pipeline(ctx, @"qw36_matmul_q5_k_f32", err, err_cap);
@@ -896,6 +898,7 @@ static void metal_destroy(qw36_gpu_ctx *ctx)
     ctx->matmul_q4k_affine32 = nil;
     ctx->matmul_q4k_affine32_mlx = nil;
     ctx->matmul_q5k_affine32 = nil;
+    ctx->matmul_q5k_affine32_mlx = nil;
     ctx->matmul_q6k_scale16 = nil;
     ctx->matmul_q6k_scale16_mlx = nil;
     ctx->matmul_q4_k_quad = nil;
@@ -1262,6 +1265,11 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
             const char *e = getenv("QW36_METAL_Q6K_SCALE16_MLX");
             q6k_mlx_env_cached = (e && atoi(e) != 0) ? 1 : 0;
         }
+        static int q5k_mlx_env_cached = -1;
+        if (q5k_mlx_env_cached < 0) {
+            const char *e = getenv("QW36_METAL_Q5K_AFFINE32_MLX");
+            q5k_mlx_env_cached = (e && atoi(e) != 0) ? 1 : 0;
+        }
         id<MTLComputePipelineState> affine_pipe = nil;
         NSString *affine_name = nil;
         if (w->dtype == QW36_DTYPE_Q4K_AFFINE32) {
@@ -1270,8 +1278,12 @@ static int metal_matmul(qw36_gpu_ctx *ctx, qw36_gpu_buf *y, qw36_gpu_buf *x,
                 : ctx->matmul_q4k_affine32;
             affine_name = @"q4k_affine32";
         } else if (w->dtype == QW36_DTYPE_Q5K_AFFINE32) {
-            affine_pipe = ctx->matmul_q5k_affine32;
-            affine_name = @"q5k_affine32";
+            affine_pipe = q5k_mlx_env_cached && ctx->matmul_q5k_affine32_mlx
+                ? ctx->matmul_q5k_affine32_mlx
+                : ctx->matmul_q5k_affine32;
+            affine_name = q5k_mlx_env_cached && ctx->matmul_q5k_affine32_mlx
+                ? @"q5k_affine32_mlx"
+                : @"q5k_affine32";
         } else {
             affine_pipe = q6k_mlx_env_cached && ctx->matmul_q6k_scale16_mlx
                 ? ctx->matmul_q6k_scale16_mlx

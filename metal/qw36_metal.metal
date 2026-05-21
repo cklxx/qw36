@@ -1722,6 +1722,64 @@ static inline float qw36_qdot5_affine32_16(device const uchar *qbytes,
     return scale * qacc + bias * xsum;
 }
 
+/* MLX-style 5-bit qdot — masked byte × pre-scaled x_thread.  Caller passes
+ * 16 floats laid out as two 8-element packs; each 8-element pack reads
+ * 5 bytes of weight.  Pre-scaling table (see load_vector helper below)
+ * mirrors MLX's bits=5 load_vector. */
+static inline float qw36_qdot5_affine32_16_mlx(device const uchar *qbytes,
+                                               const thread float *x_thread,
+                                               float scale,
+                                               float bias,
+                                               float xsum)
+{
+    float accum = 0.0f;
+    for (uint pack = 0; pack < 2u; ++pack) {
+        device const uchar *w = qbytes + pack * 5u;
+        const thread float *xt = x_thread + 8u * pack;
+        accum += float(w[0] & 0x1fu) * xt[0]
+              +  float(w[0] & 0xe0u) * xt[1]
+              +  float(w[1] & 0x03u) * (xt[1] * 256.0f)
+              +  float(w[1] & 0x7cu) * xt[2]
+              +  float(w[1] & 0x80u) * xt[3]
+              +  float(w[2] & 0x0fu) * (xt[3] * 256.0f)
+              +  float(w[2] & 0xf0u) * xt[4]
+              +  float(w[3] & 0x01u) * (xt[4] * 256.0f)
+              +  float(w[3] & 0x3eu) * xt[5]
+              +  float(w[3] & 0xc0u) * xt[6]
+              +  float(w[4] & 0x07u) * (xt[6] * 256.0f)
+              +  float(w[4] & 0xf8u) * xt[7];
+    }
+    return scale * accum + bias * xsum;
+}
+
+static inline float qw36_load_x_for_q5_affine32_16(device const float *x,
+                                                   uint k,
+                                                   thread float *x_thread)
+{
+    float xsum = 0.0f;
+    for (uint pack = 0; pack < 2u; ++pack) {
+        uint base = pack * 8u;
+        float x0 = x[k + base + 0u];
+        float x1 = x[k + base + 1u];
+        float x2 = x[k + base + 2u];
+        float x3 = x[k + base + 3u];
+        float x4 = x[k + base + 4u];
+        float x5 = x[k + base + 5u];
+        float x6 = x[k + base + 6u];
+        float x7 = x[k + base + 7u];
+        xsum += x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        x_thread[base + 0u] = x0;
+        x_thread[base + 1u] = x1 * (1.0f / 32.0f);
+        x_thread[base + 2u] = x2 * (1.0f / 4.0f);
+        x_thread[base + 3u] = x3 * (1.0f / 128.0f);
+        x_thread[base + 4u] = x4 * (1.0f / 16.0f);
+        x_thread[base + 5u] = x5 * (1.0f / 2.0f);
+        x_thread[base + 6u] = x6 * (1.0f / 64.0f);
+        x_thread[base + 7u] = x7 * (1.0f / 8.0f);
+    }
+    return xsum;
+}
+
 static inline uint qw36_unpack6(device const uchar *p, uint idx)
 {
     uint bit = 6u * idx;
@@ -1979,6 +2037,70 @@ kernel void qw36_matmul_q5k_affine32_qmv_fast_f32(
             float bias = qw36_affine32_half(blk + 16u, sub);
             device const uchar *qbytes = blk + 32u + sub * 20u + qbyte_offset;
             acc[r] += qw36_qdot5_affine32_16(qbytes, x, k, scale, bias);
+        }
+    }
+
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        float v = simd_sum(acc[r]);
+        uint row = row0 + r;
+        if (simd_lid == 0u && row < N) y[row] = v;
+    }
+}
+
+/* MLX-style Q5K_AFFINE32 matmul.  Same layout + threadgroup geometry as
+ * qw36_matmul_q5k_affine32_qmv_fast_f32 but uses masked-byte × pre-scaled
+ * x_thread to skip 16 dependent 5-bit shifts per lane per row.  Q5_K is
+ * the gate_up matmul (6144×1024) — the most frequently called Q5_K shape
+ * in Qwen3.5-0.8B-Q4_K_M — so per-element work matters here.  Gate behind
+ * QW36_METAL_Q5K_AFFINE32_MLX=1. */
+kernel void qw36_matmul_q5k_affine32_qmv_mlx_f32(
+    device float       *y        [[buffer(0)]],
+    device const float *x        [[buffer(1)]],
+    device const uchar *w        [[buffer(2)]],
+    constant uint      &K        [[buffer(3)]],
+    constant uint      &N        [[buffer(4)]],
+    uint3               tg       [[threadgroup_position_in_grid]],
+    uint                simd_gid [[simdgroup_index_in_threadgroup]],
+    uint                simd_lid [[thread_index_in_simdgroup]])
+{
+    constexpr uint simdgroups_per_tg = 4u;
+    constexpr uint rows_per_simd = 4u;
+    constexpr uint values_per_thread = 16u;
+    constexpr uint block_k = values_per_thread * 32u; /* 512 */
+
+    uint row0 = tg.x * simdgroups_per_tg * rows_per_simd
+              + simd_gid * rows_per_simd;
+    uint row_bytes = (K >> 8) * 192u;
+
+    float acc[rows_per_simd];
+    bool active[rows_per_simd];
+    for (uint r = 0; r < rows_per_simd; ++r) {
+        uint row = row0 + r;
+        acc[r] = 0.0f;
+        active[r] = row < N;
+    }
+
+    thread float x_thread[values_per_thread];
+
+    for (uint k0 = 0; k0 < K; k0 += block_k) {
+        uint k = k0 + simd_lid * values_per_thread;
+        if (k + values_per_thread > K) continue;
+        uint group = k >> 5;
+        uint block = group >> 3;
+        uint sub = group & 7u;
+        uint group_local = k & 31u;
+        uint qbyte_offset = (group_local >> 3) * 5u;
+
+        float xsum = qw36_load_x_for_q5_affine32_16(x, k, x_thread);
+
+        for (uint r = 0; r < rows_per_simd; ++r) {
+            if (!active[r]) continue;
+            uint row = row0 + r;
+            device const uchar *blk = w + row * row_bytes + block * 192u;
+            float scale = qw36_affine32_half(blk, sub);
+            float bias = qw36_affine32_half(blk + 16u, sub);
+            device const uchar *qbytes = blk + 32u + sub * 20u + qbyte_offset;
+            acc[r] += qw36_qdot5_affine32_16_mlx(qbytes, x_thread, scale, bias, xsum);
         }
     }
 
